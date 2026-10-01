@@ -8,10 +8,22 @@ from typing import (
 )
 
 from src.common import Chunk, DocumentMetadata
-from src.utils import ConfigMixin, wrap_iter_to_async
+from src.utils import ConfigMixin, ExpectedError, wrap_iter_to_async
 
 from .doc_model import ParsedDoc, chunk_document, prepare
 from .metadata import file_metadata
+
+
+class SkipFile(ExpectedError):
+    """Файл не индексируется по причине в его содержимом: битый, зашифрован, без текста.
+
+    permanent=True — повторять разбор незачем, пока файл не изменится; False —
+    повторить на следующем проходе. В журнал — одна строка WARNING с причиной.
+    """
+
+    def __init__(self, reason: str, *, permanent: bool = True):
+        super().__init__(reason)
+        self.reason, self.permanent = reason, permanent
 
 
 class Parser(abc.ABC, ConfigMixin):

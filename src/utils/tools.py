@@ -31,6 +31,14 @@ def wrap_with_converter(
         yield converter(item)
 
 
+class ExpectedError(Exception):
+    """Ожидаемый отказ: вызывающий код сам решает, что писать в журнал.
+
+    Обёртки ниже пробрасывают его без стека в журнале — иначе, например, битый
+    файл давал бы на каждом проходе трассировку вместо одной строки причины.
+    """
+
+
 def wrap_exception_logger(lg: Logger):
     def decorator(
         foo: Callable[P, Coroutine[None, None, R]],
@@ -39,6 +47,8 @@ def wrap_exception_logger(lg: Logger):
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             try:
                 return await foo(*args, **kwargs)
+            except ExpectedError:
+                raise
             except Exception as e:
                 lg.exception(f"Error in {foo.__name__}: {e}")
                 raise
@@ -54,6 +64,8 @@ def wrap_exception_logger_sync(lg: Logger):
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             try:
                 return foo(*args, **kwargs)
+            except ExpectedError:
+                raise
             except Exception as e:
                 lg.exception(f"Error in {foo.__name__}: {e}")
                 raise

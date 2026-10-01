@@ -27,7 +27,8 @@ exclude_pattern = re.compile(
         |Thumbs\.db          # Windows служебные файлы
         |~.*                 # временные файлы office
     )$""",
-    re.VERBOSE,
+    # Регистр не важен: «Node_Modules», «VENV», «thumbs.db» — тот же мусор.
+    re.VERBOSE | re.IGNORECASE,
 )
 
 

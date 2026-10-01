@@ -61,20 +61,11 @@ def test_token_len_is_thread_safe(config: Config):
     assert errors == []
 
 
-@pytest.mark.asyncio
-async def test_parse_error_does_not_mark_indexed(tmp_path):
-    """Ошибка разбора не должна помечать файл обработанным.
-
-    Иначе повторная попытка не случится никогда — даже после перезапуска
-    демона, потому что размер и mtime не изменились.
-    """
+async def _fail_calls(path) -> list[bool]:
     from src.parsers import _process_path
 
-    broken = tmp_path / "broken.docx"
-    broken.write_bytes("это не docx, а мусор".encode())
-    stat = broken.stat()
-    meta = FileMetadata(str(broken), stat.st_size, int(stat.st_mtime))
-
+    stat = path.stat()
+    meta = FileMetadata(str(path), stat.st_size, int(stat.st_mtime))
     calls: list[bool] = []
 
     async def fail_cb(_meta: FileMetadata, *, permanent: bool) -> None:
@@ -82,8 +73,39 @@ async def test_parse_error_does_not_mark_indexed(tmp_path):
 
     async for _ in _process_path(meta, fail_cb=fail_cb):
         pass
+    return calls
 
-    assert calls == [False], "сбой разбора не должен считаться окончательным"
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [RuntimeError("сбой инференса"), OSError("файл занят")])
+async def test_transient_parse_error_does_not_mark_indexed(tmp_path, monkeypatch, error):
+    """Временный или непредвиденный сбой разбора не помечает файл обработанным.
+
+    Иначе повторная попытка не случится никогда — даже после перезапуска
+    демона, потому что размер и mtime не изменились.
+    """
+    from src.parsers import DocxParser
+
+    def fail(self, file):
+        raise error
+
+    monkeypatch.setattr(DocxParser, "parse_io", fail)
+    doc = tmp_path / "doc.docx"
+    doc.write_bytes(b"PK\x03\x04")
+    assert await _fail_calls(doc) == [False], "сбой разбора не должен считаться окончательным"
+
+
+@pytest.mark.asyncio
+async def test_corrupt_file_is_skipped_with_one_warning_line(tmp_path, caplog):
+    """Испорченное содержимое — окончательный пропуск до изменения файла (дописанный
+    файл сменит размер и время и вернётся сам) и одна строка WARNING без стека."""
+    broken = tmp_path / "broken.docx"
+    broken.write_bytes("это не docx, а мусор".encode())
+    with caplog.at_level("WARNING"):
+        assert await _fail_calls(broken) == [True]
+    lines = [r for r in caplog.records if str(broken) in r.getMessage()]
+    assert len(lines) == 1 and lines[0].levelname == "WARNING" and lines[0].exc_info is None
+    assert all(r.exc_info is None for r in caplog.records), "в журнале не должно быть стека"
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,7 @@ from src.utils import get_logger
 from src.utils.r7_office import convert_via_r7, find_x2t
 
 from ._tables import Budget
-from .base import Parser, parser
+from .base import Parser, SkipFile, parser
 from .doc_model import Block, ParsedDoc
 from .docx_ooxml import parse_docx
 from .metadata import ooxml_properties
@@ -37,7 +37,11 @@ class DocxParser(Parser):
                 exc,
             )
             file.seek(0)
-            return ParsedDoc([Block(process(file))], meta, titles)
+            try:
+                text = process(file)
+            except KeyError as missing:  # в пакете нет word/document.xml
+                raise SkipFile(f"в docx нет основной части: {missing}") from exc
+            return ParsedDoc([Block(text)], meta, titles)
         if not any(b.heading for b in blocks):
             # Стилей заголовков нет (конвертация из .doc): раздел — по нумерации.
             for b in blocks:

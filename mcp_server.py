@@ -797,6 +797,8 @@ def _optional_enum(args, name, default, allowed):
     if args.get(name) is None:
         return default
     value = args[name]
+    if isinstance(value, str):
+        value = value.strip().lower()  # «Hybrid» = «hybrid»: регистр не важен
     if value not in allowed:
         raise InvalidParams(
             "параметр '%s'=%r недопустим. Возможные значения: %s"
@@ -819,6 +821,7 @@ def _optional_sources(args):
     if not isinstance(value, list) or not value:
         raise InvalidParams("параметр 'sources' должен быть непустым списком")
     allowed = ("files", "email")
+    value = [v.strip().lower() if isinstance(v, str) else v for v in value]
     for item in value:
         if item not in allowed:
             raise InvalidParams(
@@ -959,6 +962,12 @@ def _tool_search(args):
         if about and used + len(about) + 5 <= MAX_OUTPUT_CHARS:
             block.append("   " + about)
             used += len(about) + 3
+        copies = [p for p in (item.get("duplicates") or []) if isinstance(p, str)]
+        if copies:
+            line = "   копии того же файла: " + "; ".join(copies)
+            if used + len(line) <= MAX_OUTPUT_CHARS:
+                block.append(line)
+                used += len(line)
         ext = os.path.splitext(path)[1].lower()
         chunks = []
         for chunk in (item.get("chunks") or [])[:MAX_CHUNKS_PER_DOC]:
@@ -986,6 +995,8 @@ def _tool_search(args):
         }
         if isinstance(item.get("document"), dict):
             result["document"] = {k: v for k, v in item["document"].items() if v is not None}
+        if copies:
+            result["duplicates"] = copies
         structured.append(result)
 
     shown = len(structured)

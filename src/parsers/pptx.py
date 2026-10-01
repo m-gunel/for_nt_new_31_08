@@ -5,15 +5,11 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.oxml.ns import qn
 
-from src.utils import get_logger
-
 from ._tables import Budget, split_parts, table_blocks
-from .base import Parser, parser
+from .base import Parser, SkipFile, parser
 from .doc_model import Block, ParsedDoc
 from .docx_ooxml import letters, roman
 from .metadata import ooxml_properties
-
-logger = get_logger(__name__)
 
 BUDGET_TOKENS = 450  # чанк таблицы; «Документ: <имя>» сверху уложит его в 500
 
@@ -74,11 +70,8 @@ class PptxParser(Parser):
         meta, titles = ooxml_properties(file, "pptx")
         try:
             prs = Presentation(file)
-        except BadZipFile:
-            logger.warning(
-                "Failed to read PPTX file, it may not be a valid PPTX format."
-            )
-            return ParsedDoc([])
+        except (BadZipFile, KeyError) as exc:
+            raise SkipFile(f"pptx повреждён ({type(exc).__name__}: {exc})") from exc
         budget = Budget(BUDGET_TOKENS, self._config.ov_model.count_tokens)
         blocks: list[Block] = []
         for n, slide in enumerate(prs.slides, 1):

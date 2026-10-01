@@ -3,14 +3,18 @@ import concurrent
 import concurrent.futures
 import email
 import io
+import zipfile
 from collections.abc import AsyncIterable, Iterable, Iterator
 from contextlib import AsyncExitStack
 from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Protocol
+from xml.etree import ElementTree
 
 import aiofiles
+import pymupdf
 from aiofiles.threadpool.binary import AsyncBufferedReader
+from lxml import etree
 
 from src.common import (
     ChunkWithMeta,
@@ -23,7 +27,7 @@ from src.thunderbird.get_body import Attachment, Body, process_message
 from src.thunderbird.lazy_iter_mbox import _decode_filename
 from src.utils import get_config, get_logger, wrap_iter_to_async
 
-from .base import Parser, file_extension, get_parser, get_parsers_registry
+from .base import Parser, SkipFile, file_extension, get_parser, get_parsers_registry
 from .doc_model import ParsedDoc, chunk_document, full_text, prepare
 from .docx import DocParser, DocxParser
 from .metadata import clean_title, content_metadata, first_line_title, language
@@ -50,6 +54,15 @@ __all__ = [
 ]
 
 lg = get_logger(__name__)
+
+# Порча содержимого: разбор не удастся, пока файл не изменится. Временные причины
+# (OSError — файл занят или исчез, MemoryError) сюда не входят.
+_CORRUPT = (
+    zipfile.BadZipFile,
+    ElementTree.ParseError,
+    etree.XMLSyntaxError,
+    pymupdf.FileDataError,
+)
 
 
 def _document_meta(doc: ParsedDoc, base: DocumentMetadata) -> DocumentMetadata:
@@ -95,7 +108,11 @@ def document_chunks(
     base = dict(doc_meta or {})
     ext = base.get("ext") or file_extension(path)
     base.update(content_metadata(io, ext))
-    doc = prepare(parser.parse_io(io))
+    try:
+        parsed = parser.parse_io(io)
+    except _CORRUPT as exc:
+        raise SkipFile(f"содержимое повреждено ({type(exc).__name__}: {exc})") from exc
+    doc = prepare(parsed)
     meta = _document_meta(doc, DocumentMetadata(**base))
     prefix = doc_prefix(meta.get("original_name"))
     for chunk in chunk_document(doc, get_config().embed_splitter):
@@ -352,10 +369,26 @@ async def _process_path(
             ):
                 yield chunk
                 chunks += 1
+        except SkipFile as skip:
+            # Причина в содержимом (битый, зашифрован, без текста): одна строка
+            # без стека. permanent=True — до изменения файла: дописанный файл
+            # сменит размер и время и вернётся в индексацию сам.
+            lg.warning("файл %s не индексируется: %s", path, skip.reason)
+            await fail_cb(meta, permanent=skip.permanent)
+            return
+        except (OSError, MemoryError) as exc:
+            # Файл занят, исчез или не хватило памяти — повторить на следующем проходе.
+            lg.warning(
+                "файл %s пока не прочитан (%s: %s) — повтор на следующем проходе",
+                path,
+                type(exc).__name__,
+                exc,
+            )
+            await fail_cb(meta, permanent=False)
+            return
         except Exception:
-            # Разбор упал — это может быть временной причиной (файл ещё
-            # дописывается, занят, сбой инференса). Файл НЕ помечаем
-            # обработанным, чтобы следующий полный проход к нему вернулся.
+            # Непредвиденный сбой (ошибка в коде, инференс) — со стеком; файл НЕ
+            # помечаем обработанным, чтобы следующий полный проход к нему вернулся.
             lg.exception("processing %s", path)
             await fail_cb(meta, permanent=False)
             return

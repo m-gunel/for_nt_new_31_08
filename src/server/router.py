@@ -87,7 +87,7 @@ async def search(request: SearchRequest, index: AppIndex) -> SearchResponse:
         query_type=request.query_type,
         sources=request.sources,
     )
-    return SearchResponse.from_dataframes(results)
+    return SearchResponse.from_dataframes(results, limit=request.limit)
 
 
 @router.get("/config")

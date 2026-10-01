@@ -51,6 +51,26 @@ class Chunk(BaseModel):
 _CHUNK_PLACE = tuple(k for k in Chunk.model_fields if k not in ("content", "score"))
 
 
+def _distinct_rows(
+    frame: pl.DataFrame, limit: int | None, duplicates: dict[str, set[str]]
+):
+    """Строки выдачи по убыванию оценки без копий уже встреченного файла; не больше limit."""
+    rows = sorted(frame.iter_rows(named=True), key=_row_score, reverse=True)
+    first: dict[str, str] = {}  # sha256 → путь, который остаётся в выдаче
+    kept = 0
+    for row in rows:
+        sha = (row.get("meta") or {}).get("sha256")
+        if sha:
+            path = first.setdefault(sha, row["path"])
+            if path != row["path"]:
+                duplicates[path].add(row["path"])
+                continue
+        if limit is not None and kept >= limit:
+            break
+        kept += 1
+        yield row
+
+
 class DocumentInfo(BaseModel):
     """Свойства документа из индекса (src/common/doc_meta.py); всё необязательное."""
 
@@ -85,6 +105,10 @@ class BaseSearchResponseItem(BaseModel):
     type: Literal["file", "application", "email", "email_attachment"]
     score: float
     document: DocumentInfo | None = None
+    duplicates: list[str] = Field(
+        default_factory=list,
+        description="Другие пути того же содержимого (копии файла в других папках)",
+    )
 
 
 class SearchResponseItemFile(BaseSearchResponseItem):
@@ -119,20 +143,28 @@ class SearchResponse(BaseModel):
         return cls.from_dataframes([df])
 
     @classmethod
-    def from_dataframes(cls, frames: Sequence[pl.DataFrame | None]):
+    def from_dataframes(
+        cls, frames: Sequence[pl.DataFrame | None], limit: int | None = None
+    ):
         """Собрать ответ из выдач нескольких источников.
 
         Построчно, а не через `pl.concat`: схемы расходятся, если по одной
         таблице гибридный поиск деградировал до векторного — в одной
         `_relevance_score`, в другой `_distance`.
+
+        Копии одного файла (одинаковый sha256) схлопываются: остаётся путь с
+        лучшим чанком, остальные — в `duplicates`, их чанки мест не занимают.
+        limit — чанков на источник после схлопывания (индексатор при копиях
+        берёт запас).
         """
         res: dict[str, list[Chunk]] = defaultdict(list)
         titles: dict[str, str] = {}
         documents: dict[str, DocumentInfo] = {}
+        duplicates: dict[str, set[str]] = defaultdict(set)
         # None приходит, когда поиск невозможен (например, FTS-индекс ещё не
         # построен) — отдаём пустой ответ, а не падаем.
         rows = chain.from_iterable(
-            df.iter_rows(named=True) for df in frames if df is not None
+            _distinct_rows(df, limit, duplicates) for df in frames if df is not None
         )
         for row in rows:
             # meta в схеме чанка nullable (src/common/doc_meta.py): строка,
@@ -175,6 +207,7 @@ class SearchResponse(BaseModel):
                         absolute_path=file_path,
                         score=max(chunk.score for chunk in chunks),
                         document=documents.get(file_path),
+                        duplicates=sorted(duplicates.get(file_path, ())),
                     )
                     for file_path, chunks in res.items()
                 ],
@@ -199,6 +232,16 @@ class SearchRequest(BaseModel):
         description="Источники поиска; каждый получает свой limit",
     )
     # offset: int
+
+    @field_validator("query_type", "sources", mode="before")
+    @classmethod
+    def _lowercase(cls, value):
+        """«Hybrid» = «hybrid», «Files» = «files»: регистр параметров не важен."""
+        if isinstance(value, str):
+            return value.strip().lower()
+        if isinstance(value, list):
+            return [v.strip().lower() if isinstance(v, str) else v for v in value]
+        return value
 
     @field_validator("sources")
     @classmethod

@@ -27,12 +27,13 @@ from typing import Any, BinaryIO
 
 import openpyxl
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.exceptions import InvalidFileException
 
 from src.utils import get_logger
 from src.utils.r7_office import convert_via_r7
 
 from ._tables import Budget, pack_lines, split_parts
-from .base import Parser, parser
+from .base import Parser, SkipFile, parser
 from .doc_model import Block, ParsedDoc
 from .metadata import ooxml_properties
 
@@ -507,7 +508,10 @@ class XlsxParser(Parser):
     def _parse_book(self, file: BinaryIO, meta: dict, titles: list[str]) -> ParsedDoc:
         budget = Budget(BUDGET_TOKENS, self._config.ov_model.count_tokens)
         limit = self._config.excel_config.max_rows
-        wb = openpyxl.load_workbook(file, read_only=True, data_only=True)
+        try:
+            wb = openpyxl.load_workbook(file, read_only=True, data_only=True)
+        except (InvalidFileException, KeyError) as exc:  # zip, но не книга Excel
+            raise SkipFile(f"не книга Excel ({type(exc).__name__}: {exc})") from exc
         blocks: list[Block] = []
         tables: list[str] = []
         sheets: list[str] = []

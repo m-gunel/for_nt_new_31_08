@@ -101,6 +101,22 @@ def _is_missing_fts_index(exc: BaseException) -> bool:
     return any(all(part in msg for part in markers) for markers in _MISSING_FTS_MARKERS)
 
 
+# Во сколько раз больше чанков запрашивать, если в выдаче нашлись копии одного файла.
+DUP_FETCH_FACTOR = 3
+
+
+def _has_copies(frame: "pl.DataFrame | None") -> bool:
+    """Есть ли в выдаче разные пути одного содержимого (одинаковый sha256)."""
+    if frame is None or "meta" not in frame.columns or "path" not in frame.columns:
+        return False
+    first: dict[str, str] = {}
+    for meta, path in zip(frame["meta"].to_list(), frame["path"].to_list()):
+        sha = (meta or {}).get("sha256")
+        if sha and first.setdefault(sha, path) != path:
+            return True
+    return False
+
+
 class Index(AbstractAsyncContextManager):
     def __init__(self, cfg: "Config") -> None:
         from .utils import UniqueCounter
@@ -1257,7 +1273,7 @@ class Index(AbstractAsyncContextManager):
             for source in dict.fromkeys(sources)
         ]
 
-        def _vector_search(table):
+        def _vector_search(table, limit):
             return (
                 table.search(
                     vec,
@@ -1267,11 +1283,11 @@ class Index(AbstractAsyncContextManager):
                 .nprobes(32)  # type: ignore
                 # .refine_factor(20)
                 .distance_type("cosine")  # type: ignore
-                .limit(top_k)
+                .limit(limit)
                 .to_polars()
             )
 
-        def _search_in(table):
+        def _search_in(table, limit):
             if query_type == "hybrid":
                 try:
                     return (
@@ -1283,7 +1299,7 @@ class Index(AbstractAsyncContextManager):
                         .distance_type("cosine")  # type: ignore
                         .vector(vec)
                         .text(query)
-                        .limit(top_k)
+                        .limit(limit)
                         .to_polars()
                     )
                 except Exception as exc:
@@ -1309,9 +1325,9 @@ class Index(AbstractAsyncContextManager):
                             exc,
                             exc_info=True,
                         )
-                    return _vector_search(table)
+                    return _vector_search(table, limit)
             elif query_type == "vector":
-                return _vector_search(table)
+                return _vector_search(table, limit)
             elif query_type == "text":
                 try:
                     return (
@@ -1319,7 +1335,7 @@ class Index(AbstractAsyncContextManager):
                             query,
                             query_type="fts",
                         )
-                        .limit(top_k)
+                        .limit(limit)
                         .to_polars()
                     )
                 except Exception as exc:
@@ -1342,7 +1358,14 @@ class Index(AbstractAsyncContextManager):
                     # писать в хранилище.
                     lg.debug("таблица %s ещё не создана", store.table_name)
                     continue
-                results.append(_search_in(store.table))
+                frame = _search_in(store.table, top_k)
+                if _has_copies(frame):
+                    # Копии одного файла в разных папках займут места других
+                    # документов: берём запас, а SearchResponse схлопнет копии и
+                    # отрежет выдачу до top_k чанков. Без копий запрос прежний —
+                    # и ранжирование гибрида (RRF по top_k) не меняется.
+                    frame = _search_in(store.table, top_k * DUP_FETCH_FACTOR)
+                results.append(frame)
             return results
 
         return await asyncio.to_thread(_search_all)

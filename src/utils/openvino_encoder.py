@@ -224,6 +224,10 @@ class OpenVINOEmbedder:
         return None
 
     def _apply_prefix(self, texts: list[str], task: Literal["query", "document"]):
+        # Вход модели — в нижнем регистре: rubert-tiny2 различает регистр, и запрос
+        # ЗАГЛАВНЫМИ ставил правильный документ первым в 3% запросов вместо 50%
+        # (стенд, 01.10.2026). Хранимый текст, BM25 и count_tokens не меняются.
+        texts = [x.lower() for x in texts]
         if self.prefix:
             return [f"{self.prefix[task]}{x}" for x in texts]
         return texts

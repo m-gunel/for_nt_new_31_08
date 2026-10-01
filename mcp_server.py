@@ -845,6 +845,50 @@ def _format_score(value):
     return ", score=%.3f" % value if isinstance(value, (int, float)) else ""
 
 
+# Единица «страницы» фрагмента по формату: у pptx это слайд, у таблиц — лист.
+_PAGE_UNIT = {".pptx": "слайд", ".xlsx": "лист", ".xls": "лист"}
+# Поля места фрагмента, которые демон отдаёт в /search (src/server/model.py).
+_CHUNK_PLACE = ("kind", "page_start", "page_end", "line_start", "line_end", "section",
+                "table_id", "row_start", "row_end")
+
+
+def _span(start, end):
+    return "%s" % start if end in (None, start) else "%s–%s" % (start, end)
+
+
+def _chunk_place(chunk, ext):
+    """«стр. 3–4 · Глава 2 › 2.1» — где в документе фрагмент; пусто у старого демона."""
+    parts = []
+    if isinstance(chunk.get("page_start"), int):
+        unit = _PAGE_UNIT.get(ext, "стр.")
+        parts.append("%s %s" % (unit, _span(chunk["page_start"], chunk.get("page_end"))))
+    if isinstance(chunk.get("line_start"), int):
+        parts.append("строки %s" % _span(chunk["line_start"], chunk.get("line_end")))
+    if chunk.get("section"):
+        parts.append(str(chunk["section"]))
+    return " · ".join(parts)
+
+
+def _document_line(doc):
+    """Строка о документе: название, автор, редактор, дата изменения, объём."""
+    if not isinstance(doc, dict):
+        return ""
+    parts = []
+    if doc.get("title"):
+        parts.append("«%s»" % doc["title"])
+    if doc.get("author"):
+        parts.append("автор: %s" % doc["author"])
+    editor = doc.get("last_modified_by")
+    if editor and editor != doc.get("author"):
+        parts.append("изменил: %s" % editor)
+    changed = doc.get("doc_modified") or doc.get("date_modified")
+    if changed:
+        parts.append("изменён: %s" % str(changed)[:10])
+    if isinstance(doc.get("page_count"), int):
+        parts.append("объём: %s" % doc["page_count"])
+    return "; ".join(parts)
+
+
 def _tool_search(args):
     _reject_unknown(args, ("query", "limit", "query_type", "sources"))
     query = _require_str(args, "query")
@@ -910,6 +954,11 @@ def _tool_search(args):
             break
         block = [header]
         used += len(header)
+        about = _document_line(item.get("document"))
+        if about and used + len(about) + 5 <= MAX_OUTPUT_CHARS:
+            block.append("   " + about)
+            used += len(about) + 3
+        ext = os.path.splitext(path)[1].lower()
         chunks = []
         for chunk in (item.get("chunks") or [])[:MAX_CHUNKS_PER_DOC]:
             content = (chunk.get("content") or "").strip()
@@ -917,22 +966,26 @@ def _tool_search(args):
                 continue
             if len(content) > MAX_CHUNK_CHARS:
                 content = content[:MAX_CHUNK_CHARS] + "…"
-            line = "   · " + content
+            place = _chunk_place(chunk, ext)
+            line = "   · " + ("[%s] " % place if place else "") + content
             if used + len(line) > MAX_OUTPUT_CHARS:
                 break
             block.append(line)
             used += len(line)
-            chunks.append({"text": content, "score": chunk.get("score")})
+            entry = {"text": content, "score": chunk.get("score")}
+            entry.update((k, chunk[k]) for k in _CHUNK_PLACE if chunk.get(k) is not None)
+            chunks.append(entry)
         lines.extend(block)
-        structured.append(
-            {
-                "path": path,
-                "title": title,
-                "type": item_type,
-                "score": item.get("score"),
-                "chunks": chunks,
-            }
-        )
+        result = {
+            "path": path,
+            "title": title,
+            "type": item_type,
+            "score": item.get("score"),
+            "chunks": chunks,
+        }
+        if isinstance(item.get("document"), dict):
+            result["document"] = {k: v for k, v in item["document"].items() if v is not None}
+        structured.append(result)
 
     shown = len(structured)
     head = "Найдено документов: %s" % total
@@ -1429,7 +1482,23 @@ _SEARCH_OUTPUT_SCHEMA = {
                     "title": {"type": "string"},
                     "type": {"type": "string"},
                     "score": {"type": ["number", "null"]},
-                    "chunks": {"type": "array", "items": {"type": "object"}},
+                    "chunks": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": (
+                            "Фрагменты: text, score и, если демон знает, место — "
+                            "page_start/page_end (страница, слайд или лист), "
+                            "line_start/line_end, section, kind, table_id"
+                        ),
+                    },
+                    "document": {
+                        "type": "object",
+                        "description": (
+                            "Свойства документа, если демон их отдаёт: title, author, "
+                            "last_modified_by, date_created, date_modified, page_count, "
+                            "size, mime, sha256, source_uri"
+                        ),
+                    },
                 },
                 "required": ["path", "title", "type"],
             },

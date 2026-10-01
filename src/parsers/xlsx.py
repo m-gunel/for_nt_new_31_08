@@ -12,6 +12,8 @@ from src.utils import get_logger
 from src.utils.r7_office import convert_via_r7
 
 from .base import Chunk, Parser, parser
+from .doc_model import Block, ParsedDoc
+from .metadata import ooxml_properties
 
 logger = get_logger(__name__)
 
@@ -52,7 +54,16 @@ class XlsxParser(Parser):
         self.min_text_ratio = 0.1
         self.sample_size_for_analysis = 50
 
-    def iter_chunks_io(self, file: BinaryIO) -> Generator[Chunk, Any, None]:
+    def parse_io(self, file: BinaryIO) -> ParsedDoc:
+        """Карточки строк — готовые чанки (`whole`). Лист, шапка, даты — шаг 3."""
+        meta, titles = ooxml_properties(file, "xlsx")
+        blocks = [
+            Block(c["text"], kind="table_row", whole=True)
+            for c in self._row_chunks_io(file)
+        ]
+        return ParsedDoc(blocks, meta, titles, title_from_text=False)
+
+    def _row_chunks_io(self, file: BinaryIO) -> Generator[Chunk, Any, None]:
         # Create a temporary file since openpyxl needs a file path
         # Легаси .xls узнаём по магии OLE2-контейнера, а не по расширению:
         # парсер выбирается по расширению, но в потоковом API (вложения почты)

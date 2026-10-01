@@ -1,11 +1,14 @@
 from collections import defaultdict
 from collections.abc import Sequence
+from datetime import datetime
 from itertools import chain
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import polars as pl
 from pydantic import BaseModel, Field, field_validator
+
+from src.common import strip_doc_prefix
 
 
 def _row_score(row: dict[str, Any]) -> float:
@@ -30,6 +33,49 @@ class HealthCheckResponse(BaseModel):
 class Chunk(BaseModel):
     content: str
     score: float
+    # Место фрагмента в документе. Необязательные: у строк, записанных до
+    # появления полей, и в выдаче почты их нет.
+    kind: str | None = Field(None, description="text / table / table_row / notes / ocr")
+    page_start: int | None = Field(
+        None, description="Страница PDF, слайд или лист — с 1"
+    )
+    page_end: int | None = None
+    line_start: int | None = Field(None, description="Строка txt — с 1")
+    line_end: int | None = None
+    section: str | None = Field(None, description="Путь заголовков: «Глава 2 › 2.1»")
+    table_id: str | None = None
+    row_start: int | None = None
+    row_end: int | None = None
+
+
+_CHUNK_PLACE = tuple(k for k in Chunk.model_fields if k not in ("content", "score"))
+
+
+class DocumentInfo(BaseModel):
+    """Свойства документа из индекса (src/common/doc_meta.py); всё необязательное."""
+
+    title: str | None = Field(
+        None, description="Название из свойств или текста документа"
+    )
+    author: str | None = None
+    last_modified_by: str | None = None
+    subject: str | None = None
+    keywords: str | None = None
+    ext: str | None = None
+    mime: str | None = None
+    size: int | None = None
+    page_count: int | None = Field(None, description="Страниц, слайдов или листов")
+    language: str | None = None
+    date_created: datetime | None = Field(
+        None, description="Рождение файла; нет — пусто"
+    )
+    date_modified: datetime | None = None
+    doc_created: datetime | None = Field(None, description="Дата из свойств документа")
+    doc_modified: datetime | None = None
+    sha256: str | None = None
+    source_type: str | None = None
+    source_uri: str | None = None
+    origin_url: str | None = None
 
 
 class BaseSearchResponseItem(BaseModel):
@@ -38,6 +84,7 @@ class BaseSearchResponseItem(BaseModel):
     chunks: list[Chunk]
     type: Literal["file", "application", "email", "email_attachment"]
     score: float
+    document: DocumentInfo | None = None
 
 
 class SearchResponseItemFile(BaseSearchResponseItem):
@@ -81,6 +128,7 @@ class SearchResponse(BaseModel):
         """
         res: dict[str, list[Chunk]] = defaultdict(list)
         titles: dict[str, str] = {}
+        documents: dict[str, DocumentInfo] = {}
         # None приходит, когда поиск невозможен (например, FTS-индекс ещё не
         # построен) — отдаём пустой ответ, а не падаем.
         rows = chain.from_iterable(
@@ -96,7 +144,19 @@ class SearchResponse(BaseModel):
             if title := meta.get("original_name"):
                 if row["path"] not in titles:
                     titles[row["path"]] = title
-            chunk = Chunk(content=row["text"], score=_row_score(row))
+            if row["path"] not in documents and any(
+                meta.get(k) is not None for k in DocumentInfo.model_fields
+            ):
+                documents[row["path"]] = DocumentInfo.model_validate(
+                    {k: meta.get(k) for k in DocumentInfo.model_fields}
+                )
+            chunk = Chunk(
+                # Строка «Документ: <имя>» нужна индексу, а не читателю: имя файла
+                # уже в заголовке результата.
+                content=strip_doc_prefix(row["text"], meta.get("original_name")),
+                score=_row_score(row),
+                **{k: row.get(k) for k in _CHUNK_PLACE},
+            )
             res[row["path"]].append(chunk)
 
         return cls(
@@ -114,6 +174,7 @@ class SearchResponse(BaseModel):
                         chunks=chunks,
                         absolute_path=file_path,
                         score=max(chunk.score for chunk in chunks),
+                        document=documents.get(file_path),
                     )
                     for file_path, chunks in res.items()
                 ],
@@ -208,6 +269,8 @@ class ReadFileRequest(BaseModel):
 class ReadFileResponse(BaseModel):
     """Полный текст файла в понимании парсеров индексации."""
 
-    text: str = Field(description="Текст файла, собранный из чанков парсера")
+    text: str = Field(
+        description="Полный текст файла после разбора и нормализации, без нарезки"
+    )
     total_chars: int = Field(description="Полная длина текста до обрезки")
     truncated: bool = Field(description="Обрезан ли текст лимитом ручки")

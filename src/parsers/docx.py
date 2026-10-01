@@ -2,28 +2,26 @@ import os
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Generator
-from typing import Any, BinaryIO
+from typing import BinaryIO
 
 from docx2txt import process
 
 from src.utils import get_logger
 from src.utils.r7_office import convert_via_r7, find_x2t
 
-from .base import Chunk, Parser, parser
+from .base import Parser, parser
+from .doc_model import Block, ParsedDoc
+from .metadata import ooxml_properties
 
 lg = get_logger(__name__)
 
 
 @parser("docx")
 class DocxParser(Parser):
-    def iter_chunks_io(self, file: BinaryIO) -> Generator[Chunk, Any, None]:
-        idx = 0
-        # txt = md.convert_stream(file).text_content
-        txt = process(file)
-        for split in self._config.embed_splitter.split_text(txt):
-            yield Chunk(idx=idx, text=split)
-            idx += 1
+    def parse_io(self, file: BinaryIO) -> ParsedDoc:
+        """Пока весь текст docx2txt одним блоком; заголовки, таблицы, правки — шаг 4."""
+        meta, titles = ooxml_properties(file, "docx")
+        return ParsedDoc([Block(process(file))], meta, titles)
 
 
 def _find_doc_converter() -> tuple[str, list[str]] | None:
@@ -60,14 +58,14 @@ def _find_doc_converter() -> tuple[str, list[str]] | None:
 
 @parser("doc")
 class DocParser(Parser):
-    def iter_chunks_io(self, file: BinaryIO) -> Generator[Chunk, Any, None]:
+    def parse_io(self, file: BinaryIO) -> ParsedDoc:
         converter = _find_doc_converter()
         if converter is None:
             lg.warning(
                 "не найден конвертер для .doc (нужен один из: textutil, catdoc, "
                 "antiword, soffice, Р7-Офис) — файл пропущен"
             )
-            return
+            return ParsedDoc([])
 
         name, argv = converter
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -80,12 +78,8 @@ class DocParser(Parser):
             except Exception as exc:
                 # Битый или нестандартный .doc не должен ронять индексацию.
                 lg.warning("не удалось разобрать .doc через %s: %s", name, exc)
-                return
-
-        idx = 0
-        for split in self._config.embed_splitter.split_text(txt):
-            yield Chunk(idx=idx, text=split)
-            idx += 1
+                return ParsedDoc([])
+        return ParsedDoc([Block(txt)])
 
 
 def _convert_doc(name: str, argv: list[str], src: str, dst: str, outdir: str) -> str:

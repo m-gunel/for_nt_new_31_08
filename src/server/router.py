@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException, Response
 
 from src.common import IndexingStatus
 from src.indexer import AppIndex, reconfigure_lock, restart_watcher, stop_watcher
-from src.parsers import get_parser
+from src.parsers import get_parser, read_document_text
 from src.server.model import (
     HealthCheckResponse,
     IndexingControlResponse,
@@ -444,20 +444,21 @@ def _read_file_sync(raw_path: str, cfg: AppConfig) -> ReadFileResponse:
     if parser is None:
         raise HTTPException(status_code=415, detail="формат не индексируется")
     try:
-        chunks = list(parser.iter_chunks(str(path)))
+        # Полный текст документа до нарезки: склейка чанков дублировала бы
+        # перекрытия сплиттера.
+        text = read_document_text(path) or ""
     except Exception as exc:
         lg.warning("read_file: разбор %s не удался (%s)", path, exc)
         raise HTTPException(
             status_code=422, detail="не удалось разобрать файл"
         ) from None
-    if not chunks:
+    if not text:
         # Парсер честно отработал, но текста нет: например, .doc на машине
         # без конвертера. Это не сбой разбора, и агенту полезнее явный отказ,
         # чем пустой ответ.
         raise HTTPException(
             status_code=422, detail="парсер не дал текста (нет конвертера?)"
         )
-    text = "\n".join(chunk["text"] for chunk in chunks)
     total_chars = len(text)
     truncated = total_chars > _READ_FILE_MAX_CHARS
     return ReadFileResponse(

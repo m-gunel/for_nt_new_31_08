@@ -1,16 +1,18 @@
-from collections.abc import Generator
-from typing import Any, BinaryIO
+from typing import BinaryIO
 
-from .base import Chunk, Parser, parser
+from .base import Parser, parser
+from .doc_model import Block, ParsedDoc
 
 
 @parser("txt")
 class TxtParser(Parser):
     """Парсер для обычных текстовых файлов (.txt)."""
 
-    def iter_chunks_io(self, file: BinaryIO) -> Generator[Chunk, Any, None]:
-        idx = 0
+    def parse_io(self, file: BinaryIO) -> ParsedDoc:
+        """Строка — блок: чанк знает свои строки в исходном файле."""
         text = file.read().decode("utf-8", errors="replace")
-        for split in self._config.embed_splitter.split_text(text):
-            yield Chunk(idx=idx, text=split)
-            idx += 1
+        # Только \n и \r: splitlines() режет ещё по \x0b, \x0c, \x1c–\x1e, U+2028 —
+        # и номера строк разошлись бы с редактором.
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        blocks = [Block(line, line=n) for n, line in enumerate(lines, 1)]
+        return ParsedDoc(blocks, {"encoding": "utf-8"})

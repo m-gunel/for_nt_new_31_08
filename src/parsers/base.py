@@ -1,7 +1,6 @@
 import abc
 import os
 from collections.abc import AsyncGenerator, AsyncIterable, Callable, Generator, Iterable
-from datetime import datetime
 from pathlib import Path
 from typing import (
     Any,
@@ -11,26 +10,22 @@ from typing import (
 from src.common import Chunk, DocumentMetadata
 from src.utils import ConfigMixin, wrap_iter_to_async
 
+from .doc_model import ParsedDoc, chunk_document, prepare
+from .metadata import file_metadata
+
 
 class Parser(abc.ABC, ConfigMixin):
     @property
     def _config(self):
         return self.cfg
 
-    def get_metadata(self, path: str):
-        # Get the creation and modification time
-        creation_time = os.path.getctime(path)
-        modification_time = os.path.getmtime(path)
+    def get_metadata(self, path: str) -> DocumentMetadata:
+        """Поля файловой системы; свойства из содержимого добавляет конвейер разбора."""
+        return DocumentMetadata(**file_metadata(path))
 
-        # Convert timestamps to readable date-time format
-        creation_time_readable = datetime.fromtimestamp(creation_time)
-        modification_time_readable = datetime.fromtimestamp(modification_time)
-        return DocumentMetadata(
-            date_created=creation_time_readable,
-            date_modified=modification_time_readable,
-            original_name=Path(path).name,
-            ext=Path(path).suffix[1:],
-        )
+    def parse_io(self, file: BinaryIO) -> ParsedDoc:
+        """Разобрать файл в блоки и свойства из самого файла (src/parsers/doc_model.py)."""
+        raise NotImplementedError
 
     def iter_chunks(self, path: str) -> Iterable[Chunk]:
         with open(path, "rb") as f:
@@ -42,8 +37,11 @@ class Parser(abc.ABC, ConfigMixin):
                 yield chunk
 
     def iter_chunks_io(self, file: BinaryIO) -> Generator[Chunk, Any, None]:
-        """Парсер должен возвращать итератор чанков документа"""
-        raise NotImplementedError
+        """Чанки документа с полями места — без префикса «Документ: …» и метаданных:
+        их добавляет конвейер индексации, которому известно имя файла."""
+        yield from chunk_document(
+            prepare(self.parse_io(file)), self._config.embed_splitter
+        )
 
     async def async_iter_chunks_io(self, file: BinaryIO) -> AsyncGenerator[Chunk, Any]:
         # Без лога на каждый чанк: при 10 000 файлов это сотни тысяч записей

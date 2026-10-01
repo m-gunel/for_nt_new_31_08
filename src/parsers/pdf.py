@@ -1,30 +1,25 @@
 import io
 import logging
-from collections.abc import Generator
-from typing import Any, BinaryIO
+from typing import BinaryIO
 
-# import pymupdf4llm
 import pymupdf
 
-from .base import Chunk, Parser, parser
+from .base import Parser, parser
+from .doc_model import Block, ParsedDoc
+from .metadata import pdf_properties
 
 logging.getLogger("pypdf._reader").setLevel(logging.ERROR)
 
 
 @parser("pdf")
 class PdfParser(Parser):
-    def iter_chunks_io(self, file: BinaryIO) -> Generator[Chunk, Any, None]:
-        # reader = PdfReader(file)
-        # txt = md.convert_stream(file).text_content
-        # txt = pymupdf4llm.to_markdown(pymupdf.open(file))
+    def parse_io(self, file: BinaryIO) -> ParsedDoc:
+        """Страница — блок: чанк знает свои страницы. Порядок чтения — как у get_text()."""
         with (
-            # TODO: зменить на ruff-реализацию
             pymupdf.open(stream=file)
             if not isinstance(file, io.BufferedReader)
             else pymupdf.open(file) as doc
         ):
-            txt = "\n".join(page.get_text() for page in doc)  # type: ignore
-        idx = 0
-        for split in self._config.embed_splitter.split_text(txt):
-            yield Chunk(idx=idx, text=split)
-            idx += 1
+            blocks = [Block(page.get_text(), page=n) for n, page in enumerate(doc, 1)]  # type: ignore
+            meta, titles = pdf_properties(doc)
+        return ParsedDoc(blocks, meta, titles, pdf=True)

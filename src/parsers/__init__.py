@@ -3,7 +3,7 @@ import concurrent
 import concurrent.futures
 import email
 import io
-from collections.abc import AsyncIterable, Iterable
+from collections.abc import AsyncIterable, Iterable, Iterator
 from contextlib import AsyncExitStack
 from datetime import datetime
 from pathlib import Path
@@ -12,13 +12,22 @@ from typing import BinaryIO, Protocol
 import aiofiles
 from aiofiles.threadpool.binary import AsyncBufferedReader
 
-from src.common import ChunkWithMeta, DocumentMetadata, FileMetadata, is_email_path
+from src.common import (
+    ChunkWithMeta,
+    DocumentMetadata,
+    FileMetadata,
+    doc_prefix,
+    is_email_path,
+)
 from src.thunderbird.get_body import Attachment, Body, process_message
 from src.thunderbird.lazy_iter_mbox import _decode_filename
-from src.utils import get_config, get_logger
+from src.utils import get_config, get_logger, wrap_iter_to_async
 
-from .base import file_extension, get_parser, get_parsers_registry
+from .base import Parser, file_extension, get_parser, get_parsers_registry
+from .doc_model import ParsedDoc, chunk_document, full_text, prepare
 from .docx import DocParser, DocxParser
+from .metadata import clean_title, content_metadata, first_line_title, language
+from .normalize import normalize_field
 from .pdf import PdfParser
 from .pptx import PptxParser
 from .txt import TxtParser
@@ -31,13 +40,89 @@ __all__ = [
     "PptxParser",
     "TxtParser",
     "XlsxParser",
+    "document_chunks",
+    "file_chunks",
     "file_extension",
     "get_parsers_registry",
     "parse_files",
     "parse_files_io",
+    "read_document_text",
 ]
 
 lg = get_logger(__name__)
+
+
+def _document_meta(doc: ParsedDoc, base: DocumentMetadata) -> DocumentMetadata:
+    """Метаданные документа: поля ФС/письма + свойства файла + производные от текста."""
+    meta: dict = dict(base)
+    for k, v in doc.meta.items():
+        if v is not None and meta.get(k) is None:
+            meta[k] = v
+    text = full_text(doc)
+    head = text[:5000]
+    title = next((t for t in (clean_title(c, head) for c in doc.titles) if t), None)
+    if title is None and doc.title_from_text:
+        title = first_line_title(text)
+    meta["title"] = title
+    meta["language"] = language(text)
+    return DocumentMetadata(**meta)
+
+
+def document_chunks(
+    path: Path,
+    parser: Parser,
+    *,
+    io: BinaryIO | None = None,
+    doc_meta: DocumentMetadata | None = None,
+    file_meta: FileMetadata | None = None,
+) -> Iterator[ChunkWithMeta]:
+    """Конвейер разбора одного документа — общий для индексации, стенда и вложений.
+
+    Разбор → нормализация → метаданные → нарезка с полями места → фильтр пустого
+    и повторов → «Документ: <имя>» сверху каждого чанка. Синхронный: в индексации
+    идёт в потоке через wrap_iter_to_async.
+    """
+    if io is None:
+        with open(path, "rb") as f:
+            yield from document_chunks(
+                path,
+                parser,
+                io=f,
+                doc_meta=doc_meta or parser.get_metadata(str(path)),
+                file_meta=file_meta,
+            )
+        return
+    base = dict(doc_meta or {})
+    ext = base.get("ext") or file_extension(path)
+    base.update(content_metadata(io, ext))
+    doc = prepare(parser.parse_io(io))
+    meta = _document_meta(doc, DocumentMetadata(**base))
+    prefix = doc_prefix(meta.get("original_name"))
+    for chunk in chunk_document(doc, get_config().embed_splitter):
+        chunk["text"] = prefix + chunk["text"]
+        row = ChunkWithMeta(**chunk, meta=meta, path=str(path))
+        if file_meta is not None:
+            row["file_meta"] = file_meta
+        yield row
+
+
+def file_chunks(path: str | Path) -> Iterator[ChunkWithMeta]:
+    """Чанки файла ровно как их пишет индексатор (стенд замера сверяет по ним)."""
+    p = Path(path)
+    if parser := get_parser(file_extension(p)):
+        yield from document_chunks(p, parser)
+
+
+def read_document_text(path: str | Path) -> str | None:
+    """Полный текст документа после нормализации — без нарезки и перекрытий.
+
+    None — формат не индексируется.
+    """
+    p = Path(path)
+    if (parser := get_parser(file_extension(p))) is None:
+        return None
+    with open(p, "rb") as f:
+        return full_text(prepare(parser.parse_io(f)))
 
 
 class FailCallback(Protocol):
@@ -54,14 +139,8 @@ class FailCallback(Protocol):
 def parse_files(files: Iterable[Path]):
     for p in files:
         if parser := get_parser(file_extension(p)):
-            meta = parser.get_metadata(str(p))
             try:
-                for chunk in parser.iter_chunks(str(p)):
-                    yield ChunkWithMeta(
-                        **chunk,
-                        meta=meta,
-                        path=str(p),
-                    )
+                yield from document_chunks(Path(p), parser)
             except Exception:
                 lg.exception("processing %s", p)
         else:
@@ -111,6 +190,7 @@ async def _process_email_chunks(
     msg = email.message_from_bytes(data)
     dt = datetime.fromtimestamp(meta.mtime_seconds)
     subject = _decode_filename(msg["Subject"])
+    sender = normalize_field(_decode_filename(msg["From"]) if msg["From"] else None)
     lg.debug("process email subject=%s", subject)
     chunks_cnt = 0
     for part in process_message(msg):
@@ -122,6 +202,9 @@ async def _process_email_chunks(
                 ext="body",
                 th_message_id=msg["Message-ID"],
                 conversation_id=msg["In-Reply-To"],
+                source_type="email",
+                title=normalize_field(subject),
+                author=sender,
             )
             if not part.body:
                 continue
@@ -154,6 +237,7 @@ async def _process_email_chunks(
                     ext=ext,
                     th_message_id=msg["Message-ID"],
                     conversation_id=msg["In-Reply-To"],
+                    source_type="email_attachment",
                 )
                 lg.debug("process email attachment %s", part.original_name)
                 async for chunk in _process_path(
@@ -259,27 +343,15 @@ async def _process_path(
         ext = file_extension(path)
     if parser := get_parser(ext.lower()):
         chunks = 0
-        doc_meta = doc_meta or parser.get_metadata(str(path))
         try:
-            if io is None:
-                lg.debug("begin procesing %s", path)
-                async for chunk in parser.async_iter_chunks(str(path)):
-                    yield ChunkWithMeta(
-                        **chunk,
-                        meta=doc_meta,
-                        path=str(path),
-                        file_meta=meta,
-                    )
-                    chunks += 1
-            else:
-                async for chunk in parser.async_iter_chunks_io(io):
-                    yield ChunkWithMeta(
-                        **chunk,
-                        meta=doc_meta,
-                        path=str(path),
-                        file_meta=meta,
-                    )
-                    chunks += 1
+            lg.debug("begin procesing %s", path)
+            # Метаданные ФС — внутри try: файл, исчезнувший между сканом и
+            # разбором, — временный сбой этого файла, а не падение всего прохода.
+            async for chunk in wrap_iter_to_async(
+                document_chunks(path, parser, io=io, doc_meta=doc_meta, file_meta=meta)
+            ):
+                yield chunk
+                chunks += 1
         except Exception:
             # Разбор упал — это может быть временной причиной (файл ещё
             # дописывается, занят, сбой инференса). Файл НЕ помечаем

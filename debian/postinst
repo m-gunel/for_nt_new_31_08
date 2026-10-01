@@ -1,0 +1,448 @@
+#!/bin/sh
+# БТ §7 «Установка».
+#
+# Порядок на configure:
+#   1) fix_perms — чиним права, оставшиеся от сборки 1.0.6;
+#   2) маркер DEBHELPER — глобальное включение юнитов;
+#   3) снятие runtime-маски (её ставит prerm), старт демона и регистрация MCP
+#      в уже открытых сессиях — своим блоком;
+#   4) итог установки: по каждому пользователю и общий текст.
+#
+# На abort-upgrade, abort-deconfigure и abort-remove выполняется только шаг 3,
+# без итогового текста. Сюда dpkg приходит, когда обновление или удаление
+# сорвалось уже ПОСЛЕ нашего prerm: демон и .path-юниты у пользователей
+# остановлены, демон замаскирован, а при abort-remove ещё и снята регистрация
+# MCP. Пакет снова числится установленным, и всё это нужно вернуть — так же
+# поступает сниппет debhelper для системных служб.
+#
+# Включение юнитов здесь НЕ пишется руками — его вставляет dh_installsystemduser
+# через маркер DEBHELPER. Эта команда входит в стандартную последовательность
+# dh начиная с compat 12, находит наши юниты в usr/lib/systemd/user, видит у них
+# секцию [Install] и генерирует `deb-systemd-helper --user enable`. Тот кладёт
+# симлинки в /etc/systemd/user/default.target.wants/, то есть включает юниты
+# сразу для ВСЕХ пользователей системы, причём запущенный systemd для этого не
+# нужен — что и требуется при сборке образа ОС в chroot. Исключение — установка
+# без chroot (непустой DPKG_ROOT): вставка стоит под `[ -z "$DPKG_ROOT" ]` и
+# юниты не включает; print_summary об этом так и пишет.
+#
+# Ручной `systemctl --global enable` был бы здесь дублем и разошёлся бы с
+# состоянием в /var/lib/systemd/deb-systemd-user-helper-enabled, которым живёт
+# deb-systemd-helper.
+#
+# Чего вставка НЕ делает на compat 13 — так это старта в уже открытых сессиях:
+# старт пользовательских юнитов debhelper генерирует только с compat 14, и это
+# будет `deb-systemd-invoke --user restart`. Он же стоял здесь раньше, и от него
+# отказались: он требует systemctl >= 249 и на более старом systemd только пишет
+# «skipping» в stderr; к менеджеру пользователя ходит через
+# `systemctl --user --machine <uid>@`, то есть через systemd-run с PAM-сессией
+# login и мост к D-Bus пользователя, — нет шины, нет старта; и перед стартом
+# спрашивает is-enabled, молча пропуская юнит, который менеджер пользователя не
+# смог загрузить (ровно случай 1.0.6). Вывод при этом был заглушён целиком, и
+# установка говорила «включён», ничего не подняв.
+#
+# Теперь — runuser от имени пользователя и systemctl --user на приватном сокете
+# его менеджера ($XDG_RUNTIME_DIR/systemd/private): без D-Bus и без PAM-сессии
+# login, работает на любой версии systemd с user-менеджером. Ошибки видны,
+# состояние юнитов проверяется и печатается. При переходе на compat 14 нужно
+# проследить, чтобы debhelper не вставил свой deb-systemd-invoke --user рядом:
+# этот блок должен остаться единственным.
+#
+# Важно: поднятый демон сразу начинает индексацию (autostart_indexing: true в
+# /etc/lib-local-rag/distro.yml) — поставка бесшовная, вмешательства
+# пользователя не требует. Настройки индексации меняет кодинговый агент через
+# MCP-мост или HTTP API, вручную ничего править не надо.
+set -e
+
+REGISTER=/usr/lib/lib-local-rag/mcp/register_mcp.py
+LAUNCHER=/usr/lib/lib-local-rag/mcp/mcp_launcher.sh
+UNITS="lib-local-rag.service lib-local-rag-mcp-register.service lib-local-rag-mcp-register-wsc.path lib-local-rag-mcp-register-gigacode.path"
+
+# --- 1. Права -----------------------------------------------------------------
+#
+# Пакет 1.0.6 был собран без dh_fixperms из дерева с umask 077: файлы легли 0600,
+# каталоги 0700. root при установке их читал, а systemd --user работает от
+# имени пользователя, юнит открыть не может и сообщает «could not be found».
+#
+# Новая сборка с правильными правами сама это НЕ вылечит: dpkg при обновлении
+# заменяет файлы, но права уже существующих каталогов не меняет
+# (src/main/archives.c), и каталоги 0700 от 1.0.6 пережили бы апгрейд. Поэтому
+# чиним здесь, на каждом configure — на исправной системе find ничего не
+# находит, и шаг бесплатен.
+#
+# Только «добавить чтение другим», никогда не «отнять»: go+rX у файла даёт
+# исполнение лишь тому, что уже исполняемо у владельца (бинарь 0700 станет
+# 0755, а не 0744).
+fix_perms() {
+    root="${DPKG_ROOT:-}"
+    list=""
+    # Предки наших деревьев. Их мог создать сам 1.0.6, если на машине их не
+    # было, — и тогда 0700 закрыл бы всё, что под ними. Трогаем, только если
+    # у других нет даже прохода (o+x): с таким /opt не работает ни один пакет.
+    for dir in "$root/opt" "$root/usr/lib/systemd" "$root/usr/lib/systemd/user"; do
+        [ -d "$dir" ] || continue
+        if [ -n "$(find "$dir" -maxdepth 0 ! -perm -o+x -print)" ]; then
+            chmod go+rx "$dir" || true
+            list="$list$dir
+"
+        fi
+    done
+    for tree in "$root/opt/lib-local-rag" "$root/usr/lib/lib-local-rag" "$root/etc/lib-local-rag"; do
+        [ -d "$tree" ] || continue
+        bad=$(find "$tree" \( \( -type d ! -perm -o+rx \) -o \( -type f ! -perm -o+r \) \) -print) || bad=""
+        [ -n "$bad" ] || continue
+        find "$tree" -type d ! -perm -o+rx -exec chmod go+rx {} + || true
+        find "$tree" -type f ! -perm -o+r -exec chmod go+rX {} + || true
+        list="$list$bad
+"
+    done
+    # Шаблон без совпадений остаётся в цикле как есть — его отсекает -f.
+    for unit in "$root"/usr/lib/systemd/user/lib-local-rag*.service \
+                "$root"/usr/lib/systemd/user/lib-local-rag*.path; do
+        [ -f "$unit" ] || continue
+        if [ -n "$(find "$unit" -maxdepth 0 ! -perm -o+r -print)" ]; then
+            chmod go+r "$unit" || true
+            list="$list$unit
+"
+        fi
+    done
+
+    if [ -z "$list" ]; then
+        return 0
+    fi
+    # После 1.0.6 это сотни каталогов бандла — на экран выводим первые десять.
+    count=$(printf '%s' "$list" | grep -c '') || count=0
+    echo "LocalRAG: исправлены права, оставшиеся от предыдущей сборки:"
+    printf '%s' "$list" | head -n 10 | sed 's/^/    /'
+    if [ "$count" -gt 10 ]; then
+        echo "    ... и ещё $((count - 10))"
+    fi
+}
+
+# --- 3. Старт в уже открытых сессиях ------------------------------------------
+
+# Нижняя граница обычных пользователей. Системные учётки (greeter экрана входа
+# и прочие) ниже неё, и им демон не нужен — у юнитов на то же стоит
+# ConditionUser=!@system. Доменные uid SberOS выше любой разумной границы.
+uid_min() {
+    min=""
+    if [ -r /etc/login.defs ]; then
+        min=$(sed -n 's/^[[:space:]]*UID_MIN[[:space:]][[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+            /etc/login.defs | tail -n 1)
+    fi
+    case "$min" in
+        ''|*[!0-9]*) min=1000 ;;
+    esac
+    echo "$min"
+}
+
+# uid всех запущенных менеджеров systemd --user. Именно менеджеры, а не
+# getent passwd: доменных пользователей (SSSD) перечисление passwd не
+# показывает, а нам и нужны только те, у кого сессия открыта сейчас.
+active_uids() {
+    systemctl list-units --type=service --state=active --plain --no-legend 'user@*.service' \
+        | sed -n 's/^[[:space:]]*user@\([0-9][0-9]*\)\.service[[:space:]].*/\1/p'
+}
+
+# Команда от имени пользователя $name (uid $uid). XDG_RUNTIME_DIR — чтобы
+# systemctl --user нашёл приватный сокет менеджера; DBUS_SESSION_BUS_ADDRESS
+# гасим, чтобы он не пошёл на чужую (например, унаследованную от sudo) шину.
+# timeout — страховка от зависшего менеджера или сетевого дома: установка
+# пакета не должна висеть из-за одного пользователя.
+run_as_user() {
+    timeout 60 runuser -u "$name" -- env -u DBUS_SESSION_BUS_ADDRESS \
+        XDG_RUNTIME_DIR="/run/user/$uid" "$@" </dev/null
+}
+
+start_for_user() {
+    echo ""
+    echo "LocalRAG: пользователь $name (uid $uid)"
+
+    # (1) Регистрация MCP напрямую, не через юнит: так её вывод — куда именно
+    # записано — виден прямо в выводе установки. HOME передаём явно, а
+    # XDG_CONFIG_HOME root'а к чужому дому отношения не имеет. Остальные дома
+    # (папку разработчика /home/work/...) скрипт находит сам.
+    #
+    # --strict: без него скрипт возвращает 0 почти всегда (так нужно юниту),
+    # и итог писал бы «выполнена», даже когда обе цели дали ОШИБКУ или агента
+    # нет ни в одном доме. С ним код говорит, что произошло на самом деле:
+    # 0 — записано или уже было записано, 3 — агентов нет, записывать некуда,
+    # 1 — хотя бы одна цель дала ОШИБКУ или не найден ни один дом, 2 — отказ
+    # запуска (под root; через runuser случаться не должен).
+    rc=0
+    out=$(run_as_user env -u XDG_CONFIG_HOME HOME="$home" \
+        python3 "$REGISTER" --all --strict --launcher "$LAUNCHER" 2>&1) || rc=$?
+    if [ -n "$out" ]; then
+        printf '%s\n' "$out" | sed -e '/^[[:space:]]*$/d' -e 's/^/    /'
+    fi
+    case "$rc" in
+        0)
+            mcp="регистрация MCP выполнена" ;;
+        3)
+            mcp="агенты (WSC, GigaCode) в домашних каталогах не найдены — MCP пропишется автоматически, когда агент появится" ;;
+        1)
+            mcp="регистрация MCP с ОШИБКАМИ — см. строки ОШИБКА выше"
+            echo "LocalRAG: ВНИМАНИЕ: регистрация MCP у пользователя $name завершилась с ошибками (строки ОШИБКА выше)." >&2
+            echo "  Диагностика (от имени пользователя): python3 $REGISTER --doctor" >&2
+            ;;
+        *)
+            mcp="регистрация MCP НЕ выполнена: ошибка запуска register_mcp.py (код $rc)"
+            echo "LocalRAG: ВНИМАНИЕ: register_mcp.py у пользователя $name не запустился как надо (код $rc)." >&2
+            echo "  Диагностика (от имени пользователя): python3 $REGISTER --doctor" >&2
+            ;;
+    esac
+
+    # (2) Менеджер мог уже закэшировать юниты как not-found (после 1.0.6 —
+    # наверняка) или держать старую их версию: без daemon-reload restart
+    # работал бы с ней.
+    rc=0
+    run_as_user systemctl --user --no-pager daemon-reload >/dev/null || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "LocalRAG: ВНИМАНИЕ: у пользователя $name не удалось перечитать юниты (daemon-reload, код $rc)." >&2
+    fi
+
+    # (3) restart, а не start: на обновлении prerm уже остановил демон, и одна
+    # команда покрывает и первую установку, и апгрейд. .path-юниты тоже
+    # перезапускаем — так они гарантированно следят по новым строкам
+    # PathChanged=. Сервис регистрации не трогаем: он только что отработал
+    # напрямую в шаге (1).
+    rc=0
+    run_as_user systemctl --user --no-pager restart --no-block \
+        lib-local-rag.service \
+        lib-local-rag-mcp-register-wsc.path \
+        lib-local-rag-mcp-register-gigacode.path >/dev/null || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "LocalRAG: ВНИМАНИЕ: у пользователя $name не удалось запустить юниты (restart, код $rc)." >&2
+    fi
+
+    # (4) Загрузил ли менеджер каждый юнит. Именно здесь 1.0.6 и провалился:
+    # enable прошёл, а менеджер пользователя файл не прочитал.
+    daemon_loaded=yes
+    not_loaded=""
+    for unit in $UNITS; do
+        state=$(run_as_user systemctl --user --no-pager show -p LoadState --value "$unit") || state=""
+        if [ "$state" = loaded ]; then
+            continue
+        fi
+        if [ "$unit" = lib-local-rag.service ]; then
+            daemon_loaded="${state:-неизвестно}"
+        else
+            not_loaded="$not_loaded $unit"
+        fi
+        echo "LocalRAG: ВНИМАНИЕ: у пользователя $name юнит $unit не загружен (LoadState=${state:-неизвестно})." >&2
+        echo "  Подробности (от имени пользователя): journalctl --user -u $unit" >&2
+        echo "  Диагностика: python3 $REGISTER --doctor" >&2
+    done
+
+    # (5) Поднялся ли демон. restart --no-block только ставит задание в
+    # очередь; Type=exec становится active сразу после exec, так что ждать
+    # приходится секунды. Ошибка exec (например, бинарь без права исполнения)
+    # видна здесь как failed или auto-restart.
+    act=""
+    sub=""
+    if [ "$daemon_loaded" = yes ]; then
+        n=0
+        while :; do
+            st=$(run_as_user systemctl --user --no-pager show -p ActiveState -p SubState \
+                lib-local-rag.service) || st=""
+            act=$(printf '%s\n' "$st" | sed -n 's/^ActiveState=//p')
+            sub=$(printf '%s\n' "$st" | sed -n 's/^SubState=//p')
+            case "$act/$sub" in
+                active/*|reloading/*|failed/*|*/auto-restart|/*) break ;;
+            esac
+            n=$((n + 1))
+            if [ "$n" -ge 10 ]; then
+                break
+            fi
+            sleep 1
+        done
+    fi
+
+    if [ "$daemon_loaded" != yes ]; then
+        daemon="юнит демона не загружен (LoadState=$daemon_loaded), демон НЕ запущен"
+    else
+        case "$act/$sub" in
+            active/*|reloading/*)
+                daemon="демон запущен, индексация стартует после прогрева (~45 c)" ;;
+            failed/*|*/auto-restart)
+                daemon="демон НЕ запустился (ActiveState=$act, SubState=$sub)"
+                echo "LocalRAG: ВНИМАНИЕ: у пользователя $name демон не запустился (ActiveState=$act, SubState=$sub)." >&2
+                echo "  Подробности (от имени пользователя): journalctl --user -u lib-local-rag.service" >&2
+                ;;
+            /*)
+                daemon="состояние демона узнать не удалось (менеджер пользователя не ответил)" ;;
+            *)
+                daemon="демон ещё запускается (ActiveState=$act, SubState=$sub)" ;;
+        esac
+    fi
+
+    if [ -n "$not_loaded" ]; then
+        mcp="$mcp; не загружены:$not_loaded"
+    fi
+    echo "  -> $daemon; $mcp"
+    summary="$summary  $name: $daemon; $mcp
+"
+}
+
+# Снять runtime-маску демона, которую prerm ставит на время обновления или
+# удаления: без неё живой MCP-мост в агенте поднял бы демон из наполовину
+# заменённых файлов (подробно — в prerm). Маска лежит в /run/user/UID и сама
+# исчезает с концом сессии, так что снимать нужно только в открытых. Если маски
+# нет, unmask ничего не делает. --quiet — чтобы не печатать «Removed …».
+unmask_for_user() {
+    rc=0
+    run_as_user systemctl --user --no-pager --quiet unmask --runtime \
+        lib-local-rag.service >/dev/null || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "LocalRAG: ВНИМАНИЕ: у пользователя $name не удалось снять временную маску демона (unmask --runtime, код $rc)." >&2
+        echo "  Маска пропадёт при выходе из сессии; снять сразу (от имени пользователя): systemctl --user unmask --runtime lib-local-rag.service" >&2
+    fi
+}
+
+start_in_open_sessions() {
+    summary=""
+    # Установка в образ без chroot (DPKG_ROOT): systemctl здесь дотянулся бы до
+    # менеджеров машины сборки, а не образа. Что сказать об этом, решает
+    # print_summary.
+    if [ -n "${DPKG_ROOT:-}" ]; then
+        return 0
+    fi
+    # Контейнер или chroot сборки образа, где systemd не запущен: поднимать
+    # некого. Юниты включены вставкой debhelper, всё случится при первом
+    # входе пользователя.
+    if [ ! -d /run/systemd/system ]; then
+        summary="  systemd в этой системе не запущен (контейнер или сборка образа): демон и
+  регистрация поднимутся при входе пользователя.
+"
+        return 0
+    fi
+    # Тот же протокол, что у invoke-rc.d и deb-systemd-invoke: код 101 —
+    # «запуск служб запрещён» (chroot сборки образа и т.п.). Запрет касается
+    # только старта: маску, поставленную prerm, снимаем всё равно, иначе
+    # демон у пользователя не поднимется до конца его сессии.
+    allowed=yes
+    if [ -x /usr/sbin/policy-rc.d ]; then
+        rc=0
+        /usr/sbin/policy-rc.d lib-local-rag.service start || rc=$?
+        if [ "$rc" -eq 101 ]; then
+            allowed=""
+        fi
+    fi
+    # runuser и timeout — из util-linux и coreutils, это Essential-пакеты; проверка
+    # на случай урезанного образа.
+    if ! command -v runuser >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1; then
+        echo "LocalRAG: ВНИМАНИЕ: нет runuser или timeout — в открытых сессиях ничего не запущено." >&2
+        summary="  Демон и регистрация поднимутся при следующем входе пользователя.
+"
+        return 0
+    fi
+
+    min=$(uid_min)
+    found=""
+    for uid in $(active_uids); do
+        if [ "$uid" -lt "$min" ]; then
+            continue
+        fi
+        entry=$(getent passwd "$uid") || entry=""
+        name=${entry%%:*}
+        home=$(printf '%s\n' "$entry" | cut -d: -f6)
+        if [ -z "$name" ] || [ -z "$home" ]; then
+            echo "LocalRAG: ВНИМАНИЕ: не удалось определить пользователя с uid $uid (getent passwd), его сессия пропущена." >&2
+            continue
+        fi
+        found=yes
+        unmask_for_user
+        if [ -n "$allowed" ]; then
+            start_for_user
+        fi
+    done
+
+    if [ -z "$allowed" ]; then
+        summary="  policy-rc.d запретил запуск служб: демон и регистрация поднимутся при входе
+  пользователя.
+"
+    elif [ -z "$found" ]; then
+        summary="  Активных сессий нет: демон и регистрация поднимутся при следующем входе
+  пользователя (после перезагрузки).
+"
+    fi
+}
+
+# Итог установки. Тестировщику диагностические команды не даются: пакет сам
+# сообщает, что получилось, — по каждому пользователю выше и сводкой здесь.
+# Подсказки для сопровождающего стоят только в строках «LocalRAG: ВНИМАНИЕ».
+print_summary() {
+    ver=$(dpkg-query -W -f='${Version}' lib-local-rag 2>/dev/null) || ver=""
+    echo ""
+    # Установка в образ без chroot (dpkg --root … --force-script-chrootless,
+    # mmdebstrap --mode=chrootless). Вставка dh_installsystemduser стоит под
+    # `if [ -z "$DPKG_ROOT" ]`, то есть юниты в этом режиме НЕ включает, и
+    # при входе у пользователя образа ничего не стартует. Сказать об этом
+    # честно — единственное, что здесь можно сделать правильно: свой enable
+    # разошёлся бы с учётом deb-systemd-helper (см. шапку).
+    if [ -n "${DPKG_ROOT:-}" ]; then
+        echo "LocalRAG${ver:+ $ver} установлен в образ ОС без chroot (DPKG_ROOT=$DPKG_ROOT)."
+        cat <<EOF
+
+  Юниты НЕ включены: в установке без chroot вставка debhelper
+  (dh_installsystemduser) их не включает. Пока их не включить, у пользователей
+  образа демон и регистрация MCP сами не поднимутся. Включите юниты в образе:
+      systemctl --root="$DPKG_ROOT" --global enable $UNITS
+  или соберите образ установкой в chroot (без --force-script-chrootless).
+
+EOF
+        return 0
+    fi
+    echo "LocalRAG${ver:+ $ver} установлен и включён для всех пользователей."
+    cat <<'EOF'
+
+  Индексация стартует автоматически вместе с демоном (autostart_indexing:
+  true в /etc/lib-local-rag/distro.yml). Прогрев модели занимает 40-45 секунд,
+  затем первый проход по /home идёт в фоне; на большом объёме файлов он займёт
+  время.
+
+  Демон — пользовательская служба systemd. В открытых сессиях он запускается
+  этой установкой (итог ниже), а дальше поднимается сам при каждом входе
+  пользователя в систему, в том числе после перезагрузки.
+
+  MCP-мост localrag прописывается в конфиги агентов в домашнем каталоге
+  пользователя (pw_dir, например /home/sigma.sbrf.ru@ЛОГИН):
+      Workspace Computer  <дом>/.wsc/config/wsc.json
+      GigaCode            <дом>/.gigacode/settings.json
+  а если есть папка разработчика /home/work/ЛОГИН@... с установленным
+  агентом — то и там. В открытых сессиях это уже сделано (строки выше), у
+  остальных — при входе; запись повторяется, когда агент создаёт или
+  перезаписывает свой конфиг.
+
+  Перезапустите Workspace Computer и GigaCode, чтобы они увидели инструменты
+  localrag.
+
+EOF
+    echo "Итог по пользователям:"
+    printf '%s' "$summary"
+    echo ""
+}
+
+case "$1" in
+    configure)
+        fix_perms
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+esac
+
+#DEBHELPER#
+
+# Блок стоит ПОСЛЕ маркера DEBHELPER: к моменту старта юниты уже включены, а
+# права уже исправлены. Отсюда собственный guard на $1. На abort-* — только
+# возврат служб в открытых сессиях, без общего текста (см. шапку).
+case "$1" in
+    configure)
+        start_in_open_sessions
+        print_summary
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        start_in_open_sessions
+        ;;
+esac
+
+exit 0

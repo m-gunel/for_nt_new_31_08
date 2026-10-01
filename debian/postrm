@@ -1,0 +1,257 @@
+#!/bin/sh
+# БТ §7 «Удаление». Требуется четыре вещи, и все четыре здесь:
+#   a) демон немедленно остановлен            — сделано в prerm;
+#   b) все индексные файлы и директория удалены с устройства;
+#   c) следов не остаётся — конфиги, временные файлы, порт/pid;
+#   d) пользователь получает уведомление, что индексы очищены.
+#
+# Пункты b-d выполняются ТОЛЬКО на purge. Простой remove оставляет данные:
+# он означает «снять программу», а не «стереть индексы», и после переустановки
+# индекс не пришлось бы собирать заново (это часы работы на большом корпусе).
+set -e
+
+# Та же граница обычных пользователей, что в postinst.
+uid_min() {
+    min=""
+    if [ -r /etc/login.defs ]; then
+        min=$(sed -n 's/^[[:space:]]*UID_MIN[[:space:]][[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+            /etc/login.defs | tail -n 1)
+    fi
+    case "$min" in
+        ''|*[!0-9]*) min=1000 ;;
+    esac
+    echo "$min"
+}
+
+# uid запущенных менеджеров systemd --user — см. postinst.
+active_uids() {
+    [ -d /run/systemd/system ] || return 0
+    systemctl list-units --type=service --state=active --plain --no-legend 'user@*.service' \
+        | sed -n 's/^[[:space:]]*user@\([0-9][0-9]*\)\.service[[:space:]].*/\1/p'
+}
+
+# uid владельцев каталогов /home/* и /home/work/* — третий источник
+# пользователей, см. purge_user_data. stat без -L: владелец самого каталога, а
+# не того, куда ведёт симлинк. Фильтр по UID_MIN и дедупликация — у
+# вызывающего: сам /home/work и прочее, что принадлежит root, отсекается там.
+home_owner_uids() {
+    for d in /home/* /home/work/*; do
+        [ -d "$d" ] || continue
+        stat -c %u "$d" 2>/dev/null || true
+    done
+}
+
+# Что сделано, копится здесь и печатается в конце: уведомление (d) — по
+# факту, чьи именно данные сняты.
+purged=""   # «    <каталог>  (<пользователь>)» построчно
+failed=""   # что удалить не удалось
+checked=""  # чьи дома проверены, через запятую
+
+# Удалить данные индексатора в одном доме ($2) пользователя с uid $1; $3 —
+# как назвать пользователя в итоге.
+#
+# Только в каталоге, который принадлежит этому uid: пути папки разработчика
+# мы строим сами, по имени, и чужой каталог с совпавшим именем трогать нельзя.
+# rm -rf на симлинке удаляет сам симлинк, а не то, куда он ведёт.
+purge_home() {
+    [ -n "$2" ] && [ -d "$2" ] || return 0
+    [ "$(stat -L -c %u "$2" 2>/dev/null)" = "$1" ] || return 0
+    removed=""
+    for dir in "$2/.files-search" "$2/.ragsearch"; do
+        if [ -e "$dir" ] || [ -L "$dir" ]; then
+            # Сетевой дом с root_squash root удалить не даст. Это не повод
+            # ронять purge: остальные дома и пользователи важнее.
+            if rm -rf "$dir"; then
+                removed="yes"
+            else
+                echo "LocalRAG: не удалось удалить $dir — удалите вручную." >&2
+                failed="$failed    $dir
+"
+            fi
+        fi
+    done
+    if [ -n "$removed" ]; then
+        purged="$purged    $2  ($3)
+"
+    fi
+}
+
+purge_user_data() {
+    # DPKG_ROOT — удаление из образа ОС: дома машины, на которой это
+    # запущено, к нему отношения не имеют.
+    [ -z "${DPKG_ROOT:-}" ] || return 0
+    min=$(uid_min)
+    seen=" "
+    # Пользователи — объединение трёх источников, как в prerm: запущенные
+    # менеджеры systemd --user, getent passwd и владельцы каталогов в /home и
+    # /home/work. Последний — ради доменного пользователя SSSD, который сейчас
+    # не в системе: перечисление passwd его не показывает (enumerate = false),
+    # менеджера у него нет, а данные снять нужно. Имя и дом по одному uid SSSD
+    # отдаёт из кэша.
+    for uid in $(active_uids) $(getent passwd | cut -d: -f3) $(home_owner_uids); do
+        case "$uid" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        # Только реальные пользователи: системные учётки индексов не имеют,
+        # а root-каталог трогать незачем.
+        [ "$uid" -ge "$min" ] || continue
+        case "$seen" in
+            *" $uid "*) continue ;;
+        esac
+        seen="$seen$uid "
+
+        entry=$(getent passwd "$uid") || entry=""
+        name=${entry%%:*}
+        home=$(printf '%s\n' "$entry" | cut -d: -f6)
+        if [ -n "$name" ]; then
+            # В итог — только те, у кого дом есть на диске: учётки вроде
+            # nobody (дом /nonexistent) там были бы шумом.
+            if [ -d "$home" ]; then
+                checked="$checked${checked:+, }$name"
+            fi
+            # Дом — из passwd: он может лежать и вне /home. К pw_dir
+            # добавляется SberOS-пара: папка разработчика /home/work/ИМЯ и, у
+            # ЛОГИН@ДОМЕН, /home/ДОМЕН@ЛОГИН. Демон, запущенный из терминала,
+            # пишет индекс в $HOME терминала — то есть как раз в папку
+            # разработчика.
+            purge_home "$uid" "$home" "$name"
+            purge_home "$uid" "/home/work/$name" "$name"
+            case "$name" in
+                *@*) purge_home "$uid" "/home/${name#*@}@${name%%@*}" "$name" ;;
+            esac
+        fi
+        # Временные выдачи POST /get_file_path.
+        find /tmp -maxdepth 1 -name 'rag_file_*' -user "$uid" \
+            -exec rm -rf {} + 2>/dev/null || true
+    done
+
+    # И каталоги в /home и /home/work — по их владельцу, одним проходом. Так
+    # данные снимаются и у того, кого passwd уже не знает (учётку удалили,
+    # кэш SSSD пуст), и в каталоге, названном не по имени пользователя.
+    # Уже вычищенное выше здесь просто не найдётся.
+    for d in /home/* /home/work/*; do
+        [ -d "$d" ] || continue
+        owner=$(stat -c %u "$d" 2>/dev/null) || continue
+        case "$owner" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        [ "$owner" -ge "$min" ] || continue
+        entry=$(getent passwd "$owner") || entry=""
+        name=${entry%%:*}
+        purge_home "$owner" "$d" "${name:-uid $owner}"
+    done
+}
+
+# Итог purge — по факту: чьи данные удалены, что удалить не удалось, и как
+# снять запись MCP, если prerm кого-то не нашёл. Подсказку «запустите
+# register_mcp.py --remove» здесь давать нельзя: на purge файлов пакета уже
+# нет, выполнить её нечем.
+print_purge_summary() {
+    echo ""
+    echo "LocalRAG удалён."
+    if [ -n "${DPKG_ROOT:-}" ]; then
+        echo "  Удаление из образа (DPKG_ROOT): домашние каталоги не проверялись."
+        echo ""
+        return 0
+    fi
+    if [ -n "$purged" ]; then
+        echo "  Индексы и пользовательские настройки (.files-search, .ragsearch) удалены"
+        echo "  с устройства:"
+        printf '%s' "$purged"
+    fi
+    if [ -n "$failed" ]; then
+        echo "  НЕ удалось удалить (удалите вручную):"
+        printf '%s' "$failed"
+    fi
+    if [ -z "$purged" ] && [ -z "$failed" ]; then
+        echo "  Индексов LocalRAG на устройстве не найдено — удалять было нечего."
+        if [ -n "$checked" ]; then
+            echo "  Проверены домашние каталоги пользователей: $checked."
+        fi
+    fi
+    cat <<'EOF'
+
+  Записи MCP-моста снимаются из конфигов агентов ещё при удалении пакета
+  (prerm), у каждого найденного пользователя. Если у кого-то запись localrag
+  осталась — пользователь не был найден (не входил в систему, а его каталога
+  нет ни в /home, ни в /home/work) или его домашний каталог был недоступен, —
+  снимите её вручную: удалите ключ mcp.localrag в ~/.wsc/config/wsc.json и
+  mcpServers.localrag в ~/.gigacode/settings.json либо верните резервную
+  копию <файл>.localrag-backup, которая лежит рядом с конфигом.
+
+EOF
+}
+
+case "$1" in
+    purge)
+        # Снятие глобального включения юнитов здесь НЕ пишется: его делает
+        # вставка dh_installsystemduser через маркер DEBHELPER (deb-systemd-helper
+        # --user purge). Раньше тут стоял свой `systemctl --global disable`, и
+        # это было двойное управление одними и теми же симлинками: у
+        # deb-systemd-helper есть собственный учёт состояния в
+        # /var/lib/systemd/deb-systemd-user-helper-enabled, и расхождение с ним
+        # даёт «disable не срабатывает, и непонятно почему». Соседний
+        # `systemctl --global daemon-reload` был к тому же невалиден — область
+        # --global определена только для enable/disable/is-enabled/preset/mask,
+        # и вызов молча аборился.
+        purge_user_data
+        # Конфиг демона — conffile, его снимает dpkg. Копию, которую preinst
+        # отложил при переходе с ручной сборки (distro.yml.localrag-old), dpkg
+        # не знает — её убираем сами, иначе каталог не опустеет (БТ §7:
+        # следов не остаётся). С префиксом DPKG_ROOT: при удалении из образа
+        # без chroot путь без него указывал бы на /etc машины сборки.
+        rm -f "${DPKG_ROOT:-}/etc/lib-local-rag/distro.yml.localrag-old"
+        rmdir "${DPKG_ROOT:-}/etc/lib-local-rag" 2>/dev/null || true
+        print_purge_summary
+        ;;
+    remove)
+        # На `apt purge` и `dpkg -P` dpkg зовёт postrm дважды: сначала с
+        # remove, потом с purge. Строка «индексы сохранены» тогда противоречила
+        # бы итогу purge на том же экране — при вычистке её не печатаем.
+        # Status-Want=purge dpkg выставляет до вызова скриптов.
+        want=$(dpkg-query -W -f='${db:Status-Want}' lib-local-rag 2>/dev/null) || want=""
+        if [ "$want" != purge ]; then
+            echo "LocalRAG удалён. Индексы СОХРАНЕНЫ — для полной очистки: sudo dpkg --purge lib-local-rag"
+        fi
+        ;;
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+esac
+
+#DEBHELPER#
+
+# Пользовательские менеджеры systemd после remove всё ещё держат наши юниты в
+# памяти (остановленными) и узнают об удалении файлов только на daemon-reload.
+# Звать `systemctl --user daemon-reload` у каждого — снова runuser и сокет на
+# пользователя; SIGHUP менеджеру делает то же самое (man systemd: SIGHUP —
+# перечитать конфигурацию) одной командой и без D-Bus. Ровно это вставит сам
+# debhelper на compat 14 (deb-systemd-invoke --user --no-dbus daemon-reload),
+# при переходе на него блок нужно будет удалить.
+#
+# --kill-whom=main обязательно: сигнал уходит только главному процессу
+# user@UID.service, то есть самому systemd --user. Без него SIGHUP получили бы
+# все процессы в cgroup менеджера — все программы сессии пользователя.
+# До systemd 252 опция называлась --kill-who, отсюда второй вызов.
+#
+# После маркера DEBHELPER — чтобы менеджеры перечитали уже итоговое состояние,
+# что бы ни делала с симлинками вставка debhelper.
+#
+# Перед этим снимаем runtime-маску, которую prerm поставил демону на время
+# удаления (см. prerm). После remove она не нужна: файлов пакета нет, поднимать
+# нечего. А осталась бы до конца сессии, и уже запущенный мост в агенте всё это
+# время отвечал бы «служба временно остановлена, идёт установка», хотя пакета
+# нет. Маска — это симлинк на /dev/null в /run/user/UID/systemd/user; удаляем
+# только такой, от root, без захода в менеджер пользователя, а SIGHUP ниже
+# заставляет менеджер это перечитать.
+if [ "$1" = "remove" ] && [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+    for mask in /run/user/*/systemd/user/lib-local-rag.service; do
+        if [ -L "$mask" ] && [ "$(readlink "$mask")" = /dev/null ]; then
+            rm -f "$mask" || true
+        fi
+    done
+    systemctl kill --kill-whom=main --signal=SIGHUP 'user@*.service' >/dev/null 2>&1 \
+        || systemctl kill --kill-who=main --signal=SIGHUP 'user@*.service' >/dev/null 2>&1 \
+        || true
+fi
+
+exit 0

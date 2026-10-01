@@ -1,0 +1,23 @@
+[Unit]
+Description=LocalRAG — следить за конфигом GigaCode
+Documentation=file:/usr/lib/lib-local-rag/mcp/README.md
+# Не для greeter-а и root: см. lib-local-rag.service.
+ConditionUser=!@system
+
+[Path]
+# Здесь следим за самим файлом, а не за каталогом: settings.json создаёт сам
+# GigaCode (в нём лежат ide, $version и пустой mcpServers), так что событие
+# гарантированно будет. Наблюдение за файлом точнее — не дёргает сервис на
+# каждую постороннюю запись в ~/.gigacode.
+#
+# Про то, почему только PathChanged= и никакого PathExists=, — см. соседний
+# юнит lib-local-rag-mcp-register-wsc.path.
+PathChanged=%h/.gigacode/settings.json
+# Вторая строка — папка разработчика SberOS /home/work/ЛОГИН@ДОМЕН (%u
+# раскрывается в ЛОГИН@ДОМЕН), зачем она и почему безвредна, если папки
+# нет, — см. тот же соседний юнит.
+PathChanged=/home/work/%u/.gigacode/settings.json
+Unit=lib-local-rag-mcp-register.service
+
+[Install]
+WantedBy=default.target

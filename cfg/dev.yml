@@ -1,0 +1,23 @@
+# Конфиг для ПРОГОНА ТЕСТОВ, а не для запуска демона.
+#
+# На него ссылаются pyproject.toml ([tool.pytest_env]) и tests/conftest.py.
+# Удалять нельзя: без CONFIG_PATH из цепочки источников настроек выпадает
+# init_settings, и тогда Config(...) в тестах молча игнорирует свои аргументы,
+# начиная читать реальный ~/.ragsearch пользователя.
+#
+# Для запуска демона используйте свой конфиг по образцу cfg/example.yml.
+
+file_scan_cfg:
+  # Пусто намеренно: каждый тест задаёт себе пути сам, через monkeypatch.
+  paths: []
+embed_model_cfg:
+  model_path: models/rubert-tiny2_002
+
+email_poll_interval: 60
+email:
+  # Выключена: тесты, которым нужна почта, включают её явно и подставляют
+  # синтетический профиль. Включённая здесь почта означала бы, что любой
+  # запуск с этим конфигом лезет в настоящий ~/.thunderbird.
+  enabled: false
+  index_last_n_days: 30
+app_logging_level: DEBUG

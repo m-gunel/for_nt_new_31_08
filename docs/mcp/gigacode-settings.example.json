@@ -1,0 +1,26 @@
+{
+  // Образец для GigaCode: ~/.gigacode/settings.json.
+  //
+  // Схема здесь ДРУГАЯ, не opencode. Отличий три:
+  //   - ключ mcpServers на верхнем уровне, а не mcp;
+  //   - поля type нет: запись из command/args/env, как в проверенном рабочем
+  //     конфиге GigaCode. Транспорт stdio GigaCode определяет по command;
+  //   - command — строка, аргументы отдельным массивом args (он необязателен),
+  //     окружение в env, а не environment.
+  // В opencode-схеме наоборот: mcp.<имя> с "type": "local" и command массивом
+  // целиком.
+  //
+  // Ключи ide и $version создаёт сам GigaCode — при регистрации они
+  // сохраняются, дописывается только запись внутри mcpServers.
+  "ide": {},
+  "$version": 3,
+  "mcpServers": {
+    "localrag": {
+      "command": "/usr/lib/lib-local-rag/mcp/mcp_launcher.sh",
+      "args": [],
+      "env": {
+        "LQRAG_TIMEOUT": "110"
+      }
+    }
+  }
+}

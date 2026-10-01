@@ -1,0 +1,210 @@
+#!/bin/sh
+# БТ §7 «Обновление»: демон должен корректно остановиться ДО замены бинарных
+# файлов, а индексные файлы — остаться нетронутыми.
+#
+# Останавливаем юниты у всех, у кого они подняты. Индексы при этом не трогаем:
+# их удаляет только postrm на purge.
+#
+# Кроме останова, демон на это время маскируется (mask --runtime): иначе его
+# снова поднял бы MCP-мост, живущий в агенте пользователя, — см.
+# stop_for_all_users. Маску снимает postinst.
+#
+# Этот prerm выполняется только при снятии или обновлении 1.0.7 и новее. При
+# обновлении С 1.0.6 dpkg зовёт prerm из 1.0.6, код которого утерян; если он
+# упадёт, dpkg позовёт уже наш с failed-upgrade — см. case внизу.
+set -e
+
+REGISTER=/usr/lib/lib-local-rag/mcp/register_mcp.py
+
+# Та же граница обычных пользователей, что в postinst.
+uid_min() {
+    min=""
+    if [ -r /etc/login.defs ]; then
+        min=$(sed -n 's/^[[:space:]]*UID_MIN[[:space:]][[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+            /etc/login.defs | tail -n 1)
+    fi
+    case "$min" in
+        ''|*[!0-9]*) min=1000 ;;
+    esac
+    echo "$min"
+}
+
+# uid запущенных менеджеров systemd --user — см. postinst.
+active_uids() {
+    [ -d /run/systemd/system ] || return 0
+    systemctl list-units --type=service --state=active --plain --no-legend 'user@*.service' \
+        | sed -n 's/^[[:space:]]*user@\([0-9][0-9]*\)\.service[[:space:]].*/\1/p'
+}
+
+# uid владельцев каталогов /home/* и /home/work/* — третий источник
+# пользователей, см. unregister_for_all_users. stat без -L: владелец самого
+# каталога, а не того, куда ведёт симлинк. Фильтр по UID_MIN и дедупликация —
+# у вызывающего: сам /home/work и прочее, что принадлежит root, отсекается там.
+home_owner_uids() {
+    for d in /home/* /home/work/*; do
+        [ -d "$d" ] || continue
+        stat -c %u "$d" 2>/dev/null || true
+    done
+}
+
+# Команда от имени пользователя $name (uid $uid): приватный сокет его
+# менеджера, без D-Bus, с таймаутом — подробно см. postinst.
+run_as_user() {
+    timeout 60 runuser -u "$name" -- env -u DBUS_SESSION_BUS_ADDRESS \
+        XDG_RUNTIME_DIR="/run/user/$uid" "$@" </dev/null
+}
+
+# Заполняет name и home по uid; ложь, если пользователя не видно.
+lookup_user() {
+    entry=$(getent passwd "$uid") || entry=""
+    name=${entry%%:*}
+    home=$(printf '%s\n' "$entry" | cut -d: -f6)
+    [ -n "$name" ] && [ -n "$home" ]
+}
+
+stop_for_all_users() {
+    # Установка в образ (DPKG_ROOT), контейнер без systemd, запрет policy-rc.d
+    # (код 101) — останавливать нечего или нельзя. В chroot сборки образа
+    # systemctl мог бы дотянуться до менеджеров самой машины сборки.
+    [ -z "${DPKG_ROOT:-}" ] || return 0
+    [ -d /run/systemd/system ] || return 0
+    if [ -x /usr/sbin/policy-rc.d ]; then
+        rc=0
+        /usr/sbin/policy-rc.d lib-local-rag.service stop || rc=$?
+        [ "$rc" -ne 101 ] || return 0
+    fi
+    command -v runuser >/dev/null 2>&1 || return 0
+
+    # Раньше здесь был deb-systemd-invoke --user stop — почему от него
+    # отказались, см. шапку postinst. На compat 13 debhelper останов
+    # пользовательских юнитов не генерирует, так что это наша забота.
+    min=$(uid_min)
+    for uid in $(active_uids); do
+        [ "$uid" -ge "$min" ] || continue
+        lookup_user || continue
+        # Порядок важен. Сначала .path-юниты: пока они живы, любая запись в
+        # конфиг агента снова запустит регистрацию. Потом сам сервис
+        # регистрации, если он как раз отрабатывает, и только потом демон.
+        # stop синхронный: демону даётся TimeoutStopSec=30, это меньше 60 c
+        # таймаута, а файлы пакета dpkg заменит лишь после выхода из prerm.
+        #
+        # stderr у stop заглушён: останов юнита, который менеджер не загрузил,
+        # — не ошибка, а при обновлении с 1.0.6 (юниты 0600, менеджер их не
+        # прочитал) иначе на экран шли бы английские «Failed to stop … Unit …
+        # not loaded», до четырёх строк на пользователя.
+        run_as_user systemctl --user --no-pager stop \
+            lib-local-rag-mcp-register-wsc.path \
+            lib-local-rag-mcp-register-gigacode.path >/dev/null 2>&1 || true
+        run_as_user systemctl --user --no-pager stop \
+            lib-local-rag-mcp-register.service >/dev/null 2>&1 || true
+        # Runtime-маска демона — ДО его останова. MCP-мост в агенте
+        # пользователя живёт дальше и на первом же отказе соединения сам
+        # зовёт `systemctl --user start lib-local-rag.service`. Без маски
+        # менеджер поднял бы демон между этим stop и заменой файлов — из
+        # наполовину распакованного /opt, — а на remove и purge демон пережил
+        # бы удаление пакета и заново создал бы ~/.files-search после purge.
+        # С маской мост получает «masked» и отвечает агенту, что служба
+        # временно остановлена. --runtime: маска в /run/user/UID и сама
+        # исчезает с концом сессии; снимает её postinst (в том числе на
+        # abort-*), а после remove — postrm. Сбой маски удаление не роняет.
+        run_as_user systemctl --user --no-pager --quiet mask --runtime \
+            lib-local-rag.service >/dev/null 2>&1 || true
+        run_as_user systemctl --user --no-pager stop \
+            lib-local-rag.service >/dev/null 2>&1 || true
+    done
+}
+
+# Снять запись MCP-моста из конфигов агентов.
+#
+# Делается ЗДЕСЬ, а не в postrm: на purge dpkg удаляет файлы пакета ДО вызова
+# postrm, и звать register_mcp.py оттуда уже некого. prerm — последний момент,
+# когда скрипт ещё на диске. И ПОСЛЕ stop_for_all_users: иначе .path-юнит
+# увидел бы нашу правку конфига и вписал запись обратно.
+#
+# Только на remove (а значит и на purge, который его включает), но НЕ на
+# upgrade: при обновлении запись должна пережить замену файлов.
+#
+# От имени ПОЛЬЗОВАТЕЛЯ через runuser, а не от root напрямую: правка чужого
+# конфига от root сменила бы владельца файла, и агент перестал бы его
+# перезаписывать. HOME передаём явно, XDG_CONFIG_HOME root'а гасим — к чужому
+# дому он отношения не имеет. Остальные дома пользователя (папку разработчика
+# /home/work/... на SberOS) скрипт обходит сам.
+#
+# Пользователи — объединение трёх источников, один uid обрабатываем один раз:
+#   - запущенные менеджеры systemd --user: те, кто в системе сейчас, в том
+#     числе доменные пользователи (SSSD);
+#   - getent passwd: локальные учётки, которых сейчас нет в системе;
+#   - владельцы каталогов /home/* и /home/work/*: доменный пользователь SSSD,
+#     который сейчас не в системе. Его нет ни в одном из первых двух
+#     источников — перечисление в SSSD по умолчанию выключено (enumerate =
+#     false), — а удаление через SberEMP как раз и идёт ночью или на экране
+#     входа. Имя и дом по одному uid (getent passwd <uid>) SSSD отдаёт из
+#     кэша, так что дальше всё как у остальных.
+# Кого не нашли и так (дом вне /home, SSSD без кэша), у того запись остаётся —
+# postrm на purge описывает, как снять её вручную.
+#
+# Что снято, печатаем по факту: строки «регистрация снята» из вывода
+# скрипта, по каждому пользователю. Остальной его вывод (пропуски, «без
+# изменений») на экране установки — шум. Если скрипт завершился с ошибкой,
+# показываем вывод целиком: там причина.
+#
+# Всё с оговорками: нет runuser, недоступен сетевой домашний каталог,
+# не отвечает python3 — удаление пакета из-за этого падать не должно.
+unregister_for_all_users() {
+    [ -z "${DPKG_ROOT:-}" ] || return 0
+    [ -f "$REGISTER" ] || return 0
+    command -v runuser >/dev/null 2>&1 || return 0
+    min=$(uid_min)
+    seen=" "
+    for uid in $(active_uids) $(getent passwd | cut -d: -f3) $(home_owner_uids); do
+        case "$uid" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        [ "$uid" -ge "$min" ] || continue
+        case "$seen" in
+            *" $uid "*) continue ;;
+        esac
+        seen="$seen$uid "
+        lookup_user || continue
+        # Учётки без дома (nobody и т.п.) пропускаем: записей у них нет.
+        [ -d "$home" ] || continue
+        rc=0
+        out=$(run_as_user env -u XDG_CONFIG_HOME HOME="$home" \
+            python3 "$REGISTER" --remove 2>&1) || rc=$?
+        if [ "$rc" -ne 0 ] || printf '%s\n' "$out" | grep -q 'ОШИБКА'; then
+            echo "LocalRAG: ВНИМАНИЕ: регистрацию MCP у пользователя $name снять не удалось полностью (код $rc):" >&2
+            printf '%s\n' "$out" | sed -e '/^[[:space:]]*$/d' -e 's/^/    /' >&2
+            echo "  Снимите вручную в файлах из строк выше: ключ mcp.localrag в .wsc/config/wsc.json," >&2
+            echo "  mcpServers.localrag в .gigacode/settings.json (или верните <файл>.localrag-backup)." >&2
+            continue
+        fi
+        report=$(printf '%s\n' "$out" | grep 'регистрация снята') || report=""
+        if [ -n "$report" ]; then
+            echo "LocalRAG: пользователь $name — снята регистрация MCP:"
+            printf '%s\n' "$report" | sed 's/^[[:space:]]*/    /'
+        fi
+    done
+}
+
+case "$1" in
+    remove)
+        stop_for_all_users
+        unregister_for_all_users
+        ;;
+    upgrade|deconfigure)
+        stop_for_all_users
+        ;;
+    failed-upgrade)
+        # Сюда dpkg приходит, когда упал prerm СТАРОЙ версии, — при обновлении
+        # с 1.0.6 это его неизвестный код. Код 0 разрешает обновлению идти
+        # дальше, а останов повторяем сами: упавший старый prerm мог не успеть
+        # остановить демон до замены файлов. || true — чтобы уже ничто в
+        # останове не превратило этот выход в отказ.
+        stop_for_all_users || true
+        exit 0
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

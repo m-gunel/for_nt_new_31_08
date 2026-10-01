@@ -1,0 +1,205 @@
+lib-local-rag (1.0.7) stable; urgency=medium
+
+  * Корневая причина сбоя 1.0.6 («Unit lib-local-rag.service could not be
+    found» у пользователя, MCP не прописан): пакет собран мимо debhelper, без
+    dh_fixperms, из дерева с umask 077, и его файлы и каталоги легли в систему
+    с правами 0600/0700. root при установке их прочитал, поэтому глобальный
+    enable прошёл и создал симлинки. А systemd --user работает от имени
+    пользователя, открыть юнит не может и сообщает «could not be found». По
+    той же причине не отработала регистрация MCP: её юнит и скрипт тоже
+    нечитаемы. Исходники 1.0.4-1.0.6 не сохранились, 1.0.7 собран от 1.0.3.
+  * postinst чинит права, оставшиеся от 1.0.6: dpkg при обновлении не меняет
+    права уже существующих каталогов (src/main/archives.c), и каталоги 0700
+    пережили бы установку исправной сборки. Что исправлено, печатается.
+  * Новый preinst: ручные сборки до 1.0.7 не объявляли
+    /etc/lib-local-rag/distro.yml conffile'ом, и при обновлении dpkg
+    спрашивал «какую версию конфига оставить». Без терминала (SberEMP) это
+    ошибка «end of file on stdin at conffile prompt», пакет остаётся
+    ненастроенным — так падало обновление 1.0.6 → 1.0.7 на стенде. preinst
+    откладывает такой файл в distro.yml.localrag-old; purge убирает и его.
+  * postinst сам поднимает демон в уже открытых сессиях вместо
+    deb-systemd-invoke --user: по каждому запущенному user@UID.service —
+    runuser от имени пользователя и systemctl --user на приватном сокете его
+    менеджера (daemon-reload, restart), без D-Bus и PAM-сессии login.
+    deb-systemd-invoke требовал systemctl >= 249, ходил через D-Bus и молча
+    пропускал юнит, который менеджер не смог загрузить, а его вывод был
+    заглушён — установка говорила «включён», ничего не подняв. Теперь ошибки
+    видны, LoadState каждого юнита и состояние демона проверяются, по каждому
+    пользователю печатается итог.
+  * postinst в открытых сессиях регистрирует MCP-мост напрямую
+    (register_mcp.py от имени пользователя) и показывает, куда записано.
+    Итоговое сообщение переписано под бесшовный режим: индексация стартует
+    сама, без упоминаний /api/v1/activate; где прописан MCP, что агентов
+    нужно перезапустить. Диагностических команд в итоге нет — они только в
+    строках «LocalRAG: ВНИМАНИЕ».
+  * Итог регистрации MCP — по коду register_mcp.py --strict, а не «выполнена»
+    всегда: «выполнена», «агенты (WSC, GigaCode) не найдены — MCP пропишется,
+    когда агент появится» или «с ОШИБКАМИ — см. строки ОШИБКА выше».
+  * Runtime-маска демона на время обновления и удаления: prerm делает
+    systemctl --user mask --runtime, postinst перед стартом снимает её у
+    каждого активного пользователя (и когда policy-rc.d запретил старт),
+    postrm на remove убирает оставшуюся. Иначе MCP-мост в агенте поднимал
+    демон из наполовину заменённых файлов или после удаления пакета. На
+    abort-upgrade/-deconfigure/-remove postinst возвращает службы в открытых
+    сессиях.
+  * Во все четыре юнита добавлено ConditionUser=!@system: юниты включены
+    глобально, и без условия демон стартовал у greeter-а экрана входа и у
+    root, а root с paths: /home проиндексировал бы весь /home в /root.
+  * .path-юниты следят и за папкой разработчика SberOS: вторые строки
+    PathChanged=/home/work/%u/.wsc/config и .../.gigacode/settings.json.
+  * prerm: останов через runuser, .path-юниты первыми, stderr останова
+    заглушён (незагруженный юнит 1.0.6 — не ошибка); снятие регистрации MCP
+    — по объединению запущенных user@UID.service, getent passwd и владельцев
+    каталогов /home/* и /home/work/*: доменного пользователя SSSD, который не
+    в системе, первые два источника не видят. Что снято, печатается.
+    failed-upgrade завершается успешно и сам останавливает демон —
+    обновление поверх 1.0.6 переживает его неизвестный prerm.
+  * postrm: на remove пользовательские менеджеры перечитывают конфигурацию
+    (SIGHUP главному процессу user@UID.service); purge чистит индексы по тому
+    же объединению пользователей, в pw_dir и в SberOS-паре
+    /home/work/ЛОГИН@ДОМЕН и /home/ДОМЕН@ЛОГИН, а также в каталогах /home и
+    /home/work по их владельцу — только в каталогах самого пользователя.
+    Итог purge — по факту: чьи данные удалены или что удалять было нечего;
+    вместо невыполнимой подсказки «register_mcp.py --remove» — как снять
+    запись MCP вручную. На purge не печатается строка remove «индексы
+    сохранены».
+  * DPKG_ROOT: preinst и postrm работают с /etc образа, а не машины сборки;
+    postinst в установке без chroot честно пишет, что юниты не включены, и
+    как их включить в образе.
+  * register_mcp.py пишет в домашний каталог из passwd (pw_dir) и в
+    SberOS-пару домов — туда, где каталог агента уже есть. Запуск из терминала
+    с HOME=/home/work/... тоже попадает в pw_dir. Формат записи WSC прежний.
+    Из записи GigaCode убран type: "stdio", BOM в начале конфига снимается.
+    От root скрипт не пишет ничего: пишущие режимы, в том числе с --home и
+    --config, отказывают с подсказкой runuser; --doctor, --list и --dry-run
+    разрешены. --doctor проверяет права на лаунчер и скрипт. Флаг --strict
+    даёт код возврата по итогу (им пользуется postinst).
+  * mcp_server.py ищет порт демона и в pw_dir/.files-search/port (терминал с
+    HOME=/home/work/...). Если демон недоступен, мост сам запускает
+    lib-local-rag.service и сразу отвечает агенту «индексатор прогревается»;
+    если служба замаскирована на время установки пакета — что она временно
+    остановлена.
+  * scripts/check_deb.sh, вызывается из make deb: права в готовом пакете,
+    версия, четыре юнита с ConditionUser, enable от debhelper для каждого из
+    них и purge в postrm, preinst с переносом distro.yml, нет подсказки про
+    /api/v1/activate. Пакет собирается только через make deb.
+  * Dockerfile: CA-бандл RHEL 8 берётся из tls-ca-bundle.pem, в debian:12
+    создаётся /etc/ssl/certs; make deb зовёт dpkg-buildpackage с
+    --ignore-builtin-builddeps (build-essential в образе сборки не нужен).
+  * scripts/build_deb_nosudo.sh: сборка без прав администратора. Если
+    debhelper и dpkg-dev в системе нет, скрипт скачивает их обычным
+    пользователем (apt-get download) в ~/.cache и собирает тем же make deb
+    (DEB_BUILD_FLAGS=-d: база dpkg о распакованном debhelper не знает).
+    Качается только недостающее; если apt-get download пользователю
+    недоступен (на SberOS файлы sources.list закрыты), scripts/fetch_build_tools.py
+    берёт пакеты из зеркала Debian в SberOSC с токеном из .secret и проверяет
+    подпись Release и контрольные суммы, как apt. Собирает через
+    scripts/deb_rules_build.sh (debian/rules clean/build/binary с
+    DEB_RULES_REQUIRES_ROOT из control): dpkg-buildpackage читает закрытую на
+    SberOS базу /var/lib/dpkg/status и падал на dpkg-genbuildinfo.
+  * Makefile: uv берёт пакеты из зеркала SberOSC (UV_INDEX_URL с токеном из
+    .secret, как в Dockerfile) и доверяет системным сертификатам
+    (UV_SYSTEM_CERTS/UV_NATIVE_TLS); build и tests ставят зависимости строго по
+    uv.lock (--frozen). Раньше локальный make build без настроенного uv уходил
+    на pypi.org и падал на корпоративном TLS («UnknownIssuer»).
+  * debian/control: убрана зависимость init-system-helpers (>= 1.61) —
+    deb-systemd-invoke больше не используется. debian/rules: заглушен
+    dh_makeshlibs — .so бандла PyInstaller не наши.
+
+ -- ИИ-помощник сотрудника СберКот <noreply@sberbank.ru>  Fri, 25 Sep 2026 01:02:56 +0300
+
+lib-local-rag (1.0.3) stable; urgency=medium
+
+  * scripts/register_mcp.py переписан. Запись клалась в mcp.servers.<имя>, но по
+    config-schema.json ключи внутри "mcp" — это САМИ имена серверов. Наша запись
+    читалась агентом как сервер с именем "servers" без обязательных type и
+    command; схема строгая (additionalProperties: false), поэтому отвергался весь
+    конфиг целиком — снаружи это выглядело как «файл правильный, а в интерфейсе
+    MCP не настроены». Теперь mcp.<имя>, а унаследованный mcp.servers вычищается.
+  * Там же: поле окружения переименовано с env на environment (в схеме оно
+    называется так), выставлен явный timeout 120000 мс — дефолт агента 5000 мс
+    меньше времени прогрева модели (40-45 c), и первый же поиск после старта
+    гарантированно отваливался по таймауту.
+  * register_mcp.py знает несколько целей с РАЗНЫМИ схемами: Workspace Computer
+    (~/.wsc/config/wsc.json, opencode-схема) и GigaCode (~/.gigacode/settings.json,
+    плоский mcpServers). Каталог ~/.config/gigatool — легаси: новых записей туда
+    не делаем, но чистим оставленный там невалидный ключ. Флаги --target, --all,
+    --list, --doctor. Конфиг читается как JSONC: агент допускает комментарии и
+    висячие запятые, на которых прежний json.loads отказывал.
+  * Права существующего конфига больше не понижаются до 0600 — сохраняется
+    исходный режим. Перед первой правкой рядом кладётся <файл>.localrag-backup.
+    Отказ по одной цели больше не прерывает остальные.
+  * Добавлены debian/units/lib-local-rag-mcp-register-wsc.path и
+    -gigacode.path: регистрация повторяется, когда агент создал или перезаписал
+    свой конфиг. Это закрывает тиражирование через СУС, где индексатор ставится
+    ДО приложения и приложение затирает запись. Только PathChanged=, без
+    PathExists=: PathExists проверяет условие, а не событие, и в паре с oneshot
+    без RemainAfterExit даёт бесконечный цикл.
+  * lib-local-rag-mcp-register.service: RemainAfterExit сознательно НЕ ставится —
+    иначе .path-юнит не может перезапустить уже активный Unit=, и перерегистрация
+    перестаёт работать. Отсюда штатный inactive (dead) в статусе.
+  * prerm снимает регистрацию из конфигов агентов на remove, от имени
+    пользователя через runuser. Именно в prerm, а не в postrm: на purge файлы
+    пакета удаляются до postrm, и звать register_mcp.py оттуда уже некого.
+  * Основной юнит переименован в debian/lib-local-rag.user.service. Прежнее имя
+    подпадало под шаблон dh_installsystemd, и пакет раскладывал ВТОРОЙ, системный
+    экземпляр юнита с запуском от root — при снятом override_dh_installsystemd
+    это и происходило. Демон от root пишет индексы в /root/.files-search, куда
+    мост от имени пользователя не заглядывает.
+  * В юнит добавлены SyslogIdentifier, явные StandardOutput/StandardError и
+    PYTHONUNBUFFERED=1.
+  * Добавлен отсутствовавший debian/source/format.
+
+ -- ИИ-помощник сотрудника СберКот <noreply@sberbank.ru>  Tue, 15 Sep 2026 18:00:00 +0300
+
+lib-local-rag (1.0.2) stable; urgency=medium
+
+  * mcp_server.py: явная диагностика недоступного сайдкара. Стартовый лог и
+    сообщение TransportError теперь различают, откуда взят адрес (LQRAG_URL /
+    файл ~/.files-search/port / fallback 8000), и при отсутствии сервиса
+    предупреждают с подсказкой: systemctl --user status lib-local-rag.service.
+    Раньше fallback на 127.0.0.1:8000 молча маскировал не запущенный демон.
+  * tests/test_mcp_diagnostics.py: покрытие определения адреса сайдкара и
+    стартового предупреждения.
+  * docs/RUN-DEB.md: пошаговая инструкция установки/запуска/диагностики .deb.
+
+ -- ИИ-помощник сотрудника СберКот <noreply@sberbank.ru>  Fri, 11 Sep 2026 14:00:00 +0300
+
+lib-local-rag (1.0.1) stable; urgency=medium
+
+  * Юнит переименован в debian/lib-local-rag.user.service — его раскладывает
+    dh_installsystemduser. Заглушка override_dh_installsystemd больше не нужна:
+    она была единственным, что мешало dh_installsystemd разложить ВТОРОЙ,
+    системный экземпляр того же юнита с запуском от root.
+  * Добавлен пользовательский юнит lib-local-rag-mcp-register.service: он
+    прописывает MCP-мост в конфиг агента от имени пользователя при входе в
+    сессию. Раньше пакет только печатал команду в postinst.
+  * postinst поднимает юниты в уже открытых сессиях через
+    deb-systemd-invoke --user restart — на compat 13 debhelper делает только
+    enable. Закрывает БТ §7.2.c «после обновления демон автоматически
+    перезапускается».
+  * prerm переведён на deb-systemd-invoke --user stop вместо самописного цикла
+    по loginctl.
+  * Из postinst убран невалидный `systemctl --global daemon-reload` (область
+    --global для daemon-reload не определена) и вводивший в заблуждение
+    закомментированный `systemctl --global enable`.
+  * Из postrm убран самодельный `systemctl --global disable`: снятие делает
+    вставка dh_installsystemduser, а двойное управление симлинками расходилось
+    с состоянием deb-systemd-helper.
+  * Снята нижняя граница python3 (>= 3.12): мост написан на stdlib уровня 3.6,
+    а граница делала пакет неустанавливаемым на базе с python3.11.
+  * Добавлены init-system-helpers (>= 1.61) и Rules-Requires-Root: no.
+  * В debian/rules заглушены dh_shlibdeps, dh_strip, dh_dwz и
+    dh_strip_nondeterminism: на бандле PyInstaller первый падает, остальные
+    портят артефакт.
+  * Добавлены debian/source/format и debian/copyright.
+
+ -- ИИ-помощник сотрудника СберКот <noreply@sberbank.ru>  Thu, 10 Sep 2026 12:00:00 +0300
+
+lib-local-rag (1.0.0) stable; urgency=medium
+
+  * Первая версия пакета: демон индексации, MCP-мост, systemd user unit.
+  * Индексация не стартует автоматически — ждёт POST /api/v1/activate
+    (БТ библиотеки индексации §4.1).
+
+ -- ИИ-помощник сотрудника СберКот <noreply@sberbank.ru>  Fri, 04 Sep 2026 00:00:00 +0300

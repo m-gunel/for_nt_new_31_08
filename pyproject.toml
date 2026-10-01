@@ -1,0 +1,116 @@
+[project]
+name = "files-search-back"
+# Держать синхронно с src/version.py и верхней записью debian/changelog;
+# расхождение ловит гейт в цели `deb` Makefile.
+version = "1.0.3"
+description = "Add your description here"
+readme = "README.md"
+# Код использует синтаксис дженериков PEP 695 (class LSMTable[T]) — это 3.12+.
+requires-python = ">=3.12"
+dependencies = [
+    "aiofiles>=25.1.0",
+    "beautifulsoup4>=4.14.0",
+    "docx2txt>=0.9",
+    "fastapi>=0.136.1",
+    "jinja2>=3.1.6",
+    "lancedb>=0.33.0",
+    "langchain-text-splitters>=0.3.9",
+    "lsm>=0.5.10",
+    "lxml>=6.0.2",
+    "networkx>=3.4.2",
+    "openpyxl>=3.1.5",
+    "openvino-tokenizers>=2025.3.0.0",
+    "persist-queue[async]>=1.1.0",
+    "polars[pyarrow]>=1.41.2",
+    "pyarrow<21",
+    "pydantic-settings>=2.14.1",
+    "pylance>=7.0.0",
+    "pymupdf>=1.27.2",
+    "pypdf>=6.13.0",
+    "python-pptx>=1.0.2",
+    # Прямой импорт: src/config.py:13 читает им YAML-конфиг. До сих пор пакет
+    # был объявлен только в requirements.txt, а uv/Docker/PyInstaller держались
+    # на том, что его подтянет кто-то транзитивно. Стоило этой зависимости
+    # исчезнуть выше по дереву — и демон перестал бы стартовать.
+    "pyyaml>=6.0",
+    "retry>=0.9.2",
+    "rich>=15.0.0",
+    "tantivy>=0.24.0",
+    "uvicorn>=0.35.0",
+    "watchdog>=6.0.0",
+    "watchfiles>=1.1.1",
+]
+
+[dependency-groups]
+build = [
+    "pyinstaller>=6.15.0",
+]
+dev = [
+    "ipykernel>=6.30.1",
+    "ipywidgets>=8.1.7",
+    "pre-commit>=4.5.0",
+    "pyarrow-stubs>=20.0.0.20250825",
+    # ruff заблокирован на внутреннем PyPI (уязвимость)
+    # uv по умолчанию ставит только dev, а `make tests` — это `uv run pytest`.
+    # Без включения test в окружении нет pytest-asyncio, и половина набора
+    # падает на импорте. Раньше это маскировалось тем, что pytest и
+    # pytest-asyncio дублировались в [project.dependencies] — то есть уезжали
+    # в сборку демона.
+    {include-group = "test"},
+]
+giga = [
+    "langgraph>=0.6.6",
+    "langchain-gigachat>=0.3.12",
+]
+openai = [
+    "langchain-openai>=0.3.31",
+]
+test = [
+    "asgi-lifespan>=2.1.0",
+    "httpx>=0.28.1",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.3.0",
+    "pytest-env>=1.2.0",
+]
+torch = [
+    "datasets>=4",
+    "einops>=0.8.1",
+    "torch>=2.12",
+    "transformers>=4.57",
+    "sentence-transformers>=5.5.0",
+    "optimum[onnxruntime,openvino]>=2.1.0",
+]
+
+[tool.uv]
+# АРМ на SberOS — это x86_64 Linux, и резолвер обязан подбирать версии, под
+# которые в зеркале есть колёса именно для этой платформы. Без этой строки uv
+# выбирает самую свежую версию по метаданным и падает на установке: у lancedb
+# 0.38.0 в зеркале лежат колёса только под manylinux aarch64 и macOS arm64.
+required-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[[tool.uv.index]] 
+name = "pytorch" 
+url = "https://sberosc.sigma.sbrf.ru/repo/pypi/sber-pytorch/cpu" 
+explicit = true
+
+[tool.uv.sources] 
+torch = { index = "pytorch" }
+
+[tool.ruff]
+target-version = "py312"
+lint.extend-select = ["I"]
+# Сценарии НТ приехали из пакета тестировщика и держатся байт-в-байт: их
+# гоняют и отсюда, и с его стенда, и расхождение форматирования мешало бы
+# сверять прогоны. Правим в них только пути стенда.
+exclude = ["scripts/nt"]
+
+[tool.pytest.ini_options]
+# Маркер объявляем явно: без этого pytest ругается на неизвестный маркер, а
+# `make tests` держится на `-m "not integration"`.
+markers = [
+    "integration: требует внешнего окружения (профиль Thunderbird, запущенный демон)",
+]
+
+[tool.pytest_env]
+TESTING = "Y"
+CONFIG_PATH = "cfg/dev.yml"

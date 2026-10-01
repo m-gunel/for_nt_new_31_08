@@ -1,0 +1,14 @@
+name: localrag-sidecar
+version: 0.1.0
+description: "Минимальный локальный APM-манифест для репозитория files-search-back (LocalRAG sidecar). Только правила сборки/окружения — БЕЗ интеграции с чужими проектами (registry/wiki/ssot/atlassian) и БЕЗ MCP (sidecar запускается независимо от агента)."
+author: "Вернигоров Александр"
+license: "UNLICENSED"
+includes: auto
+
+dependencies:
+  apm: []
+  # MCP намеренно НЕ объявляются: sidecar запускается/останавливается независимо.
+  # stdio-мост (mcp_launcher.sh) регистрируется на стороне потребителя (opencode.json / корневой APM).
+  mcp: []
+
+scripts: {}

@@ -1,0 +1,38 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+# uv.lock НЕ игнорируется: без него каждая установка резолвится заново по
+# тому, что лежит в зеркале сегодня, и прогон НТ невоспроизводим. Мы уже
+# ловили это на lancedb, которая уехала с 0.3x на 0.38 между прогонами.
+# requirements.lock.txt — тот же состав для pip-пути (pip про uv.lock не знает).
+
+# Virtual environments
+.venv
+.idea
+*.iml
+data
+.DS_Store
+my_exported_model
+repo.zip
+repo.zip.enc
+.secret
+.secret.temp
+# Environment files — keep secrets out of the repository
+.env
+.env.*
+!.env.example
+.gigaide/gigaide.properties
+.claude/
+CLAUDE.md
+
+# debian build artifacts (generated, not tracked)
+debian/*.debhelper
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/.debhelper/
+debian/lib-local-rag/

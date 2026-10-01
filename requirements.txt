@@ -1,0 +1,51 @@
+# Зависимости для запуска индексатора через pip, без uv.
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements.txt
+#
+# Список синхронизирован с [project.dependencies] в pyproject.toml, откуда
+# собирается проект через uv (uv sync, make build, Dockerfile).
+# sentence-transformers сюда не входит: он тянет torch (несколько ГБ) и нужен
+# только при embed_model_cfg.model_type == "st", а по умолчанию используется
+# "ov" (OpenVINO). Зависимости для тестов — в группах pyproject.toml.
+
+# --- веб-слой ---
+fastapi>=0.136.1
+uvicorn>=0.35.0
+pydantic-settings>=2.14.1
+
+# --- хранилище: векторная БД и состояние файлов ---
+lancedb>=0.33.0
+pylance>=7.0.0
+pyarrow<21
+polars[pyarrow]>=1.41.2
+tantivy>=0.24.0
+lsm>=0.5.10
+
+# --- эмбеддинги (OpenVINO, без torch) ---
+openvino>=2025.3
+openvino-tokenizers>=2025.3.0.0
+
+# --- парсеры документов ---
+pymupdf>=1.27.2
+pypdf>=6.13.0
+docx2txt>=0.9
+python-pptx>=1.0.2
+openpyxl>=3.1.5
+lxml>=6.0.2
+beautifulsoup4>=4.14.0
+
+# --- разбиение текста на чанки ---
+langchain-text-splitters>=0.3.9
+
+# --- наблюдение за файловой системой и очереди ---
+watchdog>=6.0.0
+watchfiles>=1.1.1
+persist-queue[async]>=1.1.0
+aiofiles>=25.1.0
+
+# --- прочее ---
+jinja2>=3.1.6
+rich>=15.0.0
+retry>=0.9.2
+networkx>=3.4.2
+pyyaml>=6.0

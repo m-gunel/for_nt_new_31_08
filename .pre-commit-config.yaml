@@ -1,0 +1,29 @@
+repos:
+
+  - repo: local
+    hooks:
+      - id: pytest
+        name: Run pytest
+        entry: uv run pytest -m "not integration"
+        language: system
+        pass_filenames: false
+        always_run: true
+        types: [python]
+      - id: spec
+        name: make spec
+        entry: make spec
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: ruff_check
+        name: ruff check
+        entry: uv run ruff check src --fix
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: ruff_format
+        name: ruff check
+        entry: uv run ruff format
+        language: system
+        pass_filenames: false
+        always_run: true

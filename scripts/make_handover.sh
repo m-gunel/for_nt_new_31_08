@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Сборка архива для передачи тестировщику.
+#
+# Смысл скрипта не в zip, а в проверках перед ним: архив без uv.lock означает,
+# что у принимающей стороны состав пакетов отрезолвится заново по тому, что
+# лежит в зеркале сегодня, и её прогон НТ будет несравним с вашим. Плюс архив
+# не должен унести секреты и чужое локальное состояние.
+#
+# Запускать из корня репозитория, на машине с доступом к зеркалу:
+#   ./scripts/make_handover.sh
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+NAME="lib-local-rag-mcp-$(date +%Y%m%d)"
+OUT="../${NAME}.zip"
+FAIL=0
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  OK   %s\n' "$*"; }
+bad()  { printf '  СТОП %s\n' "$*"; FAIL=1; }
+
+say "=== 1. Состав пакетов зафиксирован ==="
+if [[ -f uv.lock ]]; then
+  ok "uv.lock на месте"
+else
+  bad "нет uv.lock — выполните: uv lock"
+fi
+if [[ -f requirements.lock.txt ]]; then
+  ok "requirements.lock.txt на месте"
+else
+  say "  ПРЕДУПР requirements.lock.txt нет — нужен, только если кто-то ставится через pip:"
+  say "          uv export --no-hashes --format requirements-txt --no-dev -o requirements.lock.txt"
+fi
+
+say "=== 2. В локе плейсхолдер, а не живой токен ==="
+# Dockerfile подставляет реальный OSC_TOKEN прямо в pyproject.toml при сборке;
+# лок, созданный внутри сборки, унесёт токен в индексные URL.
+if [[ -f uv.lock ]]; then
+  if grep -q "OSC_TOKEN" uv.lock; then
+    ok "в индексных URL плейсхолдер OSC_TOKEN"
+  elif grep -qE "https://token:[A-Za-z0-9_-]{8,}@sberosc" uv.lock; then
+    bad "в uv.lock похоже лежит РЕАЛЬНЫЙ токен — пересоздайте лок на рабочей машине"
+  else
+    ok "подстановок токена не видно"
+  fi
+fi
+
+say "=== 3. Платформа целевого контура объявлена ==="
+if grep -q "required-environments" pyproject.toml; then
+  ok "required-environments задан (x86_64 Linux)"
+else
+  bad "нет required-environments — uv может отрезолвить lancedb без колеса под АРМ"
+fi
+
+say "=== 4. Тестовые зависимости не уедут в сборку демона ==="
+if grep -qE '^\s*"(pytest|pytest-asyncio|httpx|asgi-lifespan|sentence-transformers)' <(sed -n '/^dependencies = \[/,/^]/p' pyproject.toml); then
+  bad "в [project.dependencies] остались тестовые или тяжёлые пакеты"
+else
+  ok "runtime-зависимости чистые"
+fi
+
+say "=== 5. Быстрые тесты ==="
+if command -v uv >/dev/null 2>&1; then
+  if uv run pytest -m "not integration" -q >/tmp/handover_tests.log 2>&1; then
+    ok "$(tail -1 /tmp/handover_tests.log)"
+  else
+    bad "тесты красные, см. /tmp/handover_tests.log"
+  fi
+else
+  say "  ПРОПУСК uv не найден — прогоните тесты вручную"
+fi
+
+say "=== 6. Мост отвечает ==="
+if echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ./mcp_launcher.sh 2>/dev/null | grep -q local_search; then
+  ok "tools/list отдаёт инструменты"
+else
+  bad "мост не ответил на tools/list"
+fi
+
+if (( FAIL )); then
+  say ""
+  say "Архив НЕ собран: сначала закройте пункты со «СТОП»."
+  exit 1
+fi
+
+say "=== 7. Сборка архива ==="
+rm -rf "/tmp/${NAME}" && mkdir -p "/tmp/${NAME}"
+# Исключаем секреты, локальное состояние индекса и всё, что пересоздаётся само.
+rsync -a \
+  --exclude '__pycache__/' --exclude '*.pyc' \
+  --exclude '.pytest_cache/' --exclude '.ruff_cache/' \
+  --exclude '.venv/' --exclude 'dist/' --exclude 'build/' \
+  --exclude 'data/' --exclude 'tests/tmp/' \
+  --exclude '.env' --exclude '.env.*' --exclude '.secret' --exclude '.secret.temp' \
+  --exclude '.gigaide/' --exclude '.DS_Store' --exclude '.git/' \
+  ./ "/tmp/${NAME}/lib-local-rag/"
+
+# Зипуем внутренний каталог, чтобы архив распаковывался в lib-local-rag/,
+# а не в лишний уровень с датой в имени.
+( cd "/tmp/${NAME}" && rm -f "../${NAME}.zip" && zip -qr "../${NAME}.zip" lib-local-rag )
+mv "/tmp/${NAME}.zip" "$OUT"
+rm -rf "/tmp/${NAME}"
+
+say ""
+say "Готово: $(cd .. && pwd)/${NAME}.zip"
+say "Внутри: uv.lock, код, тесты, MCP-мост, модель. Без .env, .secret и data/."
+say ""
+say "Тестировщику передайте вместе с docs/HANDOVER.md — там порядок запуска."

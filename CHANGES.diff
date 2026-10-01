@@ -1,0 +1,1238 @@
+# Индексатор: правки по результатам НТ (пакет NT_indexer_20260828)
+# Базовая версия: ef1c1ca "first commit"
+# Применить к чистому репозиторию:  git apply CHANGES.diff
+#
+# scripts/nt/ сюда НЕ включён: это сценарии НТ, скопированные из пакета
+# тестировщика. Единственная правка в них — вынос путей стенда в
+# переменные окружения:
+#   scripts/nt/test_sber_indexer.sh:
+#     -# ─── Константы — ПОДПРАВЬ ПОД СВОИ ПУТИ ───────────────────────────────────────
+#     -readonly INDEXER_DIR="/home/work/22514222@sigma.sbrf.ru/lib-local-rag"
+#     +# ─── Константы стенда ─────────────────────────────────────────────────────────
+#     +# Пути задаются переменными окружения — в репозитории они не могут быть
+#     +# захардкожены под конкретную машину. Пример запуска:
+#     +#   INDEXER_DIR=~/lib-local-rag WATCHED_DIR=~/index_test_files \
+#     +#   MONITOR_DIR=~/datahound sudo -E ./test_sber_indexer.sh
+#     +readonly INDEXER_DIR="${INDEXER_DIR:-$PWD}"
+#     -readonly INDEXER_URL="http://127.0.0.1:8000"
+#     -readonly LOADTEST="/home/work/22514222@sigma.sbrf.ru/datahound/sber_indexer_loadtest.py"
+#     -readonly WATCHED_DIR="/home/work/22514222@sigma.sbrf.ru/index_test_files"
+#     -readonly MONITOR_DIR="/home/work/22514222@sigma.sbrf.ru/datahound"  # где лежит cli/main.py
+#     +readonly INDEXER_URL="${INDEXER_URL:-http://127.0.0.1:8000}"
+#     +readonly LOADTEST="${LOADTEST:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sber_indexer_loadtest.py}"
+#     +readonly WATCHED_DIR="${WATCHED_DIR:-$HOME/index_test_files}"
+#     +readonly MONITOR_DIR="${MONITOR_DIR:-$HOME/datahound}"  # где лежит cli/main.py
+#   scripts/nt/check_indexer_fix.sh:
+#     -DIR="${DIR:-/home/work/22514222@sigma.sbrf.ru/index_test_files}"
+#     +DIR="${DIR:-$HOME/index_test_files}"
+#   scripts/nt/smoke_user_path.sh:
+#     -DIR="${DIR:-/home/work/22514222@sigma.sbrf.ru/index_test_files}"
+#     -INDEXER_DIR="${INDEXER_DIR:-/home/work/22514222@sigma.sbrf.ru/lib-local-rag}"
+#     +DIR="${DIR:-$HOME/index_test_files}"
+#     +INDEXER_DIR="${INDEXER_DIR:-$PWD}"
+
+diff --git a/main.py b/main.py
+index ef3590b..61a40d2 100644
+--- a/main.py
++++ b/main.py
+@@ -1,3 +1,4 @@
++import faulthandler
+ import logging
+ import os
+ 
+@@ -5,6 +6,12 @@ import uvicorn
+ 
+ from src.malloc_tuning import apply_arena_limit, memory_state
+ 
++# До импорта нативных расширений: abort() внутри C-библиотеки (LSM, Lance,
++# OpenVINO) иначе оставляет в логе одну строку ассерта и ни следа Python —
++# по такому логу нельзя понять, какой вызов упал. С faulthandler на SIGABRT
++# и SIGSEGV печатается стек всех потоков.
++faulthandler.enable()
++
+ # До импорта src.config и src.server: они тянут OpenVINO, Lance и polars, чьи
+ # потоки иначе успеют получить собственные арены glibc, и лимит опоздает.
+ apply_arena_limit()
+diff --git a/pyproject.toml b/pyproject.toml
+index cd90d5a..a35fdb4 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -85,6 +85,10 @@ torch = { index = "pytorch" }
+ [tool.ruff]
+ target-version = "py312"
+ lint.extend-select = ["I"]
++# Сценарии НТ приехали из пакета тестировщика и держатся байт-в-байт: их
++# гоняют и отсюда, и с его стенда, и расхождение форматирования мешало бы
++# сверять прогоны. Правим в них только пути стенда.
++exclude = ["scripts/nt"]
+ 
+ [tool.pytest_env]
+ TESTING = "Y"
+diff --git a/src/indexer/indexer.py b/src/indexer/indexer.py
+index e876f66..bbe7b6a 100644
+--- a/src/indexer/indexer.py
++++ b/src/indexer/indexer.py
+@@ -37,6 +37,8 @@ from src.utils import (
+ )
+ from src.utils.lance_wrapper import LanceWrapper, sql_quote
+ from src.utils.lsm_adapter import LSMCollection, check_meta_changed
++from src.utils.lsm_adapter import to_thread as lsm_to_thread
++from src.utils.lsm_adapter import wait_idle as lsm_wait_idle
+ from src.utils.thread_priority import background_pool_initializer
+ 
+ from .scanners import EmailsScanner, FilesScanner
+@@ -110,6 +112,13 @@ class Index(AbstractAsyncContextManager):
+         self._index_task: asyncio.Task | None = None
+         # Сколько файлов сейчас разбирает watcher (для честного /status)
+         self.watch_pending = 0
++        # Итоги последнего завершённого прохода. Без них /status обнуляет
++        # files_indexed и progress в тот же момент, когда снимается
++        # main_index, и клиент, дождавшийся конца индексации, читает
++        # «проиндексировано 0» (НТ 27.08: bulk_index_end indexed=0 на прогоне,
++        # где реально обработано 680 файлов).
++        self.last_pass_total = 0
++        self.last_pass_indexed = 0
+         # Когда последний раз выполнялась компакция — по таблице отдельно
+         self._last_optimize: dict[str, float] = {
+             cfg.ld_files_table: 0.0,
+@@ -229,11 +238,19 @@ class Index(AbstractAsyncContextManager):
+             self.task.cancel()
+             with suppress(asyncio.CancelledError):
+                 await self.task
+-                lg.info("indexing stopped")
++            # Вне suppress: внутри строка печаталась только когда задача НЕ
++            # была отменена, то есть ровно в тех прогонах, где останавливать
++            # было нечего. По логу это читалось как «остановка не дошла».
++            lg.info("indexing stopped")
+         lg.info("clear index queue")
+         await self.files_scanner.clear()
+         lg.info("stop indexing")
+         await self.stop_emails_polling()
++        # Отмена задачи не отменяет уже отданную в LSM-поток работу: она
++        # доигрывает, пока вызывающая сторона считает, что всё остановлено.
++        # Ждём явно — дальше POST /config перезапускает индексацию, и её
++        # первый шаг снова идёт в ту же БД.
++        await lsm_wait_idle()
+ 
+     async def start_reindex(self):
+         lg.debug("restart indexing")
+@@ -336,6 +353,14 @@ class Index(AbstractAsyncContextManager):
+         Дроп таблицы, а не удаление по фильтру: не остаётся ни deletion
+         vectors, ни партиций IVF-PQ с мёртвыми PQ-кодами.
+         """
++        if self.emails_scanner is None and not self.email_store.has_table:
++            # Сбрасывать нечего: почту не включали, таблицы нет. Выходим до
++            # обращения к LSM и Lance — клиенты шлют конфиг целиком, то есть
++            # с email.enabled=false на КАЖДЫЙ POST /config, и без этой
++            # проверки каждое обновление папок тянуло за собой обход всей
++            # таблицы состояния и дроп несуществующей таблицы.
++            lg.debug("почтовый индекс уже пуст, сбрасывать нечего")
++            return
+         if self.emails_scanner is not None:
+             await self.emails_scanner.clear()
+         await self.lsm_collection.indexed.async_delete_prefix(prefix=EMAIL_PREFIX)
+@@ -362,11 +387,16 @@ class Index(AbstractAsyncContextManager):
+             for path in batch:
+                 await self.lsm_collection.indexed.async_delete(path)
+ 
+-    def _collect_stale_paths(self) -> list[str]:
+-        """Пути из LSM, которых больше нет на диске. Выполняется в потоке."""
++    @staticmethod
++    def _filter_stale(paths: list[str]) -> list[str]:
++        """Из снимка ключей LSM оставить те, которых больше нет на диске.
++
++        Снимок берётся отдельно, на LSM-потоке: тысячи `os.path.exists` —
++        это тысячи syscall'ов, и держать на них блокировку таблицы нельзя.
++        """
+         return [
+             path
+-            for path, _meta in self.lsm_collection.indexed.items()
++            for path in paths
+             # у писем нет файла на диске — их состояние живёт своей жизнью
+             if not is_email_path(path) and not os.path.exists(path)
+         ]
+@@ -380,7 +410,11 @@ class Index(AbstractAsyncContextManager):
+         записи не замечает — он умеет только добавлять, — поэтому без сверки
+         удалённый файл продолжает находиться поиском сколько угодно долго.
+         """
+-        stale = await asyncio.to_thread(self._collect_stale_paths)
++        # Именно lsm_to_thread, а не asyncio.to_thread: обращаться к lsm_db
++        # можно только из выделенного потока (см. src/utils/lsm_adapter.py).
++        # Через дефолтный пул этот обход шёл параллельно записям в ту же БД.
++        indexed_paths = await lsm_to_thread(self.lsm_collection.indexed.keys_snapshot)
++        stale = await asyncio.to_thread(self._filter_stale, indexed_paths)
+         if not stale:
+             lg.debug("reconcile: nothing to remove")
+             return 0
+@@ -455,18 +489,40 @@ class Index(AbstractAsyncContextManager):
+             return
+         lg.info("collected %s items, start indexing into %s", total, store.table_name)
+         self.main_index = True
++        started = time.monotonic()
++        # Генератор держим в переменной, чтобы закрыть его явно. При отмене
++        # задачи (её делает POST /config) он иначе остаётся подвешенным на
++        # yield и финализируется когда-нибудь потом — уже после clear(),
++        # когда scanner.queue указывает на НОВУЮ очередь. Его task_done()
++        # уходил бы не в ту очередь: «task_done() called too many times»
++        # либо порча счётчика unfinished_tasks.
++        stream = scanner.iter(endless=False)
+         try:
+             lg.info("begin indexing")
+             self.counter.clear_cache()  # очищаем кеш потому что дальше будем вычитать из счетчика
+             # Обновляем индексы и во время прохода: иначе на холодном скане
+             # свежие строки до самого конца вне индексов, и поиск идёт перебором.
+             await self.ensure_index(store)
+-            await self.process_stream(scanner.iter(endless=False), store=store)
++            await self.process_stream(stream, store=store)
+         finally:
++            with suppress(Exception):
++                await stream.aclose()
++            # Итоги прохода запоминаем ДО обнуления preindex_cnt.
++            self.last_pass_total = self.preindex_cnt
++            self.last_pass_indexed = max(
++                0, self.preindex_cnt - (self.counter.cnt + self.watch_pending)
++            )
+             # Флаг снимаем ДО create_index: _maybe_compact выходит по
+             # main_index, и изнутри try компакция не наступала бы никогда.
+             self.main_index = False
+             self.preindex_cnt = 0
++        lg.info(
++            "indexed %s of %s items into %s за %.1f c",
++            self.last_pass_indexed,
++            self.last_pass_total,
++            store.table_name,
++            time.monotonic() - started,
++        )
+         await self.create_index(store)
+ 
+     async def start_emails_polling(self, immediate: bool = False):
+@@ -531,7 +587,9 @@ class Index(AbstractAsyncContextManager):
+             files_to_index=pending,
+             queued_files=self.queued_files if pending else 0,
+             queued_emails=self.queued_emails if pending else 0,
+-            total_files=self.preindex_cnt if self.main_index else 0,
++            # В простое отдаём итоги последнего прохода, а не нули: клиент,
++            # дождавшийся is_indexing=false, иначе читает «собрано 0».
++            total_files=self.preindex_cnt if self.main_index else self.last_pass_total,
+             # Сбор очереди — тоже работа: обход mbox идёт минутами при нулевом
+             # counter, и без preindex статус врал бы «простаиваю».
+             is_indexing=pending > 0 or self.preindex or self.main_index,
+@@ -542,11 +600,15 @@ class Index(AbstractAsyncContextManager):
+             else "update"
+             if pending > 0
+             else "idle",
+-            # прогресс и files_indexed считаем только когда в стадии main_index
++            # Во время прохода — текущий прогресс, после него — результат
++            # последнего прохода. Ноль в простое означал бы «ничего не
++            # проиндексировано», хотя проход только что завершился успешно.
+             progress=(1 - (pending / self.preindex_cnt))
+             if self.main_index and self.preindex_cnt
+-            else 0,
+-            files_indexed=self.preindex_cnt - pending if self.main_index else 0,
++            else (1.0 if self.last_pass_total else 0.0),
++            files_indexed=(self.preindex_cnt - pending)
++            if self.main_index
++            else self.last_pass_indexed,
+         )
+ 
+     async def create_index(
+diff --git a/src/indexer/scanners/base.py b/src/indexer/scanners/base.py
+index d13e9f7..8f84575 100644
+--- a/src/indexer/scanners/base.py
++++ b/src/indexer/scanners/base.py
+@@ -1,5 +1,8 @@
+ import abc
++import asyncio
++import os
+ import shutil
++import time
+ from collections.abc import AsyncGenerator
+ from contextlib import AbstractAsyncContextManager, AsyncExitStack
+ from pathlib import Path
+@@ -28,6 +31,10 @@ class AbstractBaseScanner(AbstractAsyncContextManager, ConfigMixin, abc.ABC):
+         self.queue = AsyncQueue(str(queue_path))
+         self.stack = AsyncExitStack()
+         self.lsm_checker = lsm_checker
++        # Очередь пересоздаётся на ходу (clear() из POST /config), а читают и
++        # пишут в неё разные задачи. Без блокировки clear() успевает подменить
++        # self.queue между get() и task_done() в iter().
++        self._queue_lock = asyncio.Lock()
+ 
+     async def __aenter__(self):
+         await self.stack.enter_async_context(self.queue)
+@@ -42,11 +49,31 @@ class AbstractBaseScanner(AbstractAsyncContextManager, ConfigMixin, abc.ABC):
+         await self.stack.aclose()
+ 
+     async def clear(self):
+-        await self.__aexit__(None, None, None)
+-        self.stack = AsyncExitStack()
+-        shutil.rmtree(self.queu_path, ignore_errors=True)
+-        self.queue = AsyncQueue(str(self.queu_path))
+-        await self.__aenter__()
++        retired: Path | None = None
++        async with self._queue_lock:
++            await self.__aexit__(None, None, None)
++            self.stack = AsyncExitStack()
++            # Каталог живой БД не удаляем на месте: отменённые корутины могут
++            # ещё держать открытые хендлы на q00000/info, а новая очередь
++            # создаётся по тому же пути и подхватила бы их файлы. Уводим
++            # старый каталог в сторону, а удаляем уже вне блокировки, когда
++            # ссылок на него не осталось.
++            old_path = self.queu_path
++            candidate = old_path.with_name(
++                f"{old_path.name}.retired.{os.getpid()}.{time.time_ns()}"
++            )
++            try:
++                os.replace(old_path, candidate)
++            except OSError:
++                # Каталога ещё нет (первый запуск) либо переименование
++                # недоступно — запасной путь остаётся прежним.
++                shutil.rmtree(old_path, ignore_errors=True)
++            else:
++                retired = candidate
++            self.queue = AsyncQueue(str(old_path))
++            await self.__aenter__()
++        if retired is not None:
++            await asyncio.to_thread(shutil.rmtree, retired, ignore_errors=True)
+ 
+     async def check_meta(self, meta: FileMetadata) -> bool:
+         """Изменился ли файл с момента последней индексации."""
+@@ -61,15 +88,36 @@ class AbstractBaseScanner(AbstractAsyncContextManager, ConfigMixin, abc.ABC):
+             if check_index and not (await self.check_meta(meta)):
+                 lg.debug("skip indexing %s, already indexed", meta.path)
+                 continue
+-            await self.queue.put(meta)
++            async with self._queue_lock:
++                await self.queue.put(meta)
+ 
+     async def iter(self, endless: bool = True):
+         while True:
+-            if not endless and await self.queue.empty():
+-                break
+-            item: FileMetadata = await self.queue.get()
++            async with self._queue_lock:
++                queue = self.queue
++                # Пустоту проверяем под той же блокировкой, что и снятие:
++                # иначе между empty() и get() очередь может опустеть, и
++                # блокирующий get() зависнет навсегда.
++                if not endless:
++                    if await queue.empty():
++                        break
++                    item: FileMetadata = await queue.get()
++            if endless:
++                # Здесь get() ждёт нового элемента сколько угодно долго —
++                # держать на нём блокировку нельзя, иначе clear() встанет.
++                item = await queue.get()
++            # yield — ВНЕ блокировки: разбор и эмбеддинг элемента идут
++            # секундами, и всё это время clear() не смог бы отработать.
+             yield item
+-            await self.queue.task_done()
++            async with self._queue_lock:
++                if queue is not self.queue:
++                    # Очередь пересоздали, пока мы обрабатывали элемент
++                    # (POST /config -> clear()). Отмечать выполнение в НОВОЙ
++                    # очереди нельзя: это «task_done() called too many
++                    # times», а старая уже закрыта и удалена.
++                    break
++                await queue.task_done()
+ 
+     async def total(self):
+-        return await self.queue.qsize()
++        async with self._queue_lock:
++            return await self.queue.qsize()
+diff --git a/src/indexer/utils.py b/src/indexer/utils.py
+index 292d8a6..57dca1f 100644
+--- a/src/indexer/utils.py
++++ b/src/indexer/utils.py
+@@ -7,6 +7,7 @@ from fastapi import Depends
+ from src.common import FileMetadata
+ from src.parsers import file_extension, get_parsers_registry
+ from src.utils import get_config, get_logger
++from src.utils.lsm_adapter import wait_idle as lsm_wait_idle
+ 
+ from .indexer import Index
+ from .watcher import Watcher
+@@ -81,6 +82,10 @@ async def stop_watcher():
+     _watcher_task.cancel()
+     with suppress(asyncio.CancelledError):
+         await _watcher_task
++    # Отмена задачи не отменяет уже отданную в LSM-поток работу: on_upsert
++    # успевает поставить туда check_meta/async_set, и они доигрывают уже
++    # после того, как watcher считается остановленным.
++    await lsm_wait_idle()
+ 
+ 
+ async def restart_watcher():
+diff --git a/src/server/router.py b/src/server/router.py
+index b70d600..e0bb5bf 100644
+--- a/src/server/router.py
++++ b/src/server/router.py
+@@ -140,9 +140,11 @@ async def update_config(
+         cfg.update_user_config(
+             _merge_user_config(cfg.user_config_with_default, user_config)
+         )
+-        if user_config.folders is not None:
++        folders_changed = user_config.folders is not None
++        if folders_changed:
+             new_paths = set(
+-                str(Path(p).expanduser().absolute()) for p in user_config.folders
++                str(Path(p).expanduser().absolute())
++                for p in user_config.folders  # type: ignore[union-attr]
+             )
+             await stop_watcher()
+             await index.stop_index()
+@@ -150,8 +152,6 @@ async def update_config(
+             if to_delete := prev_paths - new_paths:
+                 for p in to_delete:
+                     await index.delete_prefix(p)
+-            await index.start_reindex()
+-            await restart_watcher()
+         email_enabled = cfg.email_enabled
+         # Пришло ли выключение явно в этом запросе. Одного перехода
+         # «было включено -> стало выключено» мало: prev_email_enabled читается
+@@ -172,6 +172,14 @@ async def update_config(
+             # Router не должен знать ни про число таблиц, ни про устройство
+             # сканера.
+             await index.drop_email_index()
++        # Перезапуск — последним шагом секции, после всей работы по почте.
++        # Раньше start_reindex() создавал фоновую задачу в середине
++        # обработчика, и она шла сверять удалённые файлы в ту же БД
++        # состояния, куда drop_email_index() в этот момент писал.
++        # reconfigure_lock от этого не спасает: задача живёт вне лока.
++        if folders_changed:
++            await index.start_reindex()
++            await restart_watcher()
+     return Response(status_code=200)
+ 
+ 
+diff --git a/src/utils/lsm_adapter.py b/src/utils/lsm_adapter.py
+index 136dcd5..7e74fe3 100644
+--- a/src/utils/lsm_adapter.py
++++ b/src/utils/lsm_adapter.py
+@@ -3,6 +3,7 @@ import concurrent
+ import concurrent.futures
+ import os
+ import struct
++import threading
+ import time
+ from collections.abc import AsyncIterator, Callable, Iterator
+ from contextlib import AbstractContextManager, ExitStack
+@@ -21,11 +22,24 @@ from typing import (
+ from lsm import LSM
+ 
+ from src.common import FileMetadata
+-from src.utils import get_logger, wrap_iter_to_async
++from src.utils import get_logger
+ 
+ lg = get_logger(__name__, slice=-1)
+ 
+-executor = concurrent.futures.ThreadPoolExecutor(1)
++# Единственный поток, которому разрешено работать с lsm_db.
++#
++# Хендл lsm_db однопоточный: он хранит собственный номер читателя (iReader),
++# список открытых курсоров (pCsr) и глубину транзакций (nTransOpen), а на входе
++# в каждую операцию проверяет их согласованность (assert_db_state,
++# lsm_main.c:43). Обращение из нескольких потоков это состояние рассогласует —
++# в отладочной сборке процесс убивается через abort(), в release состояние
++# портится молча.
++#
++# Поэтому инвариант модуля: к self.lsm обращаются либо из этого executor'а
++# (через to_thread ниже), либо синхронно под LSMTable._lock. Дефолтный пул
++# asyncio (asyncio.to_thread), _ITER_EXECUTOR и _INDEX_BUILD_EXECUTOR к LSM
++# не допускаются.
++executor = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="lsm")
+ 
+ P = ParamSpec("P")
+ R = TypeVar("R")
+@@ -42,7 +56,9 @@ def retry_read(foo: Callable[[], R]) -> R:
+     """Повторить чтение LSM при транзиентном сбое.
+ 
+     Вызывается уже внутри worker-потока `executor`, поэтому блокирующий
+-    `time.sleep` здесь не задевает event loop.
++    `time.sleep` здесь не задевает event loop. Блокировку таблицы берёт сам
++    `foo` — на время паузы между попытками она отпущена, иначе десять секунд
++    ретраев запирали бы все остальные обращения к БД.
+     """
+     for attempt in range(LSM_READ_RETRIES):
+         try:
+@@ -63,10 +79,24 @@ def retry_read(foo: Callable[[], R]) -> R:
+ 
+ 
+ async def to_thread(foo: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+-    loop = asyncio.get_event_loop()
++    loop = asyncio.get_running_loop()
+     return await loop.run_in_executor(executor, partial(foo, *args, **kwargs))
+ 
+ 
++async def wait_idle() -> None:
++    """Дождаться, пока в LSM-потоке не останется незавершённой работы.
++
++    Отмена корутины НЕ отменяет уже отданный в executor вызов: он доигрывает
++    в потоке, пока вызывающая сторона считает, что всё остановлено. Барьер
++    нужен там, где следующий шаг рассчитывает на покой БД — в первую очередь
++    в POST /config (stop_index -> clear -> start_reindex).
++
++    Executor однопоточный, поэтому пустая задача выполняется строго после
++    всего, что было поставлено в очередь раньше.
++    """
++    await to_thread(lambda: None)
++
++
+ async def check_meta_changed(
+     table: "LSMTable[FileMetadata]", meta: FileMetadata
+ ) -> bool:
+@@ -121,11 +151,16 @@ class LSMTable[T](AbstractContextManager):
+         self.path = path
+         self.decoder = decoder
+         self.exit_stack = ExitStack()
++        # RLock, а не Lock: методы класса вызывают друг друга (delete_prefix
++        # держит блокировку и внутри неё удаляет ключи).
++        #
++        # Создаётся ДО connect(): открытие БД тоже идёт под блокировкой.
++        self._lock = threading.RLock()
+         self.lsm = self.connect()
+-        self.lck = asyncio.Lock()
+ 
+     def close(self):
+-        self.exit_stack.close()
++        with self._lock:
++            self.exit_stack.close()
+ 
+     def __exit__(
+         self,
+@@ -133,7 +168,8 @@ class LSMTable[T](AbstractContextManager):
+         exc_value: BaseException | None,
+         traceback: TracebackType | None,
+     ) -> bool | None:
+-        return self.exit_stack.close()
++        self.close()
++        return None
+ 
+     def __enter__(self) -> Self:
+         return self
+@@ -142,10 +178,11 @@ class LSMTable[T](AbstractContextManager):
+         """Сырое чтение с повтором. None — ключа нет (это не ошибка)."""
+ 
+         def _read() -> bytes | None:
+-            try:
+-                return self.lsm[key.encode()]  # type: ignore
+-            except KeyError:
+-                return None
++            with self._lock:
++                try:
++                    return self.lsm[key.encode()]  # type: ignore
++                except KeyError:
++                    return None
+ 
+         return retry_read(_read)
+ 
+@@ -153,8 +190,7 @@ class LSMTable[T](AbstractContextManager):
+         return self._read_raw(key) is not None
+ 
+     async def async_is_in(self, key: str) -> bool:
+-        async with self.lck:
+-            return await to_thread(self.is_in, key)
++        return await to_thread(self.is_in, key)
+ 
+     @overload
+     def get(self, key: str, decode: Literal[True] = True) -> T: ...
+@@ -180,63 +216,109 @@ class LSMTable[T](AbstractContextManager):
+         key: str,
+         decode: bool = True,
+     ) -> T | None:
+-        async with self.lck:
+-            return await to_thread(
+-                self.get,
+-                key=key,
+-                decode=decode,  # type: ignore
+-            )
++        return await to_thread(
++            self.get,
++            key=key,
++            decode=decode,  # type: ignore
++        )
+ 
+     def set(self, key: str, value: T) -> None:
+         data = self.encoder(value)
+-        self.lsm[key.encode()] = data
++        with self._lock:
++            self.lsm[key.encode()] = data
+ 
+     async def async_set(self, key, value: T) -> None:
+         await to_thread(self.set, key, value)
+ 
+     def delete(self, key: str) -> None:
+-        try:
+-            self.lsm.delete(key.encode())
+-        except KeyError:
+-            pass
++        with self._lock:
++            try:
++                self.lsm.delete(key.encode())
++            except KeyError:
++                pass
+ 
+     async def async_delete(self, key: str) -> None:
+         await to_thread(self.delete, key)
+ 
++    def _keys_with_prefix(self, b_prefix: bytes) -> list[bytes]:
++        """Ключи с этим префиксом. Курсора после себя не оставляет.
++
++        Полный обход `keys()`, а не курсор с `seek`, хотя seek и дешевле:
++        на ПУСТОЙ базе lsm вообще не даёт открыть курсор
++        (`RuntimeError: Invalid cursor`), а пустая база — штатное состояние
++        (свежая установка, только что очищенный индекс). `keys()` этот случай
++        переживает.
++
++        Прежний вариант — срез `self.lsm[b_prefix:]` с выходом по `break` —
++        оставлял курсор открытым на неопределённый срок, а следующая же
++        строка открывала на том же хендле транзакцию: ровно та пара
++        «курсор + транзакция», согласованность которой проверяет
++        assert_db_state. Здесь генератор вычитывается до конца, поэтому
++        курсор закрывается сразу.
++
++        Цена — обход всех ключей вместо только совпавших. Это допустимо:
++        delete_prefix зовут при смене списка папок и при выключении почты,
++        а полный обход по таблице и так делает keys_snapshot() на каждом
++        проходе индексации.
++        """
++        with self._lock:
++            return [key for key in self.lsm.keys() if key.startswith(b_prefix)]  # type: ignore
++
+     def delete_prefix(self, prefix: str):
+         b_prefix = prefix.encode()
+-        keys_to_delete = []
+-        for k, _ in self.lsm[b_prefix:]:  # type: ignore
+-            if not k.startswith(b_prefix):
+-                break
+-            keys_to_delete.append(k)
+-        with self.lsm.transaction():
+-            for k in keys_to_delete:
+-                del self.lsm[k]
++        with self._lock:
++            keys_to_delete = self._keys_with_prefix(b_prefix)
++            if not keys_to_delete:
++                return
++            with self.lsm.transaction():
++                for k in keys_to_delete:
++                    del self.lsm[k]
+ 
+     async def async_delete_prefix(self, prefix: str):
+-        async with self.lck:
+-            await to_thread(self.delete_prefix, prefix)
++        await to_thread(self.delete_prefix, prefix)
++
++    def keys_snapshot(self) -> list[str]:
++        """Все ключи таблицы одним снимком.
++
++        Значения не декодируются: вызывающей стороне (сверка удалённых файлов)
++        нужны только пути, а декодирование каждой записи на корпусе в сотню
++        тысяч файлов — лишняя работа.
++        """
++        with self._lock:
++            return [key.decode() for key in self.lsm.keys()]  # type: ignore
++
++    def items_snapshot(self) -> list[tuple[str, T]]:
++        with self._lock:
++            return [
++                (key.decode(), self.decoder(key.decode(), data))
++                for key, data in self.lsm.items()  # type: ignore
++            ]
+ 
+     def items(self) -> Iterator[tuple[str, T]]:
+-        for key, data in self.lsm.items():  # type: ignore
+-            key: bytes
+-            data: bytes
+-            yield key.decode(), self.decoder(key.decode(), data)
++        """Содержимое таблицы.
++
++        Именно снимок, а не ленивый курсор: курсор, живущий через `yield`,
++        держит открытым читателя БД всё время, пока вызывающая сторона
++        обрабатывает очередной элемент, — а брошенный на полпути генератор
++        оставляет его открытым навсегда.
++        """
++        yield from self.items_snapshot()
+ 
+     async def async_items(self) -> AsyncIterator[tuple[str, T]]:
+-        async for key, value in wrap_iter_to_async(self.items()):
++        for key, value in await to_thread(self.items_snapshot):
+             yield key, value
+ 
+     def connect(self):
+-        self.path.parent.mkdir(parents=True, exist_ok=True)
+-        return self.exit_stack.enter_context(LSM(str(self.path)))
++        with self._lock:
++            self.path.parent.mkdir(parents=True, exist_ok=True)
++            return self.exit_stack.enter_context(LSM(str(self.path)))
+ 
+     def reset(self) -> None:
+-        self.close()
+-        os.remove(self.path)
+-        self.exit_stack = ExitStack()
+-        self.lsm = self.connect()
++        with self._lock:
++            self.close()
++            os.remove(self.path)
++            self.exit_stack = ExitStack()
++            self.lsm = self.connect()
+ 
+ 
+ class TableDescriptor[T]:
+diff --git a/tests/test_config_reload.py b/tests/test_config_reload.py
+new file mode 100644
+index 0000000..c7cffb1
+--- /dev/null
++++ b/tests/test_config_reload.py
+@@ -0,0 +1,256 @@
++"""Регрессия на POST /config: порядок шагов и холостой сброс почты.
++
++Боевой дефект: `start_reindex()` создавал фоновую задачу в середине
++обработчика, и она шла сверять удалённые файлы в ту же БД состояния, куда
++`drop_email_index()` в этот же момент писал. `reconfigure_lock` от этого не
++спасает — задача живёт вне лока. Проявлялось как assert_db_state в lsm1
++(SIGABRT) примерно на каждом десятом POST /config.
++"""
++
++import pytest
++
++from src.config import Config, EmailConfig
++from src.indexer.indexer import Index
++from src.server.model import UserConfig
++from src.server.router import update_config
++
++# Фикстуры поднимают Index на временном хранилище — переиспользуем их.
++from tests.test_indexing_live import index, isolated_config  # noqa: F401
++
++
++@pytest.fixture
++def cfg(config: Config, tmp_path, monkeypatch):
++    monkeypatch.setattr(config, "data_directory", str(tmp_path / "ragsearch"))
++    config.__dict__.pop("user_conf_path", None)
++    config.__dict__.pop("data_directory_path", None)
++    monkeypatch.setattr(config, "email", EmailConfig(enabled=False))
++    yield config
++    config.__dict__.pop("user_conf_path", None)
++    config.__dict__.pop("data_directory_path", None)
++
++
++@pytest.fixture
++def journal(monkeypatch):
++    """Единый журнал вызовов индексатора и watcher'а — важен их порядок."""
++    import src.server.router as router_module
++
++    calls: list = []
++
++    async def fake_stop():
++        calls.append("stop_watcher")
++
++    async def fake_restart():
++        calls.append("restart_watcher")
++
++    monkeypatch.setattr(router_module, "stop_watcher", fake_stop)
++    monkeypatch.setattr(router_module, "restart_watcher", fake_restart)
++    return calls
++
++
++class RecordingIndex:
++    """Протокол Index, достаточный для update_config, с общим журналом."""
++
++    def __init__(self, calls: list):
++        self.calls = calls
++        self.emails_scanner = None
++
++    async def stop_index(self):
++        self.calls.append("stop_index")
++
++    async def start_reindex(self):
++        self.calls.append("start_reindex")
++
++    async def delete_prefix(self, prefix):
++        self.calls.append(("delete_prefix", prefix))
++
++    async def drop_email_index(self):
++        self.calls.append("drop_email_index")
++
++    async def start_emails_polling(self, immediate=False):
++        self.calls.append(("start_emails_polling", immediate))
++
++    async def stop_emails_polling(self):
++        self.calls.append("stop_emails_polling")
++
++
++def _nt_body(folder: str) -> UserConfig:
++    """Тело, которое реально шлёт нагрузочный стенд (и hunt_crash.py).
++
++    Ключевое здесь — email.enabled=false приходит ЯВНО на каждый запрос,
++    поэтому ветка сброса почты выполняется даже когда почту не включали.
++    """
++    return UserConfig.model_validate(
++        {
++            "folders": [folder],
++            "email": {
++                "enabled": False,
++                "path_to_email_folder": "",
++                "index_last_n_days": 90,
++            },
++            "sberchat": {"enabled": False},
++        }
++    )
++
++
++@pytest.mark.asyncio
++async def test_reindex_starts_after_email_cleanup(cfg, journal, tmp_path):
++    """Перезапуск индексации — последним шагом, после работы по почте.
++
++    До фикса порядок был stop -> start_reindex -> restart_watcher ->
++    drop_email_index, то есть фоновый скан и чистка почтового состояния
++    работали с БД одновременно.
++    """
++    docs = tmp_path / "docs"
++    docs.mkdir()
++    fake_index = RecordingIndex(journal)
++
++    await update_config(_nt_body(str(docs)), cfg, fake_index)
++
++    assert "start_reindex" in journal, "переиндексация должна была стартовать"
++    assert "restart_watcher" in journal
++
++    # Всё, что трогает состояние индекса, обязано завершиться до старта
++    # фоновой задачи.
++    start = journal.index("start_reindex")
++    for step in ("stop_watcher", "stop_index"):
++        assert journal.index(step) < start, f"{step} должен идти до start_reindex"
++    if "drop_email_index" in journal:
++        assert journal.index("drop_email_index") < start, (
++            "drop_email_index не должен работать параллельно с новым сканом"
++        )
++    assert journal.index("restart_watcher") > start
++
++
++@pytest.mark.asyncio
++async def test_email_only_change_does_not_restart_indexing(cfg, journal):
++    """Запрос без folders не трогает ни индексацию, ни watcher."""
++    fake_index = RecordingIndex(journal)
++
++    await update_config(
++        UserConfig.model_validate({"email": {"enabled": False}}), cfg, fake_index
++    )
++
++    assert "start_reindex" not in journal
++    assert "restart_watcher" not in journal
++    assert "stop_watcher" not in journal
++
++
++@pytest.mark.asyncio
++async def test_repeated_config_keeps_order_stable(cfg, journal, tmp_path):
++    """Повторные POST /config (стенд шлёт их пачкой) не ломают порядок."""
++    docs = tmp_path / "docs"
++    docs.mkdir()
++    fake_index = RecordingIndex(journal)
++
++    for _ in range(10):
++        journal.clear()
++        await update_config(_nt_body(str(docs)), cfg, fake_index)
++        start = journal.index("start_reindex")
++        assert journal.index("stop_index") < start
++        assert journal.index("restart_watcher") > start
++
++
++@pytest.mark.asyncio
++async def test_drop_email_index_is_noop_when_nothing_to_drop(
++    index: Index,  # noqa: F811
++    monkeypatch,
++):
++    """Холостой сброс почты не трогает БД состояния.
++
++    Клиенты шлют конфиг целиком, то есть с email.enabled=false на КАЖДЫЙ
++    POST /config. Без проверки «сбрасывать нечего» любое обновление списка
++    папок тянуло за собой обход всей таблицы состояния и дроп
++    несуществующей почтовой таблицы.
++    """
++    monkeypatch.setattr(index, "emails_scanner", None)
++    assert not index.email_store.has_table, "почтовой таблицы быть не должно"
++
++    touched: list[str] = []
++
++    async def fake_delete_prefix(prefix):
++        touched.append(prefix)
++
++    monkeypatch.setattr(
++        index.lsm_collection.indexed, "async_delete_prefix", fake_delete_prefix
++    )
++
++    await index.drop_email_index()
++
++    assert touched == [], "холостой сброс не должен ходить в таблицу состояния"
++
++
++@pytest.mark.asyncio
++async def test_delete_prefix_survives_empty_state_db(
++    index: Index,  # noqa: F811
++):
++    """Снятие префикса на ПУСТОЙ таблице состояния не должно падать.
++
++    Боевой дефект: обход ключей открывал курсор lsm, а на пустой базе
++    курсор не открывается вовсе — `RuntimeError: Invalid cursor`. Пустая
++    таблица состояния при этом штатна: свежая установка, только что
++    очищенный индекс, первый POST /config. Наружу это выходило как
++    500 на смену списка папок, причём watcher оставался остановленным —
++    его перезапуск идёт после удаления и до него не доходило.
++    """
++    assert not list(index.lsm_collection.indexed.items()), "таблица должна быть пуста"
++
++    await index.delete_prefix("/nonexistent/dir/")
++
++
++@pytest.mark.asyncio
++async def test_delete_prefix_removes_only_its_own_subtree(
++    index: Index,  # noqa: F811
++    tmp_path,
++):
++    """Удаляется ровно поддерево префикса, соседи по имени — нет."""
++    from src.common import FileMetadata
++
++    table = index.lsm_collection.indexed
++    paths = ["/home/a/1.txt", "/home/a/2.txt", "/home/ab/3.txt", "/home/b/4.txt"]
++    for p in paths:
++        await table.async_set(p, FileMetadata(path=p, size=1, mtime_seconds=1))
++
++    await index.delete_prefix("/home/a/")
++
++    left = sorted(key for key, _ in table.items())
++    assert left == ["/home/ab/3.txt", "/home/b/4.txt"], (
++        "снято должно быть только /home/a/, но не /home/ab/"
++    )
++
++
++@pytest.mark.asyncio
++async def test_folder_change_restarts_watcher_with_real_index(
++    cfg,
++    journal,
++    index: Index,  # noqa: F811
++    tmp_path,
++    monkeypatch,
++):
++    """Смена папки: настоящий Index, не заглушка.
++
++    Прежние тесты подменяли delete_prefix, поэтому его поломка проходила
++    мимо них — а на стенде каждый POST /config со сменой папки отвечал 500.
++    Здесь удаление настоящее: проверяем и код ответа, и то, что watcher
++    подняли обратно.
++    """
++    old_dir = tmp_path / "old"
++    new_dir = tmp_path / "new"
++    for d in (old_dir, new_dir):
++        d.mkdir()
++
++    # Полный проход поднимать не надо — важна только ветка смены папок.
++    async def fake_reindex():
++        journal.append("start_reindex")
++
++    monkeypatch.setattr(index, "start_reindex", fake_reindex)
++
++    cfg.update_user_config(_nt_body(str(old_dir)))
++    journal.clear()
++
++    response = await update_config(_nt_body(str(new_dir)), cfg, index)
++
++    assert response.status_code == 200
++    assert "restart_watcher" in journal, (
++        f"watcher обязан подняться обратно, журнал: {journal}"
++    )
++    assert journal.index("stop_watcher") < journal.index("restart_watcher")
+diff --git a/tests/test_lsm_concurrency.py b/tests/test_lsm_concurrency.py
+new file mode 100644
+index 0000000..80f0821
+--- /dev/null
++++ b/tests/test_lsm_concurrency.py
+@@ -0,0 +1,173 @@
++"""Регрессия на assert_db_state: хендл lsm_db однопоточный.
++
++Хендл хранит номер читателя, список открытых курсоров и глубину транзакций
++и проверяет их согласованность на входе в каждую операцию
++(`assert_db_state`, lsm_main.c:43). Нарушение убивает процесс через abort()
++в отладочной сборке и молча портит состояние в release.
++
++Отсюда два требования к LSMTable:
++  * все операции сериализованы (блокировка + выделенный поток);
++  * ни одна операция не оставляет за собой открытый курсор.
++"""
++
++import os
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++from src.utils.lsm_adapter import LSMTable
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++
++
++def _run_isolated(body: str) -> subprocess.CompletedProcess:
++    """Выполнить сценарий в отдельном процессе.
++
++    Именно в отдельном: сработавший assert внутри lsm1 убивает процесс
++    целиком (SIGABRT), и в общем прогоне он унёс бы весь pytest вместо
++    того, чтобы показать упавший тест.
++    """
++    env = {
++        **os.environ,
++        "DEV": "1",
++        "RESET": "0",
++        "TESTING": "Y",
++        "CONFIG_PATH": "cfg/dev.yml",
++        "PYTHONPATH": str(REPO_ROOT),
++    }
++    return subprocess.run(
++        [sys.executable, "-c", textwrap.dedent(body)],
++        capture_output=True,
++        text=True,
++        cwd=REPO_ROOT,
++        env=env,
++        timeout=180,
++    )
++
++
++def _encode(value: str) -> bytes:
++    return value.encode("utf-8")
++
++
++def _decode(key: str, data: bytes) -> str:
++    return data.decode("utf-8")
++
++
++@pytest.fixture
++def table(tmp_path):
++    t = LSMTable(path=tmp_path / "indexed.lsm", encoder=_encode, decoder=_decode)
++    try:
++        yield t
++    finally:
++        t.close()
++
++
++def test_abandoned_items_iteration_leaves_no_open_cursor(table: LSMTable[str]):
++    """Брошенный на полпути обход не должен держать курсор открытым.
++
++    `items()` раньше был ленивым генератором поверх живого курсора: пока
++    вызывающая сторона обрабатывала очередной элемент, курсор оставался
++    открытым, а брошенный генератор не закрывал его вовсе. Проверяем по
++    самому строгому признаку — БД с открытым курсором не закрывается
++    (lsm возвращает Misuse).
++    """
++    for i in range(50):
++        table.set(f"/doc{i:03d}", "v")
++
++    leaked = table.items()
++    next(leaked)  # взяли один элемент и бросили обход; ссылку держим
++
++    table.close()  # до фикса: RuntimeError: Misuse
++
++
++def test_delete_prefix_leaves_no_open_cursor(table: LSMTable[str]):
++    """delete_prefix закрывает курсор до открытия транзакции."""
++    for i in range(50):
++        table.set(f"/doc{i:03d}", "v")
++    for i in range(50):
++        table.set(f"email_INBOX:{i}", "v")
++
++    table.delete_prefix("email_")
++
++    assert [k for k, _ in table.items()] == [f"/doc{i:03d}" for i in range(50)]
++    table.close()
++
++
++def test_parallel_access_survives_and_stays_consistent(tmp_path):
++    """Одновременная работа нескольких потоков не роняет процесс.
++
++    Воспроизводит боевую связку POST /config: полный обход таблицы
++    (сверка удалённых файлов) параллельно с записями, точечными чтениями
++    и удалением по префиксу (сброс почтового индекса).
++    """
++    result = _run_isolated(f"""
++        import threading
++        from pathlib import Path
++        from src.utils.lsm_adapter import LSMTable
++
++        table = LSMTable(
++            path=Path({str(tmp_path / "indexed.lsm")!r}),
++            encoder=lambda v: v.encode(),
++            decoder=lambda k, d: d.decode(),
++        )
++        for i in range(2000):
++            table.set(f"/home/user/doc_{{i:05d}}.pdf", "x")
++        for i in range(2000):
++            table.set(f"email_INBOX:{{i}}", "y")
++
++        stop = threading.Event()
++        errors = []
++
++        def guard(fn):
++            def run():
++                while not stop.is_set():
++                    try:
++                        fn()
++                    except Exception as exc:
++                        errors.append(repr(exc))
++                        return
++            return run
++
++        def scan():
++            for _ in table.items():
++                pass
++
++        def snapshot():
++            table.keys_snapshot()
++
++        def read():
++            table.get("/home/user/doc_00001.pdf")
++            table.is_in("/home/user/missing.pdf")
++
++        def write():
++            table.set("/home/user/doc_00001.pdf", "z")
++
++        def wipe_prefix():
++            table.delete_prefix("email_")
++
++        threads = [
++            threading.Thread(target=guard(fn))
++            for fn in (scan, scan, snapshot, read, read, write, wipe_prefix)
++        ]
++        for t in threads:
++            t.start()
++        stop.wait(5)
++        stop.set()
++        for t in threads:
++            t.join(30)
++
++        assert not errors, errors[:3]
++        # Таблица осталась работоспособной, а не «выжила молча».
++        assert table.get("/home/user/doc_00002.pdf") == "x"
++        assert not [k for k, _ in table.items() if k.startswith("email_")]
++        table.close()
++        print("OK")
++    """)
++
++    assert result.returncode == 0, (
++        f"процесс упал (rc={result.returncode}): {result.stderr[-2000:]}"
++    )
++    assert "OK" in result.stdout
+diff --git a/tests/test_scanners.py b/tests/test_scanners.py
+index 6d0a047..b898347 100644
+--- a/tests/test_scanners.py
++++ b/tests/test_scanners.py
+@@ -69,6 +69,44 @@ async def test_files_scanner(files_scanner: FilesScanner):
+     assert cnt == to_count
+ 
+ 
++@pytest.mark.asyncio
++async def test_clear_during_iteration(files_scanner: FilesScanner):
++    """clear() на ходу не ломает уже начатый обход очереди.
++
++    POST /config зовёт clear() ровно тогда, когда проход может быть в
++    середине. Раньше очередь пересоздавалась под тем же путём, а обход
++    продолжал звать task_done() — но уже у НОВОГО объекта очереди, где
++    незавершённых задач нет: persistqueue отвечает на это «task_done()
++    called too many times».
++    """
++    await files_scanner.scan()
++    assert await files_scanner.total() > 0
++
++    seen = 0
++    async with timeout(10):
++        async for _meta in files_scanner.iter(endless=False):
++            seen += 1
++            if seen == 1:
++                await files_scanner.clear()
++
++    assert seen == 1, "после подмены очереди обход должен прекратиться"
++    assert await files_scanner.total() == 0
++    # Каталог очереди пересоздан и пригоден к работе.
++    assert files_scanner.queu_path.is_dir()
++    await files_scanner.scan()
++    assert await files_scanner.total() > 0
++
++
++@pytest.mark.asyncio
++async def test_clear_removes_retired_queue_dir(files_scanner: FilesScanner):
++    """Старый каталог очереди уводится в сторону и удаляется, не накапливаясь."""
++    await files_scanner.scan()
++    parent = files_scanner.queu_path.parent
++    await files_scanner.clear()
++    retired = list(parent.glob(f"{files_scanner.queu_path.name}.retired.*"))
++    assert retired == [], f"остались временные каталоги очереди: {retired}"
++
++
+ @pytest.mark.integration
+ @pytest.mark.asyncio
+ async def test_emails_scanner(emails_scanner: EmailsScanner):
+diff --git a/tests/test_status_reporting.py b/tests/test_status_reporting.py
+new file mode 100644
+index 0000000..6711114
+--- /dev/null
++++ b/tests/test_status_reporting.py
+@@ -0,0 +1,62 @@
++"""Регрессия на /status: итог прохода не должен теряться при его завершении.
++
++`files_indexed` и `progress` считались только пока поднят `main_index`, а он
++снимается в тот же момент, когда проход завершается. Клиент, дождавшийся
++`is_indexing=false`, читал «проиндексировано 0»: в НТ 27.08 стенд записал
++`bulk_index_end {'indexed': 0, 'progress': 0.0}` для прогона, где реально
++обработано 680 файлов.
++"""
++
++import pytest
++
++from src.indexer.indexer import Index
++
++# Фикстуры поднимают Index на временном хранилище — переиспользуем их.
++from tests.test_indexing_live import index, isolated_config  # noqa: F401
++
++
++@pytest.mark.asyncio
++async def test_status_reports_last_pass_after_completion(
++    index: Index,  # noqa: F811
++    monkeypatch,
++):
++    """После завершения прохода статус отдаёт его итог, а не нули."""
++
++    async def fake_collect():
++        index.queued_files = 5
++        return 5
++
++    async def fake_count_to_index():
++        index.preindex_cnt = 5
++        index.counter.reset(5)
++
++    async def fake_process_stream(stream, count=True, store=None):
++        # Проход «обработал» всю очередь.
++        index.counter.cnt = 0
++
++    async def noop(*args, **kwargs):
++        return None
++
++    monkeypatch.setattr(index, "count_to_index", fake_count_to_index)
++    monkeypatch.setattr(index, "process_stream", fake_process_stream)
++    monkeypatch.setattr(index, "ensure_index", noop)
++    monkeypatch.setattr(index, "create_index", noop)
++
++    await index._run_pass(fake_collect, index.files_scanner, index.files_store)
++
++    status = await index.status()
++    assert status.is_indexing is False
++    assert status.type == "idle"
++    assert status.files_indexed == 5, "итог завершённого прохода потерян"
++    assert status.total_files == 5
++    assert status.progress == pytest.approx(1.0)
++
++
++@pytest.mark.asyncio
++async def test_status_is_zero_before_any_pass(index: Index):  # noqa: F811
++    """До первого прохода отдаём честные нули, а не выдуманный прогресс."""
++    status = await index.status()
++    assert status.is_indexing is False
++    assert status.files_indexed == 0
++    assert status.total_files == 0
++    assert status.progress == 0.0

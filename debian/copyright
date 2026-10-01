@@ -1,0 +1,27 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: lib-local-rag
+Source: https://stash.delta.sbrf.ru/scm/sberfriend_nlp_app/lib-local-rag.git
+
+Files: *
+Copyright: 2026 ПАО Сбербанк
+License: proprietary
+
+Files: models/*
+Copyright: 2026 ПАО Сбербанк
+License: proprietary
+Comment:
+ Каталог модели вшивается в бинарь PyInstaller (см. main.spec) и уезжает в
+ пакет внутри /opt/lib-local-rag. Модель — внутренний дообученный вариант
+ rubert-tiny2; карточка модели (README.md) в поставку не попадает, её отсекает
+ фильтр _MODEL_EXCLUDE в main.spec.
+ .
+ ВНИМАНИЕ, НЕ ЗАКРЫТО: лицензия базовой модели в карточке не указана, а вместе
+ с бинарём в /opt едут сторонние библиотеки, которые PyInstaller кладёт в
+ _internal (OpenVINO, LanceDB, tantivy, PyMuPDF и другие). Их лицензии этим
+ файлом пока НЕ покрыты. До поставки за пределы внутреннего контура требуется
+ аудит состава dist/main/_internal и перечисление лицензий здесь — у части
+ зависимостей условия строже проприетарных (например, у PyMuPDF).
+
+License: proprietary
+ Внутреннее программное обеспечение ПАО Сбербанк.
+ Распространение за пределы контура организации не допускается.

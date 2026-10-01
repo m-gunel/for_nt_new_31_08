@@ -254,6 +254,13 @@ class Index(AbstractAsyncContextManager):
                 # Миграция не должна мешать демону стартовать: без неё поиск
                 # по файлам просто останется замусоренным письмами.
                 lg.exception("миграция почты из таблицы файлов не удалась")
+            # Тоже до первого прохода: новые строки должны дописываться уже в
+            # индекс с параметрами из конфига. Почтовая миграция выше строит
+            # FTS по конфигу, так что после неё пересобирать нечего.
+            try:
+                await self.migrate_fts_config()
+            except Exception:
+                lg.exception("сверка параметров FTS-индексов не удалась")
             if self.active:
                 self.task = asyncio.create_task(self.scan_all())
                 # Поллинг почты не зависит от исхода первого прохода: иначе
@@ -516,6 +523,51 @@ class Index(AbstractAsyncContextManager):
         await self.create_index(self.files_store, force_fts=True, force_vector=True)
         await self.create_index(self.email_store)
         return moved
+
+    async def migrate_fts_config(self) -> list[str]:
+        """Пересобрать FTS-индексы, построенные не с параметрами `fts_cfg`.
+
+        Например, пресетом ru_stem, который терял слова длиннее 40 байт.
+        Пересобирается только FTS: `create_index` ещё компактирует таблицу и
+        дообучает вектор, а миграции это не нужно. Зовётся до первого прохода,
+        поэтому записи параллельно нет; при сбое остаётся старый индекс, поиск
+        по нему работает. Возвращает имена пересобранных таблиц.
+        """
+        rebuilt = []
+        loop = asyncio.get_running_loop()
+        for store in (self.files_store, self.email_store):
+            try:
+                diff = await asyncio.to_thread(store.fts_config_diff)
+                if not diff:
+                    continue
+                lg.info(
+                    "FTS-индекс %s построен с другими параметрами "
+                    "(в индексе, в конфиге): %s — пересобираю",
+                    store.table_name,
+                    diff,
+                )
+                started = time.monotonic()
+                async with self._index_build_lock:
+                    await loop.run_in_executor(
+                        _INDEX_BUILD_EXECUTOR, partial(store.create_fts, force=True)
+                    )
+                rebuilt.append(store.table_name)
+                if left := await asyncio.to_thread(store.fts_config_diff):
+                    lg.error(
+                        "FTS-индекс %s после пересборки расходится с конфигом: %s — "
+                        "пересборка будет на каждом старте",
+                        store.table_name,
+                        left,
+                    )
+                else:
+                    lg.info(
+                        "FTS-индекс %s пересобран за %.1f с",
+                        store.table_name,
+                        time.monotonic() - started,
+                    )
+            except Exception:
+                lg.exception("пересборка FTS-индекса %s не удалась", store.table_name)
+        return rebuilt
 
     async def drop_email_index(self) -> None:
         """Убрать почту из поиска целиком — вместе с очередью и состоянием.

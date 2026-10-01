@@ -23,6 +23,7 @@ from pydantic_settings import (
     YamlConfigSettingsSource,
 )
 
+from src.common.fts import FtsConfig
 from src.server.model import EmailConfig
 from src.utils import get_logger
 
@@ -163,6 +164,8 @@ class Config(BaseSettings):
     embed_splitter_cfg: SplitterCfg = Field(default_factory=SplitterCfg)
     embed_model_cfg: EmbeddingModelConfig = Field(default_factory=EmbeddingModelConfig)
     reranker_model_cfg: RarankerModelConfig = Field(default_factory=RarankerModelConfig)
+    # Полнотекстовый индекс; индекс с другими параметрами пересобирается при старте.
+    fts_cfg: FtsConfig = Field(default_factory=FtsConfig)
     reranker_k: int = 30
     reranker_cutoff: float = 0.1
     ld_db_path: str = LANCE_URL
@@ -449,12 +452,14 @@ class Config(BaseSettings):
                 embed_dim=self.embed_dim,
                 table_name=self.ld_files_table,
                 session=session,
+                fts=self.fts_cfg,
             ),
             email=LanceWrapper(
                 ld_db_path=self.ld_db_path,
                 embed_dim=self.embed_dim,
                 table_name=self.ld_email_table,
                 session=session,
+                fts=self.fts_cfg,
             ),
         )
 

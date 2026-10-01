@@ -4,10 +4,13 @@ import concurrent.futures
 import math
 import threading
 from functools import cached_property
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import lancedb as ld
 import pyarrow as pa
+from lancedb.index import FTS
+
+from src.common.fts import FtsConfig
 
 from .logging import get_logger
 
@@ -69,10 +72,12 @@ class LanceWrapper:
         embed_dim: int,
         table_name: str = "files",
         session: "ld.Session | None" = None,
+        fts: FtsConfig | None = None,
     ) -> None:
         self.ld_db_path = ld_db_path
         self.table_name = table_name
         self.embed_dim = embed_dim
+        self.fts = fts or FtsConfig()
         # Сессия задаёт бюджет кэшей LanceDB и делится между таблицами:
         # своя на каждую — это лишние десятки мегабайт RSS.
         self._session = session
@@ -210,20 +215,50 @@ class LanceWrapper:
             num_sub_vectors,
         )
 
+    def _build_fts(self, replace: bool) -> None:
+        """Построить FTS-индекс по параметрам `self.fts`. Без локов.
+
+        Хендл открывается напрямую, а не через self.table: _build_fts зовут из
+        create_table под _create_lock, а self.table берёт _table_lock и сама
+        зовёт create_table. Встречный порядок захвата двух локов даёт
+        AB-BA-дедлок с optimize_indices и create_vector_index.
+        """
+        lg.info("create fts index on %s: %s", self.table_name, self.fts.model_dump())
+        self.lancedb.open_table(self.table_name).create_index(
+            "text", config=FTS(**self.fts.model_dump()), replace=replace
+        )
+
     def create_fts(self, force: bool = False):
         if self.fts_created and not force:
             return
-        lg.info("create fts table")
-        # Хендл открывается напрямую, а не через self.table: create_fts зовут
-        # из create_table под _create_lock, а self.table берёт _table_lock и
-        # сама зовёт create_table. Встречный порядок захвата двух локов даёт
-        # AB-BA-дедлок с optimize_indices и create_vector_index.
-        self.lancedb.open_table(self.table_name).create_fts_index(
-            field_names="text",
-            use_tantivy=False,
-            tokenizer_name="ru_stem",
-            replace=force,
-        )
+        self._build_fts(replace=force)
+        # Поиск идёт через закэшированный хендл: без пометки он остался бы на
+        # снимке со старым индексом. Под _create_lock этого делать нельзя
+        # (_mark_stale берёт _table_lock), поэтому create_table зовёт _build_fts.
+        self._mark_stale()
+
+    def fts_config_diff(self) -> dict[str, tuple[Any, Any]] | None:
+        """Чем параметры готового FTS-индекса расходятся с `self.fts`.
+
+        None — нет таблицы или индекса, {} — совпадают, иначе
+        {параметр: (в индексе, в конфиге)}. Индекс без `index_details` или без
+        параметра считается расходящимся: его построила старая версия lancedb.
+
+        Не через self.table: обращение к нему создало бы таблицу почты.
+        Параметры берутся из lancedb, а не из модуля lance: во фризнутой сборке
+        его нет (main.spec исключает).
+        """
+        if not self.has_table:
+            return None
+        for idx in self.lancedb.open_table(self.table_name).list_indices():
+            if idx.index_type == "FTS" and list(idx.columns) == ["text"]:
+                details = idx.index_details or {}
+                return {
+                    key: (details.get(key), want)
+                    for key, want in self.fts.model_dump().items()
+                    if key not in details or details[key] != want
+                }
+        return None
 
     def optimize_indices(self):
         """Дообновить существующие индексы новыми данными. Дёшево.
@@ -276,7 +311,8 @@ class LanceWrapper:
                     pa.field("vector", pa.list_(pa.float32(), self.embed_dim))
                 ),
             )
-            self.create_fts()
+            if not self.fts_created:
+                self._build_fts(replace=False)
 
     @cached_property
     def lance_session(self):

@@ -359,7 +359,7 @@ def test_read_file_opens_xlsx_with_titles_and_all_cell_kinds(sandbox, bridge):
 
 
 def test_read_file_truncates_huge_xlsx(sandbox, bridge):
-    """Граница строк на листе — та же тысяча, что в ExcelParserConfig.max_rows."""
+    """Граница строк на листе при локальном чтении — тысяча (MAX_XLSX_ROWS моста)."""
     rows = [["строка %d" % number] for number in range(1050)]
     book = sandbox / "большая.xlsx"
     book.write_bytes(minimal_xlsx([("Данные", rows)]))

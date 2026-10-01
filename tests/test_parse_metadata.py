@@ -219,7 +219,8 @@ def test_xlsx_properties_and_sheet_count(tmp_path):
     assert (meta["author"], meta["last_modified_by"]) == ("Козлов", "Орлов")
     assert meta["page_count"] == 2
     assert meta["mime"].endswith("spreadsheetml.sheet")
-    assert {r["kind"] for r in rows} == {"table_row"}
+    # Лист с таблицей — карточки строк, лист «Справка» без чисел — текстом (не теряется).
+    assert {r["kind"] for r in rows} == {"table_row", "text"}
 
 
 # ---------- TXT ----------

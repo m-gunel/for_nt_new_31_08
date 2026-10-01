@@ -74,7 +74,8 @@ def reset_storage_if_requested() -> None:
 
 
 class ExcelParserConfig(BaseModel):
-    max_rows: int = 1000
+    # Строк данных на лист: дальше лист обрезается с предупреждением, но не теряется.
+    max_rows: int = 5000
 
 
 class FileScanConfig(BaseModel):

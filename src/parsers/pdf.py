@@ -22,4 +22,8 @@ class PdfParser(Parser):
         ):
             blocks = [Block(page.get_text(), page=n) for n, page in enumerate(doc, 1)]  # type: ignore
             meta, titles = pdf_properties(doc)
-        return ParsedDoc(blocks, meta, titles, pdf=True)
+            try:
+                toc = [(level, title, page) for level, title, page, *_ in doc.get_toc()]
+            except Exception:  # битое оглавление — без закладок
+                toc = []
+        return ParsedDoc(blocks, meta, titles, pdf=True, toc=toc)

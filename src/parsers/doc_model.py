@@ -50,16 +50,26 @@ class ParsedDoc:
     # заголовок первого слайда); первая содержательная строка — последний запасной.
     titles: list[str] = field(default_factory=list)
     title_from_text: bool = True
-    pdf: bool = (
-        False  # правила нормализации PDF (управляющий символ между буквами — дефис)
-    )
+    # PDF: управляющий символ между буквами — дефис; колонтитулы, переносы и
+    # заголовки чистит src/parsers/pdf_clean.py.
+    pdf: bool = False
+    toc: list[tuple[int, str, int]] = field(
+        default_factory=list
+    )  # закладки: уровень, название, страница
 
 
 def prepare(doc: ParsedDoc) -> ParsedDoc:
     """Нормализовать блоки и поля; убрать пустые блоки и страницы из одного номера."""
-    blocks: list[Block] = []
     for b in doc.blocks:
         b.text = normalize_text(b.text, pdf=doc.pdf)
+    source = doc.blocks
+    if doc.pdf and source:
+        from .pdf_clean import clean_pages  # pdf_clean сам импортирует Block отсюда
+
+        # До отсева страниц из одного номера: номера страниц ищутся по их индексам.
+        source = clean_pages(source, doc.toc)
+    blocks: list[Block] = []
+    for b in source:
         if not b.text:
             # Пустая строка txt — граница абзаца для сплиттера; подряд идущие — одна.
             if b.line is not None and blocks and blocks[-1].text:

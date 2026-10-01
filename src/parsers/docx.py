@@ -14,6 +14,7 @@ from .base import Parser, parser
 from .doc_model import Block, ParsedDoc
 from .docx_ooxml import parse_docx
 from .metadata import ooxml_properties
+from .pdf_clean import heading_level
 
 lg = get_logger(__name__)
 
@@ -37,6 +38,11 @@ class DocxParser(Parser):
             )
             file.seek(0)
             return ParsedDoc([Block(process(file))], meta, titles)
+        if not any(b.heading for b in blocks):
+            # Стилей заголовков нет (конвертация из .doc): раздел — по нумерации.
+            for b in blocks:
+                if not b.whole and (level := heading_level(b.text)):
+                    b.heading = level
         return ParsedDoc(blocks, meta, titles + found)
 
 

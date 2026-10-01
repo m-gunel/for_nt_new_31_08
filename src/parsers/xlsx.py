@@ -23,7 +23,6 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Callable, Iterator
 from typing import Any, BinaryIO
 
 import openpyxl
@@ -32,6 +31,7 @@ from openpyxl.utils import get_column_letter
 from src.utils import get_logger
 from src.utils.r7_office import convert_via_r7
 
+from ._tables import Budget, pack_lines, split_parts
 from .base import Parser, parser
 from .doc_model import Block, ParsedDoc
 from .metadata import ooxml_properties
@@ -349,23 +349,7 @@ def _render_pairs(
     return out
 
 
-class _Budget:
-    """Длина в токенах: дешёвая оценка по символам, токенизатор — только у границы."""
-
-    # 1,6 символа на токен — ниже замеренного минимума 1,83 у rubert-tiny2 на таблицах ЦБ.
-    SAFE_CHARS_PER_TOKEN = 1.6
-
-    def __init__(self, limit: int, count_tokens: Callable[[str], int]):
-        self.limit, self.count = limit, count_tokens
-
-    def fits(self, text: str) -> bool:
-        return (
-            len(text) <= self.limit * self.SAFE_CHARS_PER_TOKEN
-            or self.count(text) <= self.limit
-        )
-
-
-def _unit_strings(pairs, prefix: str, budget: _Budget) -> list[str]:
+def _unit_strings(pairs, prefix: str, budget: Budget) -> list[str]:
     """Группы пар, каждая вместе с prefix — в бюджете; широкая режется с повтором верхнего уровня."""
     units = []
     for top, items, text in _render_pairs(pairs):
@@ -386,62 +370,7 @@ def _unit_strings(pairs, prefix: str, budget: _Budget) -> list[str]:
     return units
 
 
-def _split(
-    prefix: str, parts: list[str], budget: _Budget, sep: str = "\n"
-) -> list[str]:
-    """Части по карточкам, каждая с повтором prefix; гигантская часть режется по словам."""
-    out: list[str] = []
-    cur: list[str] = []
-    for p in parts:
-        if cur and not budget.fits(prefix + sep.join(cur + [p])):
-            out.append(prefix + sep.join(cur))
-            cur = [p]
-        else:
-            cur.append(p)
-    if cur or not out:
-        out.append(prefix + sep.join(cur))
-    res = []
-    for t in out:
-        if budget.fits(t):
-            res.append(t)
-            continue
-        head = (prefix.rstrip() + " …") if prefix else ""
-        step = max(50, int(budget.limit * budget.SAFE_CHARS_PER_TOKEN) - len(head))
-        words = [w[k : k + step] for w in t.split(" ") for k in range(0, len(w), step)]
-        piece: list[str] = []
-        for w in words:
-            if piece and not budget.fits(" ".join(piece + [w])):
-                res.append(" ".join(piece))
-                piece = [head, w] if head else [w]
-            else:
-                piece.append(w)
-        if piece:
-            res.append(" ".join(piece))
-    return res
-
-
-def _text_blocks(
-    prefix: str, lines: list[tuple[str, int]], budget: _Budget, **place
-) -> Iterator[Block]:
-    """Строки текста (лист без таблицы, примечания) пачками в бюджете, с номерами строк."""
-    pack: list[tuple[str, int]] = []
-
-    def flush() -> Iterator[Block]:
-        for text in _split("", [prefix + "\n".join(t for t, _ in pack)], budget):
-            yield Block(
-                text, row_start=pack[0][1], row_end=pack[-1][1], whole=True, **place
-            )
-
-    for line in lines:
-        if pack and not budget.fits(prefix + "\n".join(t for t, _ in pack + [line])):
-            yield from flush()
-            pack = []
-        pack.append(line)
-    if pack:
-        yield from flush()
-
-
-def _sheet(ws, n: int, budget: _Budget, limit: int) -> tuple[list[Block], str | None]:
+def _sheet(ws, n: int, budget: Budget, limit: int) -> tuple[list[Block], str | None]:
     """Блоки листа и название его таблицы."""
     rows, cut = _read_rows(ws, limit + SCAN_ROWS)
     sheet = clean_label(ws.title)
@@ -459,7 +388,7 @@ def _sheet(ws, n: int, budget: _Budget, limit: int) -> tuple[list[Block], str | 
             (clean_label(" | ".join(fmt_value(v) for v in r[0] if not _empty(v))), r[3])
             for r in rows
         ]
-        blocks = _text_blocks(
+        blocks = pack_lines(
             f"Лист «{sheet}»\n",
             [x for x in lines if x[0]],
             budget,
@@ -522,7 +451,7 @@ def _sheet(ws, n: int, budget: _Budget, limit: int) -> tuple[list[Block], str | 
         last_was_data = True
         prefix = f"{head}\n{sec}" + (row_line + "\n" if row_line else "")
         path = " › ".join([sheet] + ([title] if title else []) + section)
-        for text in _split(prefix, _unit_strings(pairs, prefix, budget), budget):
+        for text in split_parts(prefix, _unit_strings(pairs, prefix, budget), budget):
             blocks.append(
                 Block(
                     text,
@@ -537,7 +466,7 @@ def _sheet(ws, n: int, budget: _Budget, limit: int) -> tuple[list[Block], str | 
     if section and not last_was_data:  # подписи без данных в конце — это примечания
         notes = [(t, rows[-1][3]) for t in section] + notes
     if notes:
-        blocks += _text_blocks(
+        blocks += pack_lines(
             f"{head}\nПримечания:\n", notes, budget, page=n, section=sheet
         )
     return blocks, title or None
@@ -576,7 +505,7 @@ class XlsxParser(Parser):
                 return self._parse_book(converted, meta, titles)
 
     def _parse_book(self, file: BinaryIO, meta: dict, titles: list[str]) -> ParsedDoc:
-        budget = _Budget(BUDGET_TOKENS, self._config.ov_model.count_tokens)
+        budget = Budget(BUDGET_TOKENS, self._config.ov_model.count_tokens)
         limit = self._config.excel_config.max_rows
         wb = openpyxl.load_workbook(file, read_only=True, data_only=True)
         blocks: list[Block] = []

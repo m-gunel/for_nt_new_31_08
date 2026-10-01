@@ -290,14 +290,26 @@ def clean_title(title: str | None, head: str) -> str | None:
     return t
 
 
+# Штампы над текстом официальных документов — не название.
+_STAMP = re.compile(
+    r"^(зарегистрирован|утвержд|согласован|приложени|форма\b|код формы|конфиденциально"
+    r"|для служебного пользования|экземпляр)",
+    re.I,
+)
+
+
 def first_line_title(text: str) -> str | None:
     """Первая содержательная строка среди первых пяти непустых: есть слово из 3+ букв,
-    и это не абзац (≤150 символов). Начинается документ с абзаца — названия нет."""
+    это не штамп («Зарегистрировано…») и не абзац (≤150 символов)."""
     lines = [
         s for s in (line.strip(" .-–—•*#") for line in text.split("\n", 200)[:200]) if s
     ]
     for line in lines[:5]:
-        if len(line) <= 150 and re.search(r"[^\W\d_]{3,}", line):
+        if (
+            len(line) <= 150
+            and re.search(r"[^\W\d_]{3,}", line)
+            and not _STAMP.match(line)
+        ):
             return normalize_field(line)
     return None
 

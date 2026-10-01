@@ -6,8 +6,8 @@
 каждого чанка к страницам, строкам и разделу по его позиции в тексте, фильтр пустого
 и повторов. Блоки `whole` — готовые чанки: их не режут и не склеивают с соседями.
 
-Полный текст: блоки через перевод строки, а на границе страницы, слайда и готового
-чанка — через пустую строку. Это граница абзаца, по которой сплиттер режет в первую
+Полный текст: блоки через перевод строки, а на границе страницы, слайда, готового
+чанка и перед заголовком — через пустую строку. Это граница абзаца, по которой сплиттер режет в первую
 очередь (как раньше: страница PDF кончалась переводом строки); без неё он перебирал
 бы строки всего документа — вдвое больше вызовов токенизатора.
 """
@@ -87,7 +87,8 @@ def _layout(blocks: list[Block]) -> tuple[str, list[int]]:
     for i, b in enumerate(blocks):
         if i:
             prev = blocks[i - 1]
-            sep = "\n\n" if prev.whole or b.whole or prev.page != b.page else "\n"
+            boundary = prev.whole or b.whole or prev.page != b.page or b.heading
+            sep = "\n\n" if boundary else "\n"
             parts.append(sep)
             pos += len(sep)
         starts.append(pos)
@@ -160,6 +161,10 @@ def chunk_document(doc: ParsedDoc, splitter) -> list[dict]:
         j = i
         while j + 1 < len(blocks) and not blocks[j + 1].whole:
             j += 1
+        if j + 1 < len(blocks) and all(b.heading for b in blocks[i : j + 1]):
+            # Одни заголовки перед таблицей: они уже в её названии и пути раздела.
+            i = j + 1
+            continue
         flow_start, flow_end = starts[i], starts[j] + len(blocks[j].text)
         flow = text[flow_start:flow_end]
         prev = -1

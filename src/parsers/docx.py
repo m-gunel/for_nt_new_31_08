@@ -9,19 +9,35 @@ from docx2txt import process
 from src.utils import get_logger
 from src.utils.r7_office import convert_via_r7, find_x2t
 
+from ._tables import Budget
 from .base import Parser, parser
 from .doc_model import Block, ParsedDoc
+from .docx_ooxml import parse_docx
 from .metadata import ooxml_properties
 
 lg = get_logger(__name__)
+
+BUDGET_TOKENS = 450  # чанк таблицы; «Документ: <имя>» сверху уложит его в 500
 
 
 @parser("docx")
 class DocxParser(Parser):
     def parse_io(self, file: BinaryIO) -> ParsedDoc:
-        """Пока весь текст docx2txt одним блоком; заголовки, таблицы, правки — шаг 4."""
+        """Структура документа по OOXML (src/parsers/docx_ooxml.py); сбой — docx2txt."""
         meta, titles = ooxml_properties(file, "docx")
-        return ParsedDoc([Block(process(file))], meta, titles)
+        try:
+            blocks, found = parse_docx(
+                file, Budget(BUDGET_TOKENS, self._config.ov_model.count_tokens)
+            )
+        except Exception as exc:
+            lg.warning(
+                "docx: разбор по OOXML не удался (%s: %s) — текст через docx2txt",
+                type(exc).__name__,
+                exc,
+            )
+            file.seek(0)
+            return ParsedDoc([Block(process(file))], meta, titles)
+        return ParsedDoc(blocks, meta, titles + found)
 
 
 def _find_doc_converter() -> tuple[str, list[str]] | None:
@@ -59,6 +75,18 @@ def _find_doc_converter() -> tuple[str, list[str]] | None:
 @parser("doc")
 class DocParser(Parser):
     def parse_io(self, file: BinaryIO) -> ParsedDoc:
+        # Р7-Офис переводит .doc в .docx — тот же разбор со структурой (заголовки,
+        # нумерация, таблицы). Нет Р7 или не справился — конвертеры в голый текст.
+        if find_x2t():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                src = os.path.join(tmp_dir, "doc.doc")
+                dst = os.path.join(tmp_dir, "doc.docx")
+                with open(src, "wb") as out:
+                    shutil.copyfileobj(file, out)
+                if convert_via_r7(src, dst):
+                    with open(dst, "rb") as converted:
+                        return DocxParser().parse_io(converted)
+            file.seek(0)
         converter = _find_doc_converter()
         if converter is None:
             lg.warning(

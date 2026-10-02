@@ -15,7 +15,8 @@ from collections.abc import Iterable
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Any
 
-from src.common import CARD_KIND, norm_words
+from src.common import norm_words
+from src.parsers import get_parsers_registry
 from src.utils.lance_wrapper import sql_quote
 
 if TYPE_CHECKING:
@@ -27,8 +28,12 @@ _DIGIT = re.compile(r"\d")
 # Буква любого алфавита: \w без цифр и «_».
 _LETTER = re.compile(r"[^\W\d_]")
 
-# Код учитывается, только если он есть в именах 1–3 файлов. Код, общий для
-# многих файлов («2024г», «v2»), документ не выделяет — закреплять нечего.
+# Код учитывается, только если он есть в именах 1–3 документов. Код, общий
+# для многих файлов («2024г», «v2»), документ не выделяет — закреплять нечего.
+# Считаются документы, а не пути: копии одного файла (тот же sha256) в
+# «Загрузках», «Документах», «ЦБ_21 (1).pdf» от браузера — один документ, и
+# выдача сама схлопывает их в один результат (duplicates). Считай мы пути,
+# четвёртая копия отключала бы закрепление единственного документа.
 MAX_FILES_PER_CODE = 3
 
 # Сколько первых чанков дочитывать у закреплённого документа, которого нет в
@@ -46,11 +51,22 @@ def is_code(token: str) -> bool:
     return bool(_DIGIT.search(token)) and bool(_LETTER.search(token) or "_" in token)
 
 
+def _without_extension(token: str) -> str:
+    """«ЦБ_21.pdf» → «ЦБ_21»: файл часто называют полным именем.
+
+    Имена в словаре — без расширения (doc_name), и «цб 21 pdf» в «цб 21» не
+    входит. Срезаем только расширения разбираемых форматов: точка внутри
+    кода («v1.2», «ф.0409») — часть кода, а не расширение.
+    """
+    stem, dot, ext = token.rpartition(".")
+    return stem if dot and stem and ext.lower() in get_parsers_registry() else token
+
+
 def query_codes(query: str) -> list[str]:
     """Коды из запроса, нормализованные как имена файлов, без повторов."""
     codes: list[str] = []
     for raw in query.split():
-        token = raw.strip(_EDGE_PUNCT)
+        token = _without_extension(raw.strip(_EDGE_PUNCT))
         if is_code(token) and (code := norm_words(token)) and code not in codes:
             codes.append(code)
     return codes
@@ -66,29 +82,57 @@ def doc_name(path: str, meta: dict[str, Any] | None) -> str:
     return norm_words(PurePath(name).stem if name else PurePath(path).stem)
 
 
-def _load_names(table) -> dict[str, str]:
-    """Путь → нормализованное имя по карточкам: одна строка на документ."""
+# Строка, по которой словарь знает документ: первый чанк. Он есть у каждого
+# документа в индексе — и в собранном до карточек (1.0.8), и у файлов, которые
+# с тех пор не менялись и заново не разбирались. Словарь по карточкам на таком
+# индексе был пуст, а на частично переиндексированном считал «1–3 файла на
+# код» только по переиндексированным.
+_NAME_ROWS = "idx = 0"
+
+
+def _load_names(table, known: dict[str, str]) -> dict[str, tuple[str, str]]:
+    """Путь → (нормализованное имя, ключ документа): одна строка на документ.
+
+    Только три строковых поля, а не весь meta: словарь перестраивается после
+    каждой записи в таблицу, то есть во время индексации — почти на каждый
+    запрос с кодом, и разбор 27 полей meta у всех документов в Python-словари
+    занимал больше 90% времени (0,45 с против 0,01 с на 20 тыс. документов).
+    known — имя → нормализованное с прошлой сборки: имена меняются редко, и
+    norm_words по всему корпусу заново не нужен. Ключ документа — sha256
+    содержимого, без него — путь.
+    """
     data = (
         table.search()
-        .where(f"kind = '{CARD_KIND}'")
-        .select(["path", "meta"])
+        .where(_NAME_ROWS)
+        .select(
+            {
+                "path": "path",
+                "name": "meta.original_name",
+                "sha256": "meta.sha256",
+            }
+        )
         .to_arrow()
     )
-    return {
-        path: doc_name(path, meta)
-        for path, meta in zip(
-            data.column("path").to_pylist(),
-            data.column("meta").to_pylist(),
-            strict=True,
-        )
-        if path
-    }
+    names: dict[str, tuple[str, str]] = {}
+    for path, name, sha in zip(
+        data.column("path").to_pylist(),
+        data.column("name").to_pylist(),
+        data.column("sha256").to_pylist(),
+        strict=True,
+    ):
+        if not path:
+            continue
+        raw = name or path
+        if (norm := known.get(raw)) is None:
+            norm = known[raw] = doc_name(path, {"original_name": name})
+        names[path] = (norm, sha or path)
+    return names
 
 
 class NameIndex:
     """Имена документов одной таблицы, перестраиваемые по версии таблицы.
 
-    Полный проход по карточкам на каждый запрос дорог, а имена меняются
+    Полный проход по документам на каждый запрос дорог, а имена меняются
     только с записью в таблицу — и каждая запись даёт новую версию Lance.
     Поэтому словарь живёт, пока не сменились версия или сам хендл таблицы
     (после сброса индекса таблица создаётся заново, и номера версий
@@ -99,15 +143,19 @@ class NameIndex:
         self._lock = threading.Lock()
         self._table = None
         self._version: int | None = None
-        self._names: dict[str, str] = {}
+        self._names: dict[str, tuple[str, str]] = {}
+        # Исходное имя → нормализованное; переживает пересборки словаря.
+        self._normalized: dict[str, str] = {}
 
-    def names(self, table) -> dict[str, str]:
+    def names(self, table) -> dict[str, tuple[str, str]]:
         version = table.version
         # Под замком и сборка: два одновременных запроса не должны строить
         # один и тот же словарь дважды.
         with self._lock:
+            if self._table is not table:
+                self._normalized = {}
             if self._table is not table or self._version != version:
-                self._names = _load_names(table)
+                self._names = _load_names(table, self._normalized)
                 self._table, self._version = table, version
             return self._names
 
@@ -123,8 +171,10 @@ class NameIndex:
             if names is None:
                 names = self.names(table)
             needle = f" {code} "
-            paths = sorted(p for p, n in names.items() if needle in f" {n} ")
-            if 0 < len(paths) <= MAX_FILES_PER_CODE:
+            paths = sorted(p for p, (n, _) in names.items() if needle in f" {n} ")
+            # Порог — по документам, но вернуть нужно все пути: какой из
+            # копий остаться в выдаче, решает SearchResponse.
+            if 0 < len({names[p][1] for p in paths}) <= MAX_FILES_PER_CODE:
                 found += [p for p in paths if p not in found]
         return found
 

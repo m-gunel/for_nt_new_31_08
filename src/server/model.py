@@ -31,6 +31,11 @@ def _row_score(row: dict[str, Any]) -> float:
 _SCORE_COLUMNS = ("relevance", "_relevance_score", "_distance", "_score")
 
 
+def _has_score(row: dict[str, Any]) -> bool:
+    """Строка из пула поиска, а не дочитанная без оценки (код из имени)."""
+    return any(row.get(k) is not None for k in _SCORE_COLUMNS)
+
+
 def _row_rank(row: dict[str, Any]) -> tuple[bool, float]:
     """Ключ сортировки строк: строки пула — по оценке, дочитанные — после всех.
 
@@ -39,7 +44,7 @@ def _row_rank(row: dict[str, Any]) -> tuple[bool, float]:
     бы векторный пул, где оценка — минус расстояние, и дочитанный путь
     отбирал бы у копии из пула место «первого» пути в `duplicates`.
     """
-    return (any(row.get(k) is not None for k in _SCORE_COLUMNS), _row_score(row))
+    return (_has_score(row), _row_score(row))
 
 
 class HealthCheckResponse(BaseModel):
@@ -48,7 +53,12 @@ class HealthCheckResponse(BaseModel):
 
 class Chunk(BaseModel):
     content: str
-    score: float
+    score: float | None = Field(
+        description=(
+            "Оценка поиска; null — фрагмент дочитан вне пула у документа, "
+            "найденного по коду из имени файла"
+        )
+    )
     # Место фрагмента в документе. Необязательные: у строк, записанных до
     # появления полей, и в выдаче почты их нет.
     kind: str | None = Field(
@@ -178,7 +188,10 @@ def _distinct_docs(
     Копии уже встреченного файла (тот же sha256 под другим путём) мест не
     занимают: их пути уходят в `duplicates` того пути, что встретился первым.
     Карточка (kind="card") фрагментом не становится — она лишь отмечает, что
-    запрос совпал с именем или свойствами файла.
+    слова запроса есть в имени или свойствах файла. Отмечает только карточка,
+    найденная полнотекстовым каналом (есть `_score`): в векторный пул
+    карточки попадают и просто ближайшими соседями — в маленьком индексе все
+    до одной, — а дочитанная по коду из имени с запросом не сверялась вовсе.
 
     Документы из `pinned` (найдены по коду из имени файла) идут первыми и
     занимают места из того же limit. Копия закреплённого файла закрепляет
@@ -211,7 +224,7 @@ def _distinct_docs(
         for row in doc_rows:
             hit.take_meta(row)
             if row.get("kind") == CARD_KIND:
-                hit.card = True
+                hit.card = hit.card or row.get("_score") is not None
             elif len(hit.rows) < MAX_FRAGMENTS_PER_DOC:
                 hit.rows.append(row)
         hits.append(hit)
@@ -223,7 +236,14 @@ class BaseSearchResponseItem(BaseModel):
     title: str
     chunks: list[Chunk]
     type: Literal["file", "application", "email", "email_attachment"]
-    score: float
+    score: float | None = Field(
+        description=(
+            "Оценка лучшей строки документа. Порядок выдачи: сначала "
+            "найденные по коду из имени (match name_code), затем по оценке. "
+            "null — документа не было в пуле поиска, его нашёл только код "
+            "из имени"
+        )
+    )
     document: DocumentInfo | None = None
     duplicates: list[str] = Field(
         default_factory=list,
@@ -234,8 +254,10 @@ class BaseSearchResponseItem(BaseModel):
         description=(
             "Чем ещё документ совпал с запросом, кроме фрагментов: "
             "name_code — код из запроса есть в имени файла (такие документы "
-            "идут первыми), card — именем файла или свойствами (название, "
-            "автор, тема)"
+            "идут первыми), card — слова запроса есть в имени файла или его "
+            "свойствах: название, автор, редактор, тема, ключевые слова, "
+            "описание (полнотекстовое совпадение, в query_type=vector не "
+            "ставится)"
         ),
     )
 
@@ -295,7 +317,8 @@ class SearchResponse(BaseModel):
         (Index.search, тот же параметр). Они идут первыми — в порядке своей
         лучшей строки пула, дочитанные вне пула — после них — и несут
         "name_code" в `match`. Порядок задан явно, а не подменой оценок:
-        score остаётся настоящей оценкой поиска.
+        score остаётся настоящей оценкой поиска, а у дочитанных вне пула,
+        которым оценки нет, — null, а не выдуманный 0.
         """
         hits: dict[str, _Hit] = {}
         duplicates: dict[str, set[str]] = defaultdict(set)
@@ -323,7 +346,7 @@ class SearchResponse(BaseModel):
                     content=strip_doc_prefix(
                         row["text"], (row.get("meta") or {}).get("original_name")
                     ),
-                    score=_row_score(row),
+                    score=_row_score(row) if _has_score(row) else None,
                     **{k: row.get(k) for k in _CHUNK_PLACE},
                 )
                 for row in hit.rows
@@ -340,7 +363,7 @@ class SearchResponse(BaseModel):
                     title=hit.title or Path(file_path).name,
                     chunks=chunks,
                     absolute_path=file_path,
-                    score=hit.score,
+                    score=hit.score if hit.pooled else None,
                     document=hit.document,
                     duplicates=sorted(duplicates.get(file_path, ())),
                     match=[
@@ -357,6 +380,12 @@ class SearchResponse(BaseModel):
 _EXT = re.compile(r"[0-9a-z]+")
 
 
+def _fold_yo(sql: str) -> str:
+    """ё → е в SQL-выражении: «Ковалёв» в свойствах и «Ковалев» в запросе
+    (и наоборот) пишут как придётся, и люди, и агенты."""
+    return f"replace({sql}, 'ё', 'е')"
+
+
 def _like_contains(value: str) -> str:
     """Шаблон LIKE «содержит value»: %, _ и \\ из ввода — буквально.
 
@@ -371,6 +400,15 @@ def _like_contains(value: str) -> str:
 # покрывает лишь 1677–2262 годы: литерал за пределами LanceDB не отвергает, а
 # молча переполняет, и «до 3000 года» отсекало бы всё. Поэтому — ошибка 422.
 _FilterDate = Annotated[date, Field(ge=date(1900, 1, 1), le=date(2200, 12, 31))]
+
+
+# Дата документа для фильтра — та же, что выдача показывает как «изменён» и
+# «создан»: из свойств документа (dcterms:modified, modDate PDF), а без них —
+# файла на диске. У скачанного, пришедшего почтой, распакованного или
+# перенесённого на новый ноутбук файла дата на диске — день копирования, и
+# фильтр «за 2023» отбрасывал документ, на котором написано «изменён: 2023».
+_MODIFIED = "coalesce(meta.doc_modified, meta.date_modified)"
+_CREATED = "coalesce(meta.doc_created, meta.date_created)"
 
 
 def _sql_timestamp(day: date) -> str:
@@ -400,13 +438,21 @@ class SearchFilters(BaseModel):
         None, description="Папка: абсолютный путь, ищется во всём её поддереве"
     )
     modified_from: _FilterDate | None = Field(
-        None, description="Изменён не раньше этой даты (meta.date_modified)"
+        None,
+        description=(
+            "Изменён не раньше этой даты: дата из свойств документа "
+            "(meta.doc_modified), без неё — файла (meta.date_modified)"
+        ),
     )
     modified_to: _FilterDate | None = Field(
         None, description="Изменён не позже этой даты, включительно"
     )
     created_from: _FilterDate | None = Field(
-        None, description="Создан не раньше этой даты (meta.date_created)"
+        None,
+        description=(
+            "Создан не раньше этой даты: дата из свойств документа "
+            "(meta.doc_created), без неё — файла (meta.date_created)"
+        ),
     )
     created_to: _FilterDate | None = Field(
         None, description="Создан не позже этой даты, включительно"
@@ -473,8 +519,8 @@ class SearchFilters(BaseModel):
             prefix = self.folder.rstrip(os.sep) + os.sep
             parts.append(f"starts_with(path, '{sql_quote(prefix)}')")
         for column, lo, hi in (
-            ("meta.date_modified", self.modified_from, self.modified_to),
-            ("meta.date_created", self.created_from, self.created_to),
+            (_MODIFIED, self.modified_from, self.modified_to),
+            (_CREATED, self.created_from, self.created_to),
         ):
             if lo:
                 parts.append(f"{column} >= {_sql_timestamp(lo)}")
@@ -482,10 +528,10 @@ class SearchFilters(BaseModel):
                 # «по 31.12.2024» — весь день: строго меньше полуночи следующего.
                 parts.append(f"{column} < {_sql_timestamp(hi + timedelta(days=1))}")
         if self.author:
-            pattern = _like_contains(self.author.lower())
+            pattern = _like_contains(self.author.lower().replace("ё", "е"))
             parts.append(
-                f"(lower(meta.author) LIKE {pattern}"
-                f" OR lower(meta.last_modified_by) LIKE {pattern})"
+                f"({_fold_yo('lower(meta.author)')} LIKE {pattern}"
+                f" OR {_fold_yo('lower(meta.last_modified_by)')} LIKE {pattern})"
             )
         return " AND ".join(parts) or None
 

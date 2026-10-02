@@ -35,6 +35,8 @@ def _frame(rows: list[tuple]) -> pl.DataFrame:
 
     Строки нарочно не по порядку оценки там, где это важно тесту: LanceDB
     отдаёт их отсортированными, но SearchResponse на это не полагается.
+    Все строки — как найденные и FTS-каналом (_score не пуст): карточка в
+    таком кадре совпала с запросом словами.
     """
     full = [(*r, None, None)[:4] for r in rows]
     return pl.DataFrame(
@@ -49,6 +51,7 @@ def _frame(rows: list[tuple]) -> pl.DataFrame:
             ],
             "path": [p for p, _, _, _ in full],
             "_relevance_score": [float(s) for _, s, _, _ in full],
+            "_score": [float(s) * 10 for _, s, _, _ in full],
         }
     )
 
@@ -371,3 +374,37 @@ async def test_live_search_returns_documents_and_card_match(index: Index):  # no
     found = {i.absolute_path: i for i in items}
     assert found["/docs/положение.txt"].match == ["card"]
     assert len(items) == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query_type", ["vector", "hybrid"])
+async def test_live_card_near_by_vector_is_not_a_match(index: Index, query_type):  # noqa: F811
+    """Отметка card — только когда запрос совпал с карточкой словами.
+
+    В векторный пул карточки попадают и просто ближайшими соседями, а в
+    маленьком индексе — все до одной: раньше каждый документ выдачи нёс
+    «совпало по имени», даже на запрос, ни с одним именем не связанный.
+    """
+    rows = []
+    for name, text in (
+        ("меню столовой", "Борщ, котлеты, компот"),
+        ("график отпусков", "Отпуска сотрудников отдела"),
+        ("квартальный план", "План продаж отдела"),
+        ("инструкция по охране труда", "Требования безопасности"),
+        ("договор аренды", "Арендатор вносит плату ежемесячно"),
+    ):
+        path = f"/docs/{name}.txt"
+        rows += [(path, "text", text), (path, CARD_KIND, f"Документ: {name}")]
+    store = index.cfg.lance.files
+    await store.add_batch(_rows_table(rows, index.cfg.ov_model.encode))
+    store.create_fts(force=True)
+
+    frame = pl.concat(
+        await index.search("что приготовить к обеду", top_k=5, query_type=query_type)
+    )
+    assert frame.filter(pl.col("kind") == CARD_KIND).height > 0, (
+        "карточки в пуле есть — по вектору"
+    )
+    items = SearchResponse.from_dataframes([frame], limit=5).results
+    assert len(items) == 5
+    assert all(i.match == [] for i in items), [i.match for i in items]

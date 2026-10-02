@@ -8,6 +8,7 @@ SearchRequest.filters переводится в условие where LanceDB (Se
 
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pyarrow as pa
@@ -16,7 +17,7 @@ from pydantic import ValidationError
 
 from src.common import CARD_IDX, CARD_KIND
 from src.common.doc_meta import doc_meta_schema
-from src.indexer.indexer import Index
+from src.indexer.indexer import VECTOR_NPROBES, Index
 from src.server.model import SearchFilters, SearchRequest
 from src.server.router import search as search_endpoint
 from tests.mcp_fixture import bridge_factory, call_text, stub  # noqa: F401
@@ -48,13 +49,16 @@ def test_folder_is_a_prefix_with_separator():
 
 
 def test_date_bounds_are_inclusive_days():
+    """Дата документа — из его свойств, без них — файла: та, что видна в выдаче."""
     where = SearchFilters(modified_from="2024-01-01", modified_to="2024-12-31").where()
+    modified = "coalesce(meta.doc_modified, meta.date_modified)"
     assert where == (
-        "meta.date_modified >= TIMESTAMP '2024-01-01 00:00:00' AND "
-        "meta.date_modified < TIMESTAMP '2025-01-01 00:00:00'"
+        f"{modified} >= TIMESTAMP '2024-01-01 00:00:00' AND "
+        f"{modified} < TIMESTAMP '2025-01-01 00:00:00'"
     )
     assert SearchFilters(created_to="2023-02-28").where() == (
-        "meta.date_created < TIMESTAMP '2023-03-01 00:00:00'"
+        "coalesce(meta.doc_created, meta.date_created)"
+        " < TIMESTAMP '2023-03-01 00:00:00'"
     )
 
 
@@ -62,8 +66,8 @@ def test_author_escapes_like_wildcards_and_quotes():
     where = SearchFilters(author=" O'Bri_en 100%\\ ").where()
     pattern = "'%o''bri\\_en 100\\%\\\\%' ESCAPE '\\'"
     assert where == (
-        f"(lower(meta.author) LIKE {pattern} "
-        f"OR lower(meta.last_modified_by) LIKE {pattern})"
+        f"(replace(lower(meta.author), 'ё', 'е') LIKE {pattern} "
+        f"OR replace(lower(meta.last_modified_by), 'ё', 'е') LIKE {pattern})"
     )
 
 
@@ -73,7 +77,7 @@ def test_filters_combine_with_and():
         "meta.ext IN ('pdf')",
         "starts_with(path, '/docs/')",
     ]
-    assert "lower(meta.author) LIKE '%иванов%'" in where
+    assert "replace(lower(meta.author), 'ё', 'е') LIKE '%иванов%'" in where
 
 
 @pytest.mark.parametrize(
@@ -297,6 +301,153 @@ async def test_live_document_read_in_by_code_is_filtered_too(index: Index):  # n
         assert pinned == expected, filters
         paths = set(frame["path"].to_list()) if frame is not None else set()
         assert (code_doc in paths) == bool(expected), filters
+
+
+@pytest.mark.asyncio
+async def test_live_author_filter_ignores_yo(index: Index):  # noqa: F811
+    """«Ковалев» находит «Ковалёв», и наоборот: ё пишут как придётся."""
+    yo, ye = "/docs/a/отчёт ковалёва.docx", "/docs/a/отчёт семенова.docx"
+    await _add(
+        index,
+        {
+            yo: {"ext": "docx", "author": "Ковалёв А."},
+            ye: {"ext": "docx", "last_modified_by": "СЕМЕНОВ Б."},
+        },
+    )
+    for query_type in ("hybrid", "vector", "text"):
+        for author, expected in (
+            ("Ковалев", {yo}),
+            ("КОВАЛЁВ", {yo}),
+            ("Семёнов", {ye}),
+            ("семенов", {ye}),
+        ):
+            items = await _found(index, "годовой отчёт", {"author": author}, query_type)
+            assert {i.absolute_path for i in items} == expected, (query_type, author)
+
+
+@pytest.mark.asyncio
+async def test_live_date_filter_uses_the_date_shown_in_results(index: Index):  # noqa: F811
+    """Дата из свойств документа, а без неё — файла на диске.
+
+    docx с dcterms:modified 2023-05-10, сохранённый из почты 2024-03-01:
+    выдача пишет «изменён: 2023-05-10», и фильтр «за 2023» обязан его найти.
+    """
+    saved = "/docs/a/из почты.docx"
+    plain = "/docs/a/без свойств.txt"
+    await _add(
+        index,
+        {
+            saved: {
+                "ext": "docx",
+                "doc_modified": datetime(2023, 5, 10),
+                "date_modified": datetime(2024, 3, 1),
+                "doc_created": datetime(2023, 5, 1),
+                "date_created": datetime(2024, 3, 1),
+            },
+            plain: {"ext": "txt", "date_modified": datetime(2024, 3, 1)},
+        },
+    )
+    year_2023 = {"modified_from": "2023-01-01", "modified_to": "2023-12-31"}
+    year_2024 = {"modified_from": "2024-01-01", "modified_to": "2024-12-31"}
+    for query_type in ("hybrid", "vector", "text"):
+        for filters, expected in (
+            (year_2023, {saved}),
+            (year_2024, {plain}),
+            ({"created_to": "2023-12-31"}, {saved}),
+            ({"created_from": "2024-01-01"}, set()),  # у plain даты создания нет
+        ):
+            items = await _found(index, "годовой отчёт", filters, query_type)
+            assert {i.absolute_path for i in items} == expected, (query_type, filters)
+
+
+# ------------------------------------------- фильтр и разделы IVF-индекса ----
+
+
+def _clustered_table(tmp_path, author_rows: int = 20):
+    """6400 строк в 64 кластерах, IVF-PQ на 80 разделов (как create_vector_index).
+
+    Под фильтр author='Иванов' — author_rows строк кластера 0, далёкого от
+    запросов к остальным кластерам. Возвращает таблицу и центры кластеров.
+    """
+    import math
+
+    import lancedb
+
+    rng = np.random.default_rng(0)
+    dim, rows = 16, 6400
+    centers = rng.normal(size=(64, dim))
+    labels = rng.integers(0, 64, rows)
+    vectors = (centers[labels] + 0.05 * rng.normal(size=(rows, dim))).astype(np.float32)
+    authors = ["x"] * rows
+    for i in np.where(labels == 0)[0][:author_rows]:
+        authors[i] = "Иванов"
+    table = lancedb.connect(tmp_path / "ivf").create_table(
+        "files",
+        pa.table(
+            {
+                "path": [f"/docs/{i}.txt" for i in range(rows)],
+                "text": ["запись журнала"] * rows,
+                "author": authors,
+                "vector": pa.FixedSizeListArray.from_arrays(vectors.ravel(), dim),
+            }
+        ),
+    )
+    table.create_index(
+        vector_column_name="vector",
+        num_partitions=int(math.sqrt(rows)),
+        num_sub_vectors=4,
+        metric="cosine",
+    )
+    table.create_fts_index("text")
+    return table, centers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query_type", ["vector", "hybrid"])
+async def test_narrow_filter_is_not_lost_in_unprobed_ivf_partitions(
+    tmp_path, query_type
+):
+    """nprobes(32) ограничивал и максимум разделов: строки под узким фильтром
+    вне 32 ближайших к запросу разделов не находились вовсе (0 из 20)."""
+    table, centers = _clustered_table(tmp_path)
+    found = []
+    for cluster in (2, 3, 4):
+
+        async def async_encode(texts, role=None, center=centers[cluster]):
+            return [center.tolist()]
+
+        rag = SimpleNamespace(
+            cfg=SimpleNamespace(ov_model=SimpleNamespace(async_encode=async_encode)),
+            files_store=SimpleNamespace(
+                table=table, has_table=True, table_name="files"
+            ),
+        )
+        (frame,) = await Index.search(
+            rag, "договор", top_k=10, query_type=query_type, where="author = 'Иванов'"
+        )
+        found.append(frame.height)
+    assert found == [20, 20, 20]
+
+
+@pytest.mark.asyncio
+async def test_filter_lifts_the_ivf_probe_ceiling_only_with_filter():
+    """Без фильтра — прежние 32 раздела: поиск по всей таблице их и так находит."""
+    for where, expected, absent in (
+        (None, [("nprobes", (VECTOR_NPROBES,))], "maximum_nprobes"),
+        (
+            WHERE,
+            [("minimum_nprobes", (VECTOR_NPROBES,)), ("maximum_nprobes", (0,))],
+            "nprobes",
+        ),
+    ):
+        for query_type in ("hybrid", "vector"):
+            table = _Table(_frame([("/docs/a.pdf", 0.9)]))
+            await Index.search(
+                _index(table), "договор", query_type=query_type, where=where
+            )
+            ((_, builder),) = table.searches
+            assert all(call in builder.calls for call in expected), query_type
+            assert all(name != absent for name, _ in builder.calls), query_type
 
 
 # ---------------------------------------------------------------- MCP ----

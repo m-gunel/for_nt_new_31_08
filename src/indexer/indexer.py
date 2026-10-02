@@ -16,11 +16,16 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from lancedb.rerankers import RRFReranker
+
 from src.common import (
+    CARD_IDX,
+    CARD_KIND,
     EMAIL_PREFIX,
     ChunkWithMeta,
     FileMetadata,
     IndexingStatus,
+    document_card_text,
     is_email_path,
 )
 from src.malloc_tuning import safe_malloc_trim
@@ -181,6 +186,8 @@ class Index(AbstractAsyncContextManager):
         }
         # Имена документов для поиска файла по коду из имени — по таблице.
         self._name_indexes: dict[str, NameIndex] = {}
+        # Карточки сверены с индексом (migrate_document_cards): раз на процесс.
+        self._cards_migrated = False
         self.lsm_collection = LSMCollection()
         self.files_scanner = FilesScanner(
             queue_path=Path(cfg.lsm_root) / "files",
@@ -599,6 +606,92 @@ class Index(AbstractAsyncContextManager):
                 lg.exception("пересборка FTS-индекса %s не удалась", store.table_name)
         return rebuilt
 
+    async def migrate_document_cards(self) -> int:
+        """Дописать карточки документам, проиндексированным до их появления.
+
+        Карточку пишет разбор файла (document_chunks), а неизменённый файл
+        проход заново не разбирает: решает только size/mtime в LSM. Без этой
+        миграции индекс, собранный до карточек (1.0.8), так и оставался без
+        них — поиск по имени и свойствам и отметка "card" работали лишь для
+        новых и изменённых файлов, а сброса индекса никто не требовал.
+
+        Переразбирать файлы не нужно: карточка собирается из meta, и та уже
+        в индексе — у первого чанка документа. Считаем только вектор карточки.
+        Признак «мигрировать нечего» — у каждого документа есть карточка, так
+        что прерванная миграция просто доделается следующим проходом.
+        Только таблица файлов: почта выключена, а у тела письма карточки нет.
+
+        Зовётся из прохода индексации, до его записи. Watcher параллельно
+        писать может: файл, переписанный между чтением и записью миграции,
+        получит вторую карточку — вреда в этом нет, выдача собирает строки
+        по пути, а следующее изменение файла снесёт обе.
+        """
+        store = self.files_store
+        if not store.has_table:
+            return 0
+
+        def _pending() -> list[dict[str, Any]]:
+            table = store.table
+            carded = set(
+                table.search()
+                .where(f"kind = '{CARD_KIND}'")
+                .select(["path"])
+                .to_arrow()
+                .column("path")
+                .to_pylist()
+            )
+            first = table.search().where("idx = 0").select(["path"]).to_arrow()
+            if all(p in carded for p in first.column("path").to_pylist()):
+                return []
+            # meta — только когда есть что дописывать: чтение всех meta в
+            # Python дорого, а на каждом проходе после миграции оно не нужно.
+            first = table.search().where("idx = 0").select(["path", "meta"]).to_arrow()
+            rows = []
+            for path, meta in zip(
+                first.column("path").to_pylist(),
+                first.column("meta").to_pylist(),
+                strict=True,
+            ):
+                if path in carded or not (card := document_card_text(meta)):
+                    continue
+                carded.add(path)  # первый чанк пути мог записаться дважды
+                rows.append(
+                    {
+                        "idx": CARD_IDX,
+                        "text": card,
+                        "kind": CARD_KIND,
+                        "meta": meta,
+                        "path": path,
+                    }
+                )
+            return rows
+
+        rows = await asyncio.to_thread(_pending)
+        if not rows:
+            return 0
+        lg.info("миграция: дописываю карточки %s документам", len(rows))
+        started = time.monotonic()
+
+        async def _cards():
+            for row in rows:
+                yield row
+
+        batches = async_embed_documents_into_batches(
+            _cards(),
+            embedder=partial(
+                self.cfg.ov_model.async_encode, task="document", role="index"
+            ),
+            batch_size=self.cfg.embed_model_cfg.batch_size,
+        )
+        async for batch in async_merge_batches(
+            batches, target_size=self.cfg.parquet_record_batch_size
+        ):
+            await store.add_batch(batch)
+        # Иначе карточки до следующего прохода живут вне FTS и вектора.
+        await self.create_index(store)
+        lg.info("миграция: карточки дописаны за %.1f с", time.monotonic() - started)
+        return len(rows)
+
     async def drop_email_index(self) -> None:
         """Убрать почту из поиска целиком — вместе с очередью и состоянием.
 
@@ -755,6 +848,15 @@ class Index(AbstractAsyncContextManager):
                 f"free disk space is less then 1GiB ({free / GIB: 0.1f}GiB), refuse indexing"
             )
             return
+        # Под замком прохода, а не на старте демона: миграция считает векторы
+        # и не должна задерживать готовность HTTP, а запись прохода и так ждёт
+        # её конца. Сбой не мешает индексации — доделается следующим проходом.
+        if not emails_only and not self._cards_migrated:
+            try:
+                await self.migrate_document_cards()
+                self._cards_migrated = True
+            except Exception:
+                lg.exception("миграция карточек документов не удалась")
         # Два прохода подряд, а не один общий: поток внутри прохода обязан быть
         # однородным по источнику (см. process_stream). Файлы первыми — чтобы
         # свежий документ находился до того, как демон уйдёт читать ящик.
@@ -1286,17 +1388,28 @@ class Index(AbstractAsyncContextManager):
         кадре: файл по коду, не прошедший фильтр, в выдачу не попадает.
         Словарь имён фильтра не знает — «1–3 файла на код» считается по всей
         таблице.
+
+        Дочитываются и документы, от которых в пуле одна карточка: для
+        «найди файл …» это обычный случай (запрос совпал с именем), и без
+        дочитывания такой документ шёл первым без единого фрагмента, тогда
+        как документ вне пула получал первые чанки.
         """
         try:
             index = self._name_indexes.setdefault(store.table_name, NameIndex())
             paths = index.hits(table, codes)
             if not paths:
                 return frame
-            have = set(frame["path"].to_list()) if frame is not None else set()
-            missing = [p for p in paths if p not in have]
-            if missing:
-                import polars as pl
+            import polars as pl
 
+            have = set(frame["path"].to_list()) if frame is not None else set()
+            # ne_missing: у строк, записанных до появления kind, там null.
+            with_chunks = (
+                set(frame.filter(pl.col("kind").ne_missing(CARD_KIND))["path"])
+                if frame is not None
+                else set()
+            )
+            missing = [p for p in paths if p not in with_chunks]
+            if missing:
                 extra = pinned_rows(table, missing, where)
                 have.update(extra["path"].to_list())
                 # diagonal_relaxed: у дочитанных строк нет колонок оценки, и
@@ -1357,16 +1470,30 @@ class Index(AbstractAsyncContextManager):
             # принимать не обязан.
             return builder if where is None else builder.where(where, prefilter=True)
 
+        def _probed(builder):
+            """Разделы IVF для векторного поиска и векторного канала гибрида."""
+            if where is None:
+                return builder.nprobes(VECTOR_NPROBES)
+            # nprobes(n) ставит и минимум, и МАКСИМУМ разделов: с узким
+            # фильтром (автор, папка) строки под ним лежат в немногих
+            # разделах, и если среди 32 ближайших к запросу их нет, векторный
+            # канал отдаёт пусто — хотя prefilter обещает выдачу из всего, что
+            # под фильтр подходит. maximum_nprobes(0) разрешает LanceDB
+            # досматривать разделы, пока пул не наберётся. Замер (70 тыс.
+            # строк, 256 разделов, фильтр на 20 строк): 0 из 20 → 20 из 20.
+            return builder.minimum_nprobes(VECTOR_NPROBES).maximum_nprobes(0)
+
         def _vector_search(table):
             return (
-                _filtered(
-                    table.search(
-                        vec,
-                        query_type="vector",
-                        vector_column_name="vector",
+                _probed(
+                    _filtered(
+                        table.search(
+                            vec,
+                            query_type="vector",
+                            vector_column_name="vector",
+                        )
                     )
                 )
-                .nprobes(VECTOR_NPROBES)  # type: ignore
                 # .refine_factor(20)
                 .distance_type("cosine")  # type: ignore
                 .limit(pool)
@@ -1377,24 +1504,32 @@ class Index(AbstractAsyncContextManager):
             if query_type == "hybrid":
                 try:
                     return (
-                        _filtered(
-                            table.search(
-                                # vec,
-                                query_type="hybrid",
-                                vector_column_name="vector",
-                                # FTS-часть — только по тексту чанка. Строковый
-                                # запрос гибрида без колонок LanceDB ищет по
-                                # ВСЕМ полям с FTS-индексом: появись второй
-                                # индекс (заголовок, раздел), он молча вошёл бы
-                                # в RRF.
-                                fts_columns="text",
+                        _probed(
+                            _filtered(
+                                table.search(
+                                    # vec,
+                                    query_type="hybrid",
+                                    vector_column_name="vector",
+                                    # FTS-часть — только по тексту чанка.
+                                    # Строковый запрос гибрида без колонок
+                                    # LanceDB ищет по ВСЕМ полям с
+                                    # FTS-индексом: появись второй индекс
+                                    # (заголовок, раздел), он молча вошёл бы
+                                    # в RRF.
+                                    fts_columns="text",
+                                )
                             )
                         )
-                        # Фильтр гибрида LanceDB передаёт обоим каналам.
-                        .nprobes(VECTOR_NPROBES)  # type: ignore
+                        # Фильтр и nprobes гибрида LanceDB передаёт каналам.
                         .distance_type("cosine")  # type: ignore
                         .vector(vec)
                         .text(query)
+                        # Тот же RRF, что по умолчанию, но с оценками каналов:
+                        # _score не пуст только у строк, найденных FTS. По нему
+                        # выдача отличает карточку, совпавшую с запросом
+                        # словами, от попавшей в пул лишь соседкой по вектору
+                        # (отметка "card", src/server/model.py).
+                        .rerank(RRFReranker(return_score="all"))
                         # Лимит гибрида — и пул каждого канала до RRF, и
                         # длина слитой выдачи.
                         .limit(pool)

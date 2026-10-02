@@ -203,10 +203,12 @@ def test_match_marks_in_text_and_structured(stub, bridge):  # noqa: F811
     stub.set("POST", SEARCH, {"results": [by_code, by_card, plain], "total": 3})
     response = bridge.call("local_search", {"query": "найди файл ЦБ_21"})
     blocks = call_text(response).split("\n2. ")
-    assert "   код из имени файла; совпало по имени/названию файла" in blocks[0]
+    card = "слова запроса есть в имени или свойствах файла (название, автор, тема…)"
+    # Не «по имени/названию»: карточка — ещё автор, редактор, тема и прочее.
+    assert "   код из имени файла; " + card in blocks[0]
     first, rest = blocks[1].split("\n3. ")
-    assert "совпало по имени/названию файла" in first and "код из имени" not in first
-    assert "совпало" not in rest and "код из имени" not in rest
+    assert card in first and "код из имени" not in first
+    assert "слова запроса" not in rest and "код из имени" not in rest
     results = response["result"]["structuredContent"]["results"]
     assert [result["match"] for result in results] == [
         ["name_code", "card"],

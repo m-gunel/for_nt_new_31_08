@@ -3,7 +3,8 @@
 Код в запросе — слово с цифрой и буквой (или «_»). Если он стоит в имени
 1–3 файлов, эти документы идут в выдаче первыми с match "name_code", а тех,
 кого нет в пуле поиска, индексатор дочитывает из таблицы. Имена берутся из
-карточек документов и перестраиваются, только когда меняется версия таблицы.
+первых чанков документов (есть и в индексе без карточек) и перестраиваются,
+только когда меняется версия таблицы.
 """
 
 from types import SimpleNamespace
@@ -45,6 +46,29 @@ def test_query_codes(query, codes):
     assert query_codes(query) == codes
 
 
+@pytest.mark.parametrize(
+    "query, codes",
+    [
+        ("Найди файл ЦБ_21.pdf", ["цб 21"]),
+        ("obs_286.txt", ["obs 286"]),
+        ("«5348-У.DOCX»", ["5348 у"]),
+        # Не расширение разбираемого формата — часть кода.
+        ("версия v1.2", ["v1 2"]),
+        ("архив ЦБ_21.zip", ["цб 21 zip"]),
+    ],
+)
+def test_file_extension_is_not_part_of_the_code(query, codes):
+    """Файл называют полным именем, а имена в словаре — без расширения."""
+    assert query_codes(query) == codes
+
+
+def test_code_with_extension_finds_the_file():
+    table = _CardTable({"/docs/ЦБ_21.pdf": "ЦБ_21.pdf", "/docs/a.txt": "a.txt"})
+    assert NameIndex().hits(table, query_codes("Найди файл ЦБ_21.pdf")) == [
+        "/docs/ЦБ_21.pdf"
+    ]
+
+
 @pytest.mark.parametrize("query", ["отчёт за 2024", "15 2023", "найди файл отчёт", ""])
 def test_years_and_bare_numbers_are_not_codes(query):
     assert query_codes(query) == []
@@ -66,11 +90,15 @@ def test_doc_name_prefers_original_name():
 
 
 class _CardTable:
-    """Таблица карточек: считает полные проходы, версия — как у LanceDB."""
+    """Первые чанки документов: считает полные проходы, версия — как у LanceDB.
 
-    def __init__(self, names: dict[str, str]):
+    names — путь → original_name; shas — путь → sha256 (у кого он есть).
+    """
+
+    def __init__(self, names: dict[str, str], shas: dict[str, str] | None = None):
         self.version = 1
         self.names = names
+        self.shas = shas or {}
         self.loads = 0
 
     def search(self):
@@ -78,11 +106,18 @@ class _CardTable:
 
         class _Query:
             def where(self, predicate):
-                assert predicate == f"kind = '{CARD_KIND}'"
+                # Не карточки: в индексе, собранном до них, их нет.
+                assert predicate == "idx = 0"
                 return self
 
             def select(self, columns):
-                assert columns == ["path", "meta"]
+                # Три строковых поля, а не весь meta: словарь пересобирается
+                # на каждую запись в таблицу.
+                assert columns == {
+                    "path": "path",
+                    "name": "meta.original_name",
+                    "sha256": "meta.sha256",
+                }
                 return self
 
             def to_arrow(self):
@@ -90,7 +125,10 @@ class _CardTable:
                 return pa.table(
                     {
                         "path": list(table.names),
-                        "meta": [{"original_name": n} for n in table.names.values()],
+                        "name": list(table.names.values()),
+                        "sha256": pa.array(
+                            [table.shas.get(p) for p in table.names], pa.string()
+                        ),
                     }
                 )
 
@@ -125,6 +163,28 @@ def test_code_shared_by_more_than_three_files_is_ignored():
     del table.names["/a/v2 отчёт 3.pdf"]
     table.version += 1
     assert len(names.hits(table, ["v2"])) == MAX_FILES_PER_CODE
+
+
+def test_copies_of_one_document_count_once():
+    """Копии одного содержимого (тот же sha256) — один документ, а не четыре.
+
+    Выдача схлопывает их в один результат (duplicates); считай порог пути,
+    четвёртая копия — «Загрузки», «Документы», «(1)» от браузера — отключала
+    бы закрепление единственного документа.
+    """
+    copies = {
+        "/Загрузки/5348-У.pdf": "5348-У.pdf",
+        "/Загрузки/5348-У (1).pdf": "5348-У (1).pdf",
+        "/Документы/5348-У.pdf": "5348-У.pdf",
+        "/Рабочий стол/5348-У.pdf": "5348-У.pdf",
+    }
+    table = _CardTable(copies, dict.fromkeys(copies, "s1"))
+    assert len(copies) > MAX_FILES_PER_CODE
+    assert NameIndex().hits(table, query_codes("Найди файл 5348-У")) == sorted(copies)
+
+    # Разные документы под тем же кодом по-прежнему считаются порознь.
+    table = _CardTable(copies, {p: str(i) for i, p in enumerate(copies)})
+    assert NameIndex().hits(table, query_codes("Найди файл 5348-У")) == []
 
 
 def test_names_rebuilt_only_when_table_version_changes():
@@ -205,8 +265,13 @@ def test_pinned_order_pool_score_then_documents_read_outside_the_pool():
             "/docs/00.txt",
         ], score_col
         z = items[2]
-        assert z.match == ["name_code", "card"]
+        # Дочитанная карточка с запросом не сверялась: отметки card нет.
+        assert z.match == ["name_code"]
         assert [c.content for c in z.chunks] == ["z 0", "z 1"]
+        # Оценки у дочитанного нет — null, а не 0, который в vector был бы
+        # лучшей оценкой выдачи, а в hybrid — худшей.
+        assert z.score is None and [c.score for c in z.chunks] == [None, None]
+        assert all(i.score is not None for i in items if i is not z)
 
 
 def test_without_pinned_rows_read_outside_the_pool_do_not_outrank_it():
@@ -248,7 +313,14 @@ async def test_search_without_pinned_list_does_not_look_for_codes():
         def search(self, *args, **kwargs):
             _Table.searches += 1
             builder = SimpleNamespace()
-            for name in ("nprobes", "distance_type", "vector", "text", "limit"):
+            for name in (
+                "nprobes",
+                "distance_type",
+                "vector",
+                "text",
+                "rerank",
+                "limit",
+            ):
                 setattr(builder, name, lambda *a: builder)
             builder.to_polars = lambda: None
             return builder
@@ -354,7 +426,9 @@ async def test_live_document_outside_the_pool_is_read_in(index: Index):  # noqa:
     items = SearchResponse.from_dataframes(frames, limit=3, pinned=pinned).results
     assert len(items) == 3
     assert items[0].absolute_path == path
-    assert items[0].match == ["name_code", "card"]
+    # Карточка дочитана, а не найдена: запрос с ней не совпал.
+    assert items[0].match == ["name_code"]
+    assert items[0].score is None
     assert [c.content for c in items[0].chunks] == [
         f"Мушкетёры, глава {i}" for i in range(PINNED_CHUNKS)
     ]
@@ -376,3 +450,35 @@ async def test_live_names_follow_table_changes(index: Index):  # noqa: F811
     assert all("name_code" not in i.match for i in await _search(index, "obs_286")), (
         "удалённый файл из словаря пропал"
     )
+
+
+@pytest.mark.asyncio
+async def test_live_pinned_document_found_only_by_its_card_gets_fragments(
+    index: Index,  # noqa: F811
+):
+    """«Найди файл …» обычно совпадает с карточкой, а не с текстом файла.
+
+    Дочитывались только документы, которых в пуле нет вовсе, и закреплённый
+    документ, от которого в пуле одна карточка, шёл первым без единого
+    фрагмента — меньше, чем получил бы, не найдись он вовсе.
+    """
+    path = "/docs/obs_286 журнал.txt"
+    rows = [(path, "text", f"Мушкетёры, глава {i}") for i in range(PINNED_CHUNKS + 2)]
+    rows.append((path, CARD_KIND, "Документ: obs_286 журнал наблюдений"))
+    for i in range(60):
+        rows += _doc(f"/docs/запись {i}.txt", f"Журнал наблюдений, запись {i}")
+    await _add(index, rows)
+
+    pinned: list[str] = []
+    frames = await index.search(
+        "журнал наблюдений obs_286", top_k=3, query_type="text", pinned=pinned
+    )
+    assert pinned == [path]
+    pooled = frames[0].filter(pl.col("_score").is_not_null() & (pl.col("path") == path))
+    assert pooled["kind"].to_list() == [CARD_KIND], "в пуле от документа — карточка"
+
+    (item, *_) = SearchResponse.from_dataframes(frames, limit=3, pinned=pinned).results
+    assert (item.absolute_path, item.match) == (path, ["name_code", "card"])
+    assert [c.content for c in item.chunks] == [
+        f"Мушкетёры, глава {i}" for i in range(PINNED_CHUNKS)
+    ]

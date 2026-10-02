@@ -1,4 +1,4 @@
-"""Очистка PDF (src/parsers/pdf_clean.py): переносы, колонтитулы, заголовки."""
+"""Очистка PDF (src/parsers/pdf_clean.py): переносы и заголовки; колонтитулы остаются."""
 
 import pymupdf
 import pytest
@@ -11,7 +11,6 @@ from src.parsers.pdf_clean import (
     doc_lexicon,
     heading_level,
     split_headings,
-    strip_furniture,
 )
 
 
@@ -49,46 +48,6 @@ def test_dehyphenation(raw, clean):
 def test_hyphenated_form_wins_when_document_uses_it():
     text = "контр-агент упомянут дважды: контр-агент и контр-\nагент"
     assert dehyphenate(text, doc_lexicon(text)).endswith("контр-агент")
-
-
-BODIES = [
-    "Положение устанавливает порядок расчёта резервов.",
-    "Кредитные организации формируют резервы ежемесячно.",
-    "Расчёт ведётся по каждой ссуде отдельно.",
-    "Классификация ссуд пересматривается при изменении риска.",
-    "Отчётность представляется в территориальное учреждение.",
-    "Положение вступает в силу с даты публикации.",
-]
-
-
-def test_running_headers_and_page_numbers_are_stripped():
-    pages = [
-        f"ВЕСТНИК БАНКА РОССИИ\n№ 42 (1386) 1 августа 2012\n{body}\n(в млн рублей)\n{i}"
-        for i, body in enumerate(BODIES, 1)
-    ]
-    out = strip_furniture(pages)
-    assert out[0].startswith(
-        "ВЕСТНИК БАНКА РОССИИ"
-    )  # первое вхождение — контекст документа
-    assert all("ВЕСТНИК" not in p and "1386" not in p for p in out[1:])
-    assert all(body in p for body, p in zip(BODIES, out))
-    assert all("(в млн рублей)" in p for p in out)  # строка с единицами — не колонтитул
-    assert all(not p.rstrip().endswith(str(i)) for i, p in enumerate(out, 1))
-
-
-def test_mirrored_headers_on_odd_and_even_pages():
-    pages = [
-        ("Левый колонтитул выпуска" if i % 2 else "Правый колонтитул выпуска")
-        + f"\nТело {i} страницы"
-        for i in range(1, 9)
-    ]
-    out = strip_furniture(pages)
-    assert sum("колонтитул" in p for p in out) == 2  # по одному первому вхождению
-
-
-def test_short_document_needs_header_on_every_page():
-    pages = ["Общая шапка\nПервый текст", "Другая шапка\nВторой текст"]
-    assert strip_furniture(pages) == pages
 
 
 @pytest.mark.parametrize(
@@ -142,7 +101,7 @@ def test_split_headings_by_bookmarks():
     ]
 
 
-def test_pdf_pipeline_cleans_headers_and_hyphens(tmp_path):
+def test_pdf_pipeline_keeps_running_headers_and_joins_hyphens(tmp_path):
     path = tmp_path / "herald.pdf"
     with pymupdf.open() as doc:
         for i in range(1, 7):
@@ -155,5 +114,6 @@ def test_pdf_pipeline_cleans_headers_and_hyphens(tmp_path):
             page.insert_text((72, 780), str(i))
         doc.save(str(path))
     joined = "\n".join(r["text"] for r in file_chunks(path))
-    assert joined.count("BANK HERALD") == 1
+    # В колонтитуле банк, период и номер акта — он остаётся на каждой странице.
+    assert joined.count("BANK HERALD") == 6
     assert "applicable to every bank" in joined and "appli-" not in joined

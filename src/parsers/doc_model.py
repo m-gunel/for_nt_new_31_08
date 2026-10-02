@@ -50,8 +50,8 @@ class ParsedDoc:
     # заголовок первого слайда); первая содержательная строка — последний запасной.
     titles: list[str] = field(default_factory=list)
     title_from_text: bool = True
-    # PDF: управляющий символ между буквами — дефис; колонтитулы, переносы и
-    # заголовки чистит src/parsers/pdf_clean.py.
+    # PDF: управляющий символ между буквами — дефис; переносы и заголовки
+    # чистит src/parsers/pdf_clean.py.
     pdf: bool = False
     toc: list[tuple[int, str, int]] = field(
         default_factory=list
@@ -66,7 +66,6 @@ def prepare(doc: ParsedDoc) -> ParsedDoc:
     if doc.pdf and source:
         from .pdf_clean import clean_pages  # pdf_clean сам импортирует Block отсюда
 
-        # До отсева страниц из одного номера: номера страниц ищутся по их индексам.
         source = clean_pages(source, doc.toc)
     blocks: list[Block] = []
     for b in source:

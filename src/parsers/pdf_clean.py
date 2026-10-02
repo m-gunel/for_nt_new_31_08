@@ -1,20 +1,16 @@
-"""Очистка текста PDF до нарезки: колонтитулы, номера страниц, переносы, заголовки.
+"""Очистка текста PDF до нарезки: переносы и заголовки.
 
-- Колонтитул — строка из верхних или нижних пяти непустых строк страницы, которая (числа
-  заменены на #) повторяется в той же зоне на половине страниц; чётные и нечётные
-  считаются отдельно (зеркальные колонтитулы), в документе до трёх страниц — на всех.
-  Первое вхождение остаётся: в колонтитуле бывают банк и период.
-- Номер страницы — число в той же зоне с постоянной разницей «число − индекс страницы».
 - Перенос в конце строки склеивается по словарю самого документа: слитная форма в нём
   чаще — склеить, через дефис чаще — оставить; левая часть начинает другие составные
   слова («стресс-тест») — оставить; частицы (-то, -либо), «из-за», прописная справа
   («Северо-Западный») — дефис остаётся. Ложных склеек — 66 на 93 800 (прототип lex2).
 - Заголовок — строка оглавления PDF (закладки) на своей странице, а без оглавления —
   короткая строка «Глава 2.», «Раздел II», «Статья 5.», «Приложение 1».
+Колонтитулы и номера страниц остаются в тексте: в колонтитуле банк, период и номер акта,
+и без них в чанках поиск хуже (офлайн-A/B 02.10.2026: Hit@1 −0,028, ai360 −0,065).
 Порядок чтения не меняется: get_text() без сортировки верен для одной и двух колонок.
 """
 
-import math
 import re
 from collections import Counter
 
@@ -22,87 +18,6 @@ from .doc_model import Block
 
 L = "A-Za-zА-Яа-яЁё"
 WCH = f"[{L}]"
-
-# ---------- колонтитулы и номера страниц ----------
-
-ZONE_LINES = 5
-_PAGE_NUM = re.compile(
-    r"(?:(?:стр\.?|страница|page)\s*)?[-–—]?\s*(\d{1,4})\s*[-–—]?(?:\s*(?:из|/|of)\s*\d{1,4})?",
-    re.I,
-)
-_NUMBER = re.compile(rf"(?<![{L}\d])\d+(?![{L}\d])")
-_UNITS = re.compile(
-    r"\b(тыс|млн|млрд)\.?\s*(руб|долл|евро)", re.I
-)  # «(в млн рублей)» — не колонтитул
-
-
-def _key(line: str) -> str:
-    return re.sub(r"\s+", " ", _NUMBER.sub("#", line.lower())).strip()
-
-
-def strip_furniture(pages: list[str]) -> list[str]:
-    """Страницы без повторяющихся колонтитулов (кроме первого вхождения) и номеров."""
-    n = len(pages)
-    lines = [p.split("\n") for p in pages]
-    zones = []
-    for page in lines:
-        idx = [i for i, x in enumerate(page) if x.strip()]
-        top = idx[:ZONE_LINES]
-        zones.append(
-            [(i, "t") for i in top]
-            + [(i, "b") for i in idx[-ZONE_LINES:] if i not in top]
-        )
-    need = n if n <= 3 else max(2, math.ceil(0.5 * n))
-    total, by_parity = Counter(), [Counter(), Counter()]
-    for pi, zone in enumerate(zones):
-        keys = {(z, _key(lines[pi][i])) for i, z in zone}
-        total.update(keys)
-        by_parity[pi % 2].update(keys)
-    halves = [math.ceil(n / 2), n // 2]
-    repeated = {
-        key
-        for key, c in total.items()
-        if re.search("[a-zа-яё]", key[1])
-        and not _UNITS.search(key[1])
-        and c >= 2
-        and (
-            c >= need
-            or (
-                n >= 4
-                and any(
-                    by_parity[j][key] >= max(2, math.ceil(0.5 * halves[j]))
-                    for j in (0, 1)
-                )
-            )
-        )
-    }
-    offsets, page_num = Counter(), {}
-    for pi, zone in enumerate(zones):
-        seen = set()
-        for i, _ in zone:
-            if m := _PAGE_NUM.fullmatch(lines[pi][i].strip()):
-                off = int(m.group(1)) - pi
-                page_num[(pi, i)] = off
-                if off not in seen:
-                    seen.add(off)
-                    offsets[off] += 1
-    good = {o for o, c in offsets.items() if c >= max(2, math.ceil(0.5 * n))}
-    drop, first = set(), set()
-    for pi, zone in enumerate(zones):
-        for i, z in zone:
-            key = (z, _key(lines[pi][i]))
-            if key in repeated:
-                if key not in first:
-                    first.add(key)
-                    continue
-                drop.add((pi, i))
-            elif page_num.get((pi, i), "нет") in good:
-                drop.add((pi, i))
-    return [
-        "\n".join(x for i, x in enumerate(page) if (pi, i) not in drop)
-        for pi, page in enumerate(lines)
-    ]
-
 
 # ---------- переносы ----------
 
@@ -248,15 +163,14 @@ def split_headings(
 
 
 def clean_pages(blocks: list[Block], toc: list[tuple[int, str, int]]) -> list[Block]:
-    """Страницы PDF после нормализации: колонтитулы, переносы, заголовки."""
-    pages = strip_furniture([b.text for b in blocks])
-    lex = doc_lexicon("\n".join(pages))
+    """Страницы PDF после нормализации: переносы, заголовки."""
+    lex = doc_lexicon("\n".join(b.text for b in blocks))
     by_page: dict[int, list[tuple[int, str]]] = {}
     for level, title, page in toc:
         by_page.setdefault(page, []).append((level, title))
     out: list[Block] = []
-    for b, text in zip(blocks, pages):
-        b.text = dehyphenate(text, lex).strip("\n")
+    for b in blocks:
+        b.text = dehyphenate(b.text, lex).strip("\n")
         if b.text.strip():
             out += split_headings(b, by_page.get(b.page or 0, []), numbering=not toc)
     return out

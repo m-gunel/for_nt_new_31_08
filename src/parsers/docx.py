@@ -14,7 +14,6 @@ from .base import Parser, SkipFile, parser
 from .doc_model import Block, ParsedDoc
 from .docx_ooxml import parse_docx
 from .metadata import ooxml_properties
-from .pdf_clean import heading_level
 
 lg = get_logger(__name__)
 
@@ -42,11 +41,6 @@ class DocxParser(Parser):
             except KeyError as missing:  # в пакете нет word/document.xml
                 raise SkipFile(f"в docx нет основной части: {missing}") from exc
             return ParsedDoc([Block(text)], meta, titles)
-        if not any(b.heading for b in blocks):
-            # Стилей заголовков нет (конвертация из .doc): раздел — по нумерации.
-            for b in blocks:
-                if not b.whole and (level := heading_level(b.text)):
-                    b.heading = level
         return ParsedDoc(blocks, meta, titles + found)
 
 

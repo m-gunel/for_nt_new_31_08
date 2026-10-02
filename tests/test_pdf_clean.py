@@ -4,7 +4,7 @@ import pymupdf
 import pytest
 
 from src.parsers import file_chunks
-from src.parsers.doc_model import Block
+from src.parsers.doc_model import Block, ParsedDoc, chunk_document, full_text, prepare
 from src.parsers.normalize import normalize_text
 from src.parsers.pdf_clean import (
     dehyphenate,
@@ -12,6 +12,7 @@ from src.parsers.pdf_clean import (
     heading_level,
     split_headings,
 )
+from tests.test_doc_model import SPLITTER, _words
 
 
 def _dehyph(text: str) -> str:
@@ -77,7 +78,7 @@ def test_split_headings_by_numbering_and_two_line_heading():
     out = split_headings(page, [], numbering=True)
     assert [(b.text, b.heading) for b in out] == [
         ("Текст до главы.", None),
-        ("ГЛАВА 1 ОБЩИЕ ПОЛОЖЕНИЯ", 2),
+        ("ГЛАВА 1\nОБЩИЕ ПОЛОЖЕНИЯ", 2),  # строки страницы как есть
         ("1.1. Настоящее Положение…", None),
         ("Глава 2. Расчёт", 2),
         ("Текст главы 2.", None),
@@ -99,6 +100,23 @@ def test_split_headings_by_bookmarks():
         ("Введение в отчёт", 1),
         ("Основные показатели банка", 2),
     ]
+
+
+def test_pdf_headings_set_section_but_keep_text():
+    """Заголовок PDF — только путь раздела: полный текст тот же, что у страниц без разметки."""
+    pages = [
+        "Текст до главы.\nГЛАВА 1\nОБЩИЕ ПОЛОЖЕНИЯ\n" + _words(30, "общее"),
+        "Глава 2. Расчёт\n" + _words(30, "расчёт"),
+    ]
+    doc = prepare(
+        ParsedDoc([Block(t, page=n) for n, t in enumerate(pages, 1)], pdf=True)
+    )
+    assert [b.heading for b in doc.blocks if b.heading] == [2, 2]
+    assert full_text(doc) == "\n\n".join(pages)  # ни склейки строк, ни новых абзацев
+    sections = {
+        c.get("section") for c in chunk_document(doc, SPLITTER) if "расчёт" in c["text"]
+    }
+    assert sections == {"Глава 2. Расчёт"}  # глава того же уровня заменяет прежнюю
 
 
 def test_pdf_pipeline_keeps_running_headers_and_joins_hyphens(tmp_path):

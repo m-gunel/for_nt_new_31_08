@@ -9,7 +9,9 @@
 Полный текст: блоки через перевод строки, а на границе страницы, слайда, готового
 чанка и перед заголовком — через пустую строку. Это граница абзаца, по которой сплиттер режет в первую
 очередь (как раньше: страница PDF кончалась переводом строки); без неё он перебирал
-бы строки всего документа — вдвое больше вызовов токенизатора.
+бы строки всего документа — вдвое больше вызовов токенизатора. Заголовок PDF — только
+метка раздела: текст и границы чанков те же, что без него (граница абзаца перед
+заголовком PDF ухудшала поиск: офлайн-A/B 02.10.2026, nDCG@10 PDF −0,004).
 """
 
 import bisect
@@ -88,7 +90,7 @@ def prepare(doc: ParsedDoc) -> ParsedDoc:
     return doc
 
 
-def _layout(blocks: list[Block]) -> tuple[str, list[int]]:
+def _layout(blocks: list[Block], heading_breaks: bool = True) -> tuple[str, list[int]]:
     """Полный текст и позиция начала каждого блока в нём."""
     parts: list[str] = []
     starts: list[int] = []
@@ -96,7 +98,12 @@ def _layout(blocks: list[Block]) -> tuple[str, list[int]]:
     for i, b in enumerate(blocks):
         if i:
             prev = blocks[i - 1]
-            boundary = prev.whole or b.whole or prev.page != b.page or b.heading
+            boundary = (
+                prev.whole
+                or b.whole
+                or prev.page != b.page
+                or (heading_breaks and b.heading)
+            )
             sep = "\n\n" if boundary else "\n"
             parts.append(sep)
             pos += len(sep)
@@ -107,17 +114,19 @@ def _layout(blocks: list[Block]) -> tuple[str, list[int]]:
 
 
 def full_text(doc: ParsedDoc) -> str:
-    return _layout(doc.blocks)[0]
+    return _layout(doc.blocks, heading_breaks=not doc.pdf)[0]
 
 
 def _sections(blocks: list[Block]) -> list[str | None]:
     """Путь раздела для каждого блока: заголовки выше по тексту, вложенные по уровню."""
-    stack: list[str] = []
+    stack: list[tuple[int, str]] = []
     out = []
     for b in blocks:
         if b.heading:
-            stack = stack[: b.heading - 1] + [b.text.replace("\n", " ")]
-        out.append(b.section or (SECTION_SEP.join(stack) if stack else None))
+            stack = [h for h in stack if h[0] < b.heading]
+            stack.append((b.heading, " ".join(b.text.split())))
+        path = SECTION_SEP.join(title for _, title in stack)
+        out.append(b.section or path or None)
     return out
 
 
@@ -126,7 +135,7 @@ def chunk_document(doc: ParsedDoc, splitter) -> list[dict]:
     blocks = doc.blocks
     if not blocks:
         return []
-    text, starts = _layout(blocks)
+    text, starts = _layout(blocks, heading_breaks=not doc.pdf)
     sections = _sections(blocks)
     raw: list[dict] = []
 

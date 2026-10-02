@@ -34,6 +34,7 @@ ElementTree, а pdf и легаси-форматы честно отказыва
   LQRAG_MAX_OUTPUT   — бюджет символов на ответ поиска (по умолчанию 12000)
 """
 
+import datetime
 import json
 import os
 import re
@@ -834,6 +835,120 @@ def _optional_sources(args):
     return list(value)
 
 
+_EXT_RE = re.compile(r"[0-9a-z]+")
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _optional_text(args, name):
+    """Необязательная непустая строка; None — параметра нет."""
+    value = args.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidParams("параметр '%s' должен быть непустой строкой" % name)
+    return value.strip()
+
+
+def _optional_ext(args):
+    """ext: «docx» или [«docx», «.PDF»] → [«docx», «pdf»]."""
+    value = args.get("ext")
+    if value is None:
+        return None
+    items = [value] if isinstance(value, str) else value
+    if not isinstance(items, list) or not items:
+        raise InvalidParams(
+            "параметр 'ext' должен быть строкой или непустым списком строк"
+        )
+    exts = []
+    for item in items:
+        ext = item.strip().lstrip(".").lower() if isinstance(item, str) else None
+        # «docx,pdf» одной строкой — не расширение: молча искать по нему
+        # значило бы вернуть пустую выдачу вместо ошибки вызова.
+        if not ext or not _EXT_RE.fullmatch(ext):
+            raise InvalidParams(
+                "недопустимое расширение %r в 'ext': нужны буквы и цифры без "
+                "точки, несколько расширений — списком" % (item,)
+            )
+        if ext not in exts:
+            exts.append(ext)
+    return exts
+
+
+def _optional_folder(args):
+    folder = _optional_text(args, "folder")
+    if folder is None:
+        return None
+    folder = os.path.expanduser(folder)
+    # Относительный путь демон считал бы от своего каталога, а не от того,
+    # что имел в виду агент.
+    if not os.path.isabs(folder):
+        raise InvalidParams(
+            "параметр 'folder' должен быть абсолютным путём, получено %r" % folder
+        )
+    return os.path.normpath(folder)
+
+
+def _optional_date(args, name):
+    value = _optional_text(args, name)
+    if value is None:
+        return None
+    try:
+        if not _DATE_RE.fullmatch(value):
+            raise ValueError
+        day = datetime.date.fromisoformat(value)
+        # Диапазон демона (SearchFilters в src/server/model.py): за ним
+        # timestamp индекса переполняется.
+        if not 1900 <= day.year <= 2200:
+            raise ValueError
+        return day.isoformat()
+    except ValueError:
+        raise InvalidParams(
+            "параметр '%s'=%r должен быть датой ГГГГ-ММ-ДД между 1900 и 2200 годами"
+            % (name, value)
+        ) from None
+
+
+def _search_filters(args):
+    """Фильтры local_search → поле filters запроса /search (пусто — None).
+
+    Имена параметров — как их скажет агент («после», «до»), имена полей —
+    как в SearchFilters демона (src/server/model.py). Обе даты включительно.
+    """
+    after = _optional_date(args, "modified_after")
+    before = _optional_date(args, "modified_before")
+    if after and before and after > before:
+        raise InvalidParams(
+            "modified_after (%s) позже modified_before (%s)" % (after, before)
+        )
+    filters = {
+        "ext": _optional_ext(args),
+        "folder": _optional_folder(args),
+        "modified_from": after,
+        "modified_to": before,
+        "author": _optional_text(args, "author"),
+    }
+    return {k: v for k, v in filters.items() if v is not None} or None
+
+
+def _filters_line(filters):
+    """«Фильтры: ext=docx, pdf; автор: Иванов» — чем сужена выдача."""
+    labels = (
+        ("ext", "ext="),
+        ("folder", "папка: "),
+        ("modified_from", "изменён с "),
+        ("modified_to", "изменён по "),
+        ("author", "автор: "),
+    )
+    parts = []
+    for key, label in labels:
+        value = filters.get(key)
+        if isinstance(value, list):
+            value = ", ".join(value)
+        if value:
+            parts.append(label + value)
+    return "Фильтры: " + "; ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Инструмент: поиск
 # ---------------------------------------------------------------------------
@@ -896,23 +1011,30 @@ def _document_line(doc):
     return "; ".join(parts)
 
 
+_SEARCH_FILTER_ARGS = ("ext", "folder", "modified_after", "modified_before", "author")
+
+
 def _tool_search(args):
-    _reject_unknown(args, ("query", "limit", "query_type", "sources"))
+    _reject_unknown(
+        args, ("query", "limit", "query_type", "sources") + _SEARCH_FILTER_ARGS
+    )
     query = _require_str(args, "query")
     limit = _optional_int(args, "limit", 10, 1, 50)
     query_type = _optional_enum(args, "query_type", "hybrid", ("hybrid", "vector", "text"))
     sources = _optional_sources(args)
+    filters = _search_filters(args)
 
-    data = _http_json(
-        "POST",
-        "/api/v1/search",
-        {
-            "query": query,
-            "limit": limit,
-            "query_type": query_type,
-            "sources": sources,
-        },
-    )
+    payload = {
+        "query": query,
+        "limit": limit,
+        "query_type": query_type,
+        "sources": sources,
+    }
+    # Без фильтров поля нет вовсе: тело запроса остаётся прежним, и на нём
+    # держатся контрактные тесты и старые демоны.
+    if filters:
+        payload["filters"] = filters
+    data = _http_json("POST", "/api/v1/search", payload)
     results = data.get("results") or []
     total = data.get("total", len(results))
 
@@ -937,6 +1059,10 @@ def _tool_search(args):
             )
         else:
             text = "Ничего не найдено. Индексация не идёт, индекс актуален."
+        if filters:
+            # Пусто может быть из-за фильтров, а не из-за запроса: агенту
+            # стоит знать, что ослабить.
+            text += "\n%s — без них выдача может быть шире." % _filters_line(filters)
         return text, {"total": 0, "shown": 0, "indexing": indexing, "results": []}
 
     lines = []
@@ -1013,6 +1139,8 @@ def _tool_search(args):
     # localhost: демон отдаёт счётчики из памяти, без обращения к диску.
     status = _safe_status()
     indexing = bool(status and status.get("is_indexing"))
+    if filters:
+        head += "\n" + _filters_line(filters)
     text = head + "\n" + "\n".join(lines) + "\n"
     if indexing:
         text += (
@@ -1531,6 +1659,10 @@ READ_TOOLS = [
             "устройстве. Ищет по смыслу, дословное совпадение не требуется. "
             "Возвращает документы с фрагментами текста и абсолютными путями — "
             "путь из absolute_path можно передать в local_read_file. "
+            "Если пользователь назвал формат, папку, период или автора "
+            "(«docx от Иванова за 2024»), передайте их фильтрами ext, folder, "
+            "modified_after/modified_before, author, а в query оставьте "
+            "только смысл. "
             "Если ничего не нашлось, проверьте local_index_status: во время "
             "индексации пустая выдача не означает, что документа нет."
         ),
@@ -1566,6 +1698,42 @@ READ_TOOLS = [
                     "description": (
                         "files — файлы на диске (по умолчанию); email — письма, "
                         "работает только если включена почтовая индексация"
+                    ),
+                },
+                "ext": {
+                    "type": ["string", "array"],
+                    "items": {"type": "string"},
+                    "description": (
+                        'Фильтр по расширению файла, без точки: "docx" или '
+                        '["docx", "pdf"]. Задавайте, если пользователь назвал '
+                        "формат («docx», «презентации» — pptx, «таблицы» — xlsx, xls)"
+                    ),
+                },
+                "folder": {
+                    "type": "string",
+                    "description": (
+                        "Фильтр по папке: абсолютный путь, ищется во всём её поддереве"
+                    ),
+                },
+                "modified_after": {
+                    "type": "string",
+                    "format": "date",
+                    "description": (
+                        "Изменён не раньше этой даты, ГГГГ-ММ-ДД, включительно. "
+                        "«За 2024» — modified_after 2024-01-01 и modified_before "
+                        "2024-12-31"
+                    ),
+                },
+                "modified_before": {
+                    "type": "string",
+                    "format": "date",
+                    "description": "Изменён не позже этой даты, ГГГГ-ММ-ДД, включительно",
+                },
+                "author": {
+                    "type": "string",
+                    "description": (
+                        "Фильтр по автору или последнему редактору документа: "
+                        "часть имени, регистр не важен («Иванов»)"
                     ),
                 },
             },

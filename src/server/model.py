@@ -1,13 +1,16 @@
+import os
+import re
 from collections import defaultdict
 from collections.abc import Collection, Sequence
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import polars as pl
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.common import CARD_KIND, strip_doc_prefix
+from src.utils.lance_wrapper import sql_quote
 
 
 def _row_score(row: dict[str, Any]) -> float:
@@ -350,6 +353,143 @@ class SearchResponse(BaseModel):
         return cls(results=results, total=len(results))
 
 
+# Расширение в фильтре: только латиница и цифры, как у разбираемых форматов.
+_EXT = re.compile(r"[0-9a-z]+")
+
+
+def _like_contains(value: str) -> str:
+    """Шаблон LIKE «содержит value»: %, _ и \\ из ввода — буквально.
+
+    Без экранирования «_» в «Иванов_И» совпадал бы с любым символом, а «%»
+    в запросе снимал бы условие вовсе.
+    """
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"'%{sql_quote(escaped)}%' ESCAPE '\\'"
+
+
+# Граница даты фильтра. Даты в индексе — timestamp в наносекундах, а он
+# покрывает лишь 1677–2262 годы: литерал за пределами LanceDB не отвергает, а
+# молча переполняет, и «до 3000 года» отсекало бы всё. Поэтому — ошибка 422.
+_FilterDate = Annotated[date, Field(ge=date(1900, 1, 1), le=date(2200, 12, 31))]
+
+
+def _sql_timestamp(day: date) -> str:
+    # Даты в meta — локальное время без пояса (src/parsers/metadata.py),
+    # поэтому и граница — без пояса: полночь этого дня по местному времени.
+    return f"TIMESTAMP '{day.isoformat()} 00:00:00'"
+
+
+class SearchFilters(BaseModel):
+    """Фильтры поиска по метаданным документа (src/common/doc_meta.py).
+
+    Переводятся в условие where LanceDB по строкам чанков и применяются ДО
+    отбора пула (prefilter): иначе документы под фильтром вытеснялись бы из
+    пула прочими, и выдача фильтра оказывалась бы пустой или короче limit.
+    Условия складываются через AND. Даты — включительно с обеих сторон;
+    у строки без даты условие по дате не выполняется.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    ext: list[str] | None = Field(
+        None,
+        min_length=1,
+        description='Расширения файлов без точки, регистр не важен: ["docx", "pdf"]',
+    )
+    folder: str | None = Field(
+        None, description="Папка: абсолютный путь, ищется во всём её поддереве"
+    )
+    modified_from: _FilterDate | None = Field(
+        None, description="Изменён не раньше этой даты (meta.date_modified)"
+    )
+    modified_to: _FilterDate | None = Field(
+        None, description="Изменён не позже этой даты, включительно"
+    )
+    created_from: _FilterDate | None = Field(
+        None, description="Создан не раньше этой даты (meta.date_created)"
+    )
+    created_to: _FilterDate | None = Field(
+        None, description="Создан не позже этой даты, включительно"
+    )
+    author: str | None = Field(
+        None,
+        description="Подстрока автора или последнего редактора, регистр не важен",
+    )
+
+    @field_validator("ext")
+    @classmethod
+    def _normalize_ext(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        exts = [e.strip().lstrip(".").lower() for e in value]
+        # Только буквы и цифры: «docx,pdf» одной строкой — ошибка клиента, а не
+        # расширение, и молча вернуть по нему пустую выдачу было бы хуже.
+        if bad := [e for e in exts if not _EXT.fullmatch(e)]:
+            raise ValueError(f"недопустимое расширение: {bad[0]!r}")
+        return list(dict.fromkeys(exts))
+
+    @field_validator("folder")
+    @classmethod
+    def _absolute_folder(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        folder = os.path.normpath(os.path.expanduser(value.strip()))
+        # Относительный путь считался бы от каталога демона — не тот, что
+        # имел в виду клиент.
+        if not os.path.isabs(folder):
+            raise ValueError("folder должен быть абсолютным путём")
+        return folder
+
+    @field_validator("author")
+    @classmethod
+    def _author_not_blank(cls, value: str | None) -> str | None:
+        if value is not None and not (value := value.strip()):
+            # Пустая подстрока совпала бы с любым автором, но не с документом
+            # без автора — «фильтр ни о чём», который молча режет выдачу.
+            raise ValueError("author не должен быть пустым")
+        return value
+
+    @model_validator(mode="after")
+    def _ranges_in_order(self) -> "SearchFilters":
+        for name, lo, hi in (
+            ("modified", self.modified_from, self.modified_to),
+            ("created", self.created_from, self.created_to),
+        ):
+            if lo and hi and lo > hi:
+                raise ValueError(f"{name}_from позже {name}_to")
+        return self
+
+    def where(self) -> str | None:
+        """Условие where LanceDB; None — фильтров нет."""
+        parts = []
+        if self.ext:
+            # ext в индексе уже в нижнем регистре (file_metadata, вложения).
+            parts.append(
+                "meta.ext IN ({})".format(", ".join(f"'{e}'" for e in self.ext))
+            )
+        if self.folder:
+            # starts_with, а не LIKE: в путях «_» и «%» — обычные символы.
+            # Разделитель в конце — чтобы «/docs/a» не захватывал «/docs/ab».
+            prefix = self.folder.rstrip(os.sep) + os.sep
+            parts.append(f"starts_with(path, '{sql_quote(prefix)}')")
+        for column, lo, hi in (
+            ("meta.date_modified", self.modified_from, self.modified_to),
+            ("meta.date_created", self.created_from, self.created_to),
+        ):
+            if lo:
+                parts.append(f"{column} >= {_sql_timestamp(lo)}")
+            if hi:
+                # «по 31.12.2024» — весь день: строго меньше полуночи следующего.
+                parts.append(f"{column} < {_sql_timestamp(hi + timedelta(days=1))}")
+        if self.author:
+            pattern = _like_contains(self.author.lower())
+            parts.append(
+                f"(lower(meta.author) LIKE {pattern}"
+                f" OR lower(meta.last_modified_by) LIKE {pattern})"
+            )
+        return " AND ".join(parts) or None
+
+
 class SearchRequest(BaseModel):
     query: str
     # limit — документов на источник; пул чанков из LanceDB растёт с ним
@@ -366,6 +506,14 @@ class SearchRequest(BaseModel):
     sources: list[Literal["files", "email"]] = Field(
         default_factory=lambda: ["files"],
         description="Источники поиска; каждый получает свой limit документов",
+    )
+    filters: SearchFilters | None = Field(
+        None,
+        description=(
+            "Фильтры по метаданным: расширение, папка, даты изменения и "
+            "создания, автор. Действуют во всех query_type и на файлы, "
+            "найденные по коду из имени"
+        ),
     )
     # offset: int
 

@@ -1274,11 +1274,18 @@ class Index(AbstractAsyncContextManager):
         codes: list[str],
         frame: "pl.DataFrame | None",
         pinned: list[str],
+        where: str | None = None,
     ) -> "pl.DataFrame | None":
         """Найти документы по коду из имени и дочитать тех, кого нет в пуле.
 
         Сбой здесь поиск не роняет: код из имени — надбавка к выдаче, и без
         неё ответ остаётся тем же, что был до неё.
+
+        where — фильтр поиска. Пул уже отфильтрован, а дочитывание идёт с тем
+        же условием, поэтому закрепляются только пути, чьи строки есть в
+        кадре: файл по коду, не прошедший фильтр, в выдачу не попадает.
+        Словарь имён фильтра не знает — «1–3 файла на код» считается по всей
+        таблице.
         """
         try:
             index = self._name_indexes.setdefault(store.table_name, NameIndex())
@@ -1290,7 +1297,8 @@ class Index(AbstractAsyncContextManager):
             if missing:
                 import polars as pl
 
-                extra = pinned_rows(table, missing)
+                extra = pinned_rows(table, missing, where)
+                have.update(extra["path"].to_list())
                 # diagonal_relaxed: у дочитанных строк нет колонок оценки, и
                 # они остаются пустыми — по ним выдача и отличает строки пула.
                 frame = (
@@ -1303,7 +1311,7 @@ class Index(AbstractAsyncContextManager):
                 "поиск файла по коду из имени в %s не удался", store.table_name
             )
             return frame
-        pinned.extend(paths)
+        pinned.extend(p for p in paths if p in have)
         return frame
 
     async def search(
@@ -1313,6 +1321,7 @@ class Index(AbstractAsyncContextManager):
         query_type: Literal["hybrid", "vector", "text"] = "hybrid",
         sources: Sequence[SearchSource] = (FILES_SOURCE,),
         pinned: list[str] | None = None,
+        where: str | None = None,
     ) -> "list[pl.DataFrame | None]":
         """Искать в каждом запрошенном источнике отдельно, со своим top_k.
 
@@ -1328,6 +1337,12 @@ class Index(AbstractAsyncContextManager):
         пуле их нет, дочитываются в кадр источника. Выдача ставит эти
         документы первыми (SearchResponse.from_dataframes, тот же параметр).
         None — код из имени не ищется вовсе.
+
+        where — фильтр по метаданным (SearchFilters.where в
+        src/server/model.py). Prefilter: условие отбирает строки ДО пула, а
+        не режет готовый пул — иначе под фильтром оставались бы крохи пула.
+        Действует во всех каналах, в откате гибрида на вектор и в
+        дочитывании файла по коду из имени.
         """
         codes = query_codes(query) if pinned is not None else []
         vec = (await self.cfg.ov_model.async_encode([query], role="search"))[0]
@@ -1337,12 +1352,19 @@ class Index(AbstractAsyncContextManager):
         ]
         pool = search_pool(top_k)
 
+        def _filtered(builder):
+            # Без фильтра .where не зовём вовсе: пустое условие LanceDB
+            # принимать не обязан.
+            return builder if where is None else builder.where(where, prefilter=True)
+
         def _vector_search(table):
             return (
-                table.search(
-                    vec,
-                    query_type="vector",
-                    vector_column_name="vector",
+                _filtered(
+                    table.search(
+                        vec,
+                        query_type="vector",
+                        vector_column_name="vector",
+                    )
                 )
                 .nprobes(VECTOR_NPROBES)  # type: ignore
                 # .refine_factor(20)
@@ -1355,16 +1377,20 @@ class Index(AbstractAsyncContextManager):
             if query_type == "hybrid":
                 try:
                     return (
-                        table.search(
-                            # vec,
-                            query_type="hybrid",
-                            vector_column_name="vector",
-                            # FTS-часть — только по тексту чанка. Строковый
-                            # запрос гибрида без колонок LanceDB ищет по ВСЕМ
-                            # полям с FTS-индексом: появись второй индекс
-                            # (заголовок, раздел), он молча вошёл бы в RRF.
-                            fts_columns="text",
+                        _filtered(
+                            table.search(
+                                # vec,
+                                query_type="hybrid",
+                                vector_column_name="vector",
+                                # FTS-часть — только по тексту чанка. Строковый
+                                # запрос гибрида без колонок LanceDB ищет по
+                                # ВСЕМ полям с FTS-индексом: появись второй
+                                # индекс (заголовок, раздел), он молча вошёл бы
+                                # в RRF.
+                                fts_columns="text",
+                            )
                         )
+                        # Фильтр гибрида LanceDB передаёт обоим каналам.
                         .nprobes(VECTOR_NPROBES)  # type: ignore
                         .distance_type("cosine")  # type: ignore
                         .vector(vec)
@@ -1403,11 +1429,13 @@ class Index(AbstractAsyncContextManager):
             elif query_type == "text":
                 try:
                     return (
-                        table.search(
-                            query,
-                            query_type="fts",
-                            # Как в гибриде: только текст чанка.
-                            fts_columns="text",
+                        _filtered(
+                            table.search(
+                                query,
+                                query_type="fts",
+                                # Как в гибриде: только текст чанка.
+                                fts_columns="text",
+                            )
                         )
                         .limit(pool)
                         .to_polars()
@@ -1438,7 +1466,9 @@ class Index(AbstractAsyncContextManager):
                 table = store.table
                 frame = _search_in(table)
                 if codes:
-                    frame = self._pin_name_codes(store, table, codes, frame, pinned)
+                    frame = self._pin_name_codes(
+                        store, table, codes, frame, pinned, where
+                    )
                 results.append(frame)
             return results
 

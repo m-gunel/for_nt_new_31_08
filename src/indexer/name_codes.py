@@ -129,17 +129,20 @@ class NameIndex:
         return found
 
 
-def pinned_rows(table, paths: list[str]) -> "pl.DataFrame":
+def pinned_rows(table, paths: list[str], where: str | None = None) -> "pl.DataFrame":
     """Карточка и первые чанки документов, которых нет в пуле поиска.
 
     Без вектора: он выдаче не нужен, а весит больше всего остального.
     Строки по idx — чтобы фрагментами стали первые чанки документа, а не
-    случайные из скана.
+    случайные из скана. where — фильтр поиска (SearchFilters.where): у
+    документа, который ему не отвечает, строк не будет вовсе.
     """
     columns = [c for c in table.schema.names if c != "vector"]
     predicate = "path IN ({}) AND idx < {}".format(
         ", ".join(f"'{sql_quote(p)}'" for p in paths), PINNED_CHUNKS
     )
+    if where:
+        predicate += f" AND ({where})"
     return (
         table.search().where(predicate).select(columns).to_polars().sort("path", "idx")
     )

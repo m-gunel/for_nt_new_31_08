@@ -84,14 +84,16 @@ async def status_check(index: AppIndex) -> IndexingStatus:
     description=(
         "Поиск документов: limit — документов на источник, у каждого до трёх "
         "лучших фрагментов. Файлы, в имени которых есть код из запроса "
-        "(«ЦБ_21», «5348-У»), идут первыми"
+        "(«ЦБ_21», «5348-У»), идут первыми. filters — отбор по расширению, "
+        "папке, датам и автору"
     ),
 )
 async def search(request: SearchRequest, index: AppIndex) -> SearchResponse:
     # Индексатор берёт по limit глубокий пул чанков, документы из него
     # собирает и обрезает до limit уже SearchResponse. pinned — документы,
     # найденные по коду из имени файла: индексатор их находит и дочитывает,
-    # SearchResponse ставит первыми.
+    # SearchResponse ставит первыми. Фильтры по метаданным уходят в LanceDB
+    # условием where и действуют на всё это сразу.
     pinned: list[str] = []
     results = await index.search(
         request.query,
@@ -99,6 +101,7 @@ async def search(request: SearchRequest, index: AppIndex) -> SearchResponse:
         query_type=request.query_type,
         sources=request.sources,
         pinned=pinned,
+        where=request.filters.where() if request.filters else None,
     )
     return SearchResponse.from_dataframes(results, limit=request.limit, pinned=pinned)
 

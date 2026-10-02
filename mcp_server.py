@@ -143,6 +143,13 @@ LATEST_PROTOCOL_VERSION = "2025-06-18"
 # символов уходит в контекст модели целиком.
 MAX_CHUNKS_PER_DOC = 3
 MAX_CHUNK_CHARS = 600
+# Короче фрагмент уже не несёт смысла: при нехватке места фрагменты получают
+# верхние документы, остальные остаются с заголовком и путём.
+MIN_CHUNK_CHARS = 120
+# Строка о документе и список копий — служебные: длинное название из свойств
+# файла или десяток копий не должны съедать место других документов.
+MAX_ABOUT_CHARS = 300
+MAX_COPIES_SHOWN = 5
 # Верхняя граница чтения файла: больше в контекст всё равно не влезет.
 MAX_FILE_CHARS = 40000
 # Строк на лист книги Excel при локальном чтении (без демона): больше в ответ на
@@ -1013,6 +1020,158 @@ def _document_line(doc):
 
 _SEARCH_FILTER_ARGS = ("ext", "folder", "modified_after", "modified_before", "author")
 
+# Чем документ совпал, кроме фрагментов (поле match демона, src/server/model.py).
+# Без отметки документ, найденный одной карточкой, приходит без фрагментов, и
+# агент не понимает, почему он в выдаче.
+_MATCH_LABELS = (
+    ("name_code", "код из имени файла"),
+    ("card", "совпало по имени/названию файла"),
+)
+
+
+def _clip(text, size):
+    """Текст не длиннее size символов; обрезанный кончается «…»."""
+    if len(text) <= size:
+        return text
+    return text[: max(size - 1, 0)].rstrip() + "…"
+
+
+def _share(wants, budget):
+    """Поделить budget поровну с переливом: кому нужно меньше доли — берёт своё,
+    остаток делят остальные."""
+    sizes = [0] * len(wants)
+    left = budget
+    order = sorted(range(len(wants)), key=wants.__getitem__)
+    for pos, i in enumerate(order):
+        sizes[i] = min(wants[i], left // (len(order) - pos))
+        left -= sizes[i]
+    return sizes
+
+
+def _first_fragment_sizes(wants, overheads, budget):
+    """Сколько символов текста дать первому фрагменту каждого документа.
+
+    wants — длина полного фрагмента, overheads — строка вокруг него (отступ,
+    место в документе, перевод строки). Сначала пробуем дать фрагмент всем,
+    укорачивая поровну. Если на каждого выходит меньше MIN_CHUNK_CHARS,
+    фрагменты получают только верхние документы — сколько влезет без
+    обрывков в пару слов; заголовок с путём остаётся у всех.
+    """
+    for count in range(len(wants), 0, -1):
+        sizes = _share(wants[:count], budget - sum(overheads[:count]))
+        if all(size >= min(want, MIN_CHUNK_CHARS) for size, want in zip(sizes, wants)):
+            return sizes + [0] * (len(wants) - count)
+    return [0] * len(wants)
+
+
+def _search_entry(item, number):
+    """Документ выдачи до раскладки: обязательные строки, фрагменты, structured."""
+    path = item.get("absolute_path") or item.get("id") or "?"
+    item_type = item.get("type", "file")
+    title = item.get("title") or path
+    note = "" if item_type == "file" else "  ← не файл на диске, читать нечем"
+    lines = [
+        "%d. %s (тип=%s, путь=%s%s)%s"
+        % (number, title, item_type, path, _format_score(item.get("score")), note)
+    ]
+    match = [m for m in (item.get("match") or []) if isinstance(m, str)]
+    marks = [label for key, label in _MATCH_LABELS if key in match]
+    if marks:
+        lines.append("   " + "; ".join(marks))
+    about = _document_line(item.get("document"))
+    if about:
+        lines.append("   " + _clip(about, MAX_ABOUT_CHARS))
+    copies = [p for p in (item.get("duplicates") or []) if isinstance(p, str)]
+    if copies:
+        listed = "; ".join(copies[:MAX_COPIES_SHOWN])
+        if len(copies) > MAX_COPIES_SHOWN:
+            listed += " и ещё %d" % (len(copies) - MAX_COPIES_SHOWN)
+        lines.append("   копии того же файла: " + listed)
+
+    ext = os.path.splitext(path)[1].lower()
+    fragments = []
+    for chunk in (item.get("chunks") or [])[:MAX_CHUNKS_PER_DOC]:
+        content = (chunk.get("content") or "").strip()
+        if not content:
+            continue
+        place = _chunk_place(chunk, ext)
+        fragments.append(
+            {
+                "prefix": "   · " + ("[%s] " % place if place else ""),
+                "content": _clip(content, MAX_CHUNK_CHARS),
+                "chunk": chunk,
+            }
+        )
+
+    result = {
+        "path": path,
+        "title": title,
+        "type": item_type,
+        "score": item.get("score"),
+        "match": match,
+        "chunks": [],
+    }
+    if isinstance(item.get("document"), dict):
+        result["document"] = {
+            k: v for k, v in item["document"].items() if v is not None
+        }
+    if copies:
+        result["duplicates"] = copies
+    return {"lines": lines, "fragments": fragments, "result": result}
+
+
+def _add_fragment(entry, fragment, size):
+    """Дописать фрагмент документа, укоротив текст до size; вернуть длину строки."""
+    text = _clip(fragment["content"], size)
+    line = fragment["prefix"] + text
+    entry["lines"].append(line)
+    chunk = fragment["chunk"]
+    record = {"text": text, "score": chunk.get("score")}
+    record.update((k, chunk[k]) for k in _CHUNK_PLACE if chunk.get(k) is not None)
+    entry["result"]["chunks"].append(record)
+    return len(line) + 1
+
+
+def _layout_search(results):
+    """Разложить выдачу в бюджет MAX_OUTPUT_CHARS.
+
+    Порядок важнее полноты фрагментов: сначала каждому документу —
+    заголовок с путём, отметки и строка о документе, затем по первому
+    фрагменту (при нехватке места — укороченному), и только потом добавочные
+    фрагменты верхним документам. Раньше документ раскладывался целиком, и
+    три длинных фрагмента первых документов обрывали список: агент не видел
+    файлов, которые демон нашёл. Документы отбрасываются, только если не
+    влезают даже их заголовки.
+    """
+    entries = []
+    used = 0
+    for item in results:
+        entry = _search_entry(item, len(entries) + 1)
+        cost = sum(len(line) + 1 for line in entry["lines"])
+        if used + cost > MAX_OUTPUT_CHARS and entries:
+            break
+        entries.append(entry)
+        used += cost
+
+    firsts = [entry for entry in entries if entry["fragments"]]
+    wants = [len(entry["fragments"][0]["content"]) for entry in firsts]
+    overheads = [len(entry["fragments"][0]["prefix"]) + 1 for entry in firsts]
+    sizes = _first_fragment_sizes(wants, overheads, MAX_OUTPUT_CHARS - used)
+    for entry, size in zip(firsts, sizes):
+        if size > 0:
+            used += _add_fragment(entry, entry["fragments"][0], size)
+
+    for entry in entries:
+        if len(entry["result"]["chunks"]) != 1:
+            continue  # первый фрагмент не влез — добавочным тем более не место
+        for fragment in entry["fragments"][1:]:
+            want = len(fragment["content"])
+            room = MAX_OUTPUT_CHARS - used - len(fragment["prefix"]) - 1
+            if room < min(want, MIN_CHUNK_CHARS):
+                break
+            used += _add_fragment(entry, fragment, min(want, room))
+    return entries
+
 
 def _tool_search(args):
     _reject_unknown(
@@ -1036,7 +1195,9 @@ def _tool_search(args):
         payload["filters"] = filters
     data = _http_json("POST", "/api/v1/search", payload)
     results = data.get("results") or []
-    total = data.get("total", len(results))
+    # total — документы ответа демона, а не его поле total: у демонов до
+    # выдачи документами (limit = документы) оно считало строки.
+    total = len(results)
 
     if not results:
         # Пустая выдача во время первой индексации неотличима от «такого нет»,
@@ -1065,72 +1226,13 @@ def _tool_search(args):
             text += "\n%s — без них выдача может быть шире." % _filters_line(filters)
         return text, {"total": 0, "shown": 0, "indexing": indexing, "results": []}
 
-    lines = []
-    structured = []
-    used = 0
-    for item in results:
-        path = item.get("absolute_path") or item.get("id") or "?"
-        item_type = item.get("type", "file")
-        title = item.get("title") or path
-        note = "" if item_type == "file" else "  ← не файл на диске, читать нечем"
-        header = "%d. %s (тип=%s, путь=%s%s)%s" % (
-            len(structured) + 1,
-            title,
-            item_type,
-            path,
-            _format_score(item.get("score")),
-            note,
-        )
-        # Документ целиком либо влезает в бюджет, либо не начинается: обрезок
-        # заголовка без фрагментов агенту бесполезен.
-        if used + len(header) > MAX_OUTPUT_CHARS and structured:
-            break
-        block = [header]
-        used += len(header)
-        about = _document_line(item.get("document"))
-        if about and used + len(about) + 5 <= MAX_OUTPUT_CHARS:
-            block.append("   " + about)
-            used += len(about) + 3
-        copies = [p for p in (item.get("duplicates") or []) if isinstance(p, str)]
-        if copies:
-            line = "   копии того же файла: " + "; ".join(copies)
-            if used + len(line) <= MAX_OUTPUT_CHARS:
-                block.append(line)
-                used += len(line)
-        ext = os.path.splitext(path)[1].lower()
-        chunks = []
-        for chunk in (item.get("chunks") or [])[:MAX_CHUNKS_PER_DOC]:
-            content = (chunk.get("content") or "").strip()
-            if not content:
-                continue
-            if len(content) > MAX_CHUNK_CHARS:
-                content = content[:MAX_CHUNK_CHARS] + "…"
-            place = _chunk_place(chunk, ext)
-            line = "   · " + ("[%s] " % place if place else "") + content
-            if used + len(line) > MAX_OUTPUT_CHARS:
-                break
-            block.append(line)
-            used += len(line)
-            entry = {"text": content, "score": chunk.get("score")}
-            entry.update((k, chunk[k]) for k in _CHUNK_PLACE if chunk.get(k) is not None)
-            chunks.append(entry)
-        lines.extend(block)
-        result = {
-            "path": path,
-            "title": title,
-            "type": item_type,
-            "score": item.get("score"),
-            "chunks": chunks,
-        }
-        if isinstance(item.get("document"), dict):
-            result["document"] = {k: v for k, v in item["document"].items() if v is not None}
-        if copies:
-            result["duplicates"] = copies
-        structured.append(result)
+    entries = _layout_search(results)
+    lines = [line for entry in entries for line in entry["lines"]]
+    structured = [entry["result"] for entry in entries]
 
     shown = len(structured)
     head = "Найдено документов: %s" % total
-    if shown < len(results):
+    if shown < total:
         head += " (показано %s — остальное не поместилось в ответ)" % shown
     # Раньше здесь стояло "indexing": False жёстко. Агент, получивший три
     # документа во время первой индексации, считал список полным и отвечал
@@ -1610,7 +1712,10 @@ def _tool_trigger_rescan(args):
 _SEARCH_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
-        "total": {"type": "integer", "description": "Сколько документов нашлось"},
+        "total": {
+            "type": "integer",
+            "description": "Сколько документов вернул поиск (не больше limit на источник)",
+        },
         "shown": {"type": "integer", "description": "Сколько вошло в ответ"},
         "indexing": {
             "type": "boolean",
@@ -1624,7 +1729,22 @@ _SEARCH_OUTPUT_SCHEMA = {
                     "path": {"type": "string"},
                     "title": {"type": "string"},
                     "type": {"type": "string"},
-                    "score": {"type": ["number", "null"]},
+                    "score": {
+                        "type": ["number", "null"],
+                        "description": (
+                            "Оценка поиска: задаёт порядок внутри ответа, между "
+                            "query_type и источниками не сравнима"
+                        ),
+                    },
+                    "match": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Чем ещё документ совпал, кроме фрагментов: name_code — "
+                            "код из запроса есть в имени файла (такие идут первыми), "
+                            "card — имя файла или его свойства (название, автор, тема)"
+                        ),
+                    },
                     "chunks": {
                         "type": "array",
                         "items": {"type": "object"},
@@ -1657,8 +1777,10 @@ READ_TOOLS = [
             "Семантический поиск по локальному индексу файлов пользователя: "
             "документы, презентации, таблицы, PDF, текстовые файлы на этом "
             "устройстве. Ищет по смыслу, дословное совпадение не требуется. "
-            "Возвращает документы с фрагментами текста и абсолютными путями — "
-            "путь из absolute_path можно передать в local_read_file. "
+            "Возвращает документы (limit — их число) с лучшими фрагментами "
+            "текста и абсолютными путями — путь из absolute_path можно передать "
+            "в local_read_file. Ищет и по имени и свойствам файла: код из имени "
+            "(«найди файл ЦБ_21») поднимает этот файл первым. "
             "Если пользователь назвал формат, папку, период или автора "
             "(«docx от Иванова за 2024»), передайте их фильтрами ext, folder, "
             "modified_after/modified_before, author, а в query оставьте "

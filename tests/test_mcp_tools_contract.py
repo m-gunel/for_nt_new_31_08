@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from mcp_server import MAX_CHUNK_CHARS, MAX_OUTPUT_CHARS, MIN_CHUNK_CHARS
 from tests.mbox_fixture import minimal_docx, minimal_pptx, minimal_xlsx
 from tests.mcp_fixture import bridge_factory, call_text, stub  # noqa: F401
 
@@ -91,14 +92,147 @@ def test_search_returns_text_and_structured_content(stub, bridge):  # noqa: F811
 
 
 def test_search_output_fits_the_budget(stub, bridge):  # noqa: F811
-    """limit=50 × фрагменты по 600 символов иначе уезжают в контекст целиком."""
+    """limit=50 × фрагменты по 600 символов иначе уезжают в контекст целиком.
+
+    Влезть в бюджет надо за счёт фрагментов, а не документов: заголовки
+    всех 50 короткие, поэтому показаны все, с укороченными фрагментами.
+    """
     hits = [_hit("/docs/f%02d.txt" % i, ("я" * 900,)) for i in range(50)]
     stub.set("POST", SEARCH, {"results": hits, "total": 50})
     response = bridge.call("local_search", {"query": "много", "limit": 50})
     text = call_text(response)
     assert len(text) < 15000, "ответ не влез в бюджет"
-    assert "показано" in text
-    assert response["result"]["structuredContent"]["shown"] < 50
+    assert "показано" not in text
+    structured = response["result"]["structuredContent"]
+    assert structured["total"] == structured["shown"] == 50
+    assert all("/docs/f%02d.txt" % i in text for i in range(50))
+    for result in structured["results"]:
+        (chunk,) = result["chunks"]
+        assert MIN_CHUNK_CHARS <= len(chunk["text"]) < MAX_CHUNK_CHARS
+        assert chunk["text"].endswith("…")
+
+
+def _long_hit(number, fragments=3, size=900):
+    """Документ с длинными названием, путём и свойствами — как в выдаче ЦБ."""
+    folder = "/home/u/Документы/" + "Нормативные акты Банка России/" * 4
+    name = "%02d_Положение о порядке формирования резервов " % number + "и" * 80
+    hit = _hit(
+        folder + name + ".docx",
+        tuple("фрагмент %d.%d " % (number, k) + "я" * size for k in range(fragments)),
+    )
+    hit["title"] = name + ".docx"
+    hit["document"] = {"title": "Очень длинное название " * 30, "author": "Иванов"}
+    return hit
+
+
+def test_long_documents_do_not_cut_the_list(stub, bridge):  # noqa: F811
+    """10 документов с длинными названиями и путями — все 10 заголовков.
+
+    Раньше документ раскладывался целиком: три фрагмента по 600 символов
+    у первых документов съедали бюджет, и хвост списка терялся.
+    """
+    hits = [_long_hit(i) for i in range(10)]
+    stub.set("POST", SEARCH, {"results": hits, "total": 10})
+    response = bridge.call("local_search", {"query": "резервы"})
+    text = call_text(response)
+    structured = response["result"]["structuredContent"]
+    assert structured["shown"] == 10 and "показано" not in text
+    for i, hit in enumerate(hits):
+        assert "%d. %s" % (i + 1, hit["title"]) in text
+        assert hit["absolute_path"] in text, "путь не обрезается: по нему читают файл"
+    assert all(result["chunks"] for result in structured["results"]), (
+        "каждому документу — хотя бы укороченный фрагмент"
+    )
+    assert len(text) < MAX_OUTPUT_CHARS + 500
+
+
+def test_extra_fragments_go_to_top_documents(stub, bridge_factory):  # noqa: F811
+    """Сначала по фрагменту всем, остаток — добавочными верхнему документу."""
+    stub.set("GET", STATUS, {"is_indexing": False, "type": "idle", "files_to_index": 0})
+    hits = [_hit("/d/%d.txt" % i, ("я" * 900,) * 3) for i in range(4)]
+    stub.set("POST", SEARCH, {"results": hits, "total": 4})
+    bridge = bridge_factory(stub.url, LQRAG_MAX_OUTPUT="3000")
+    response = bridge.call("local_search", {"query": "x"})
+    results = response["result"]["structuredContent"]["results"]
+    counts = [len(result["chunks"]) for result in results]
+    assert counts == [2, 1, 1, 1]
+    # Первые фрагменты целые: место кончилось только на добавочном.
+    assert all(
+        len(result["chunks"][0]["text"]) == MAX_CHUNK_CHARS for result in results
+    )
+    assert MIN_CHUNK_CHARS <= len(results[0]["chunks"][1]["text"]) < MAX_CHUNK_CHARS
+
+
+def test_tight_budget_keeps_headers_and_feeds_top_fragments(stub, bridge_factory):  # noqa: F811
+    """Обрывков в пару слов нет: не хватает на всех — фрагменты у верхних."""
+    hits = [_hit("/d/%d.txt" % i, ("я" * 900,)) for i in range(10)]
+    stub.set("POST", SEARCH, {"results": hits, "total": 10})
+    bridge = bridge_factory(stub.url, LQRAG_MAX_OUTPUT="1500")
+    response = bridge.call("local_search", {"query": "x"})
+    text = call_text(response)
+    results = response["result"]["structuredContent"]["results"]
+    assert len(results) == 10 and "показано" not in text
+    with_text = [bool(result["chunks"]) for result in results]
+    assert with_text[0] and not with_text[-1]
+    assert with_text == sorted(with_text, reverse=True), "фрагменты — верхним"
+    assert all(
+        len(chunk["text"]) >= MIN_CHUNK_CHARS
+        for result in results
+        for chunk in result["chunks"]
+    )
+
+
+def test_documents_are_dropped_only_when_headers_do_not_fit(stub, bridge_factory):  # noqa: F811
+    hits = [_hit("/d/%02d.txt" % i) for i in range(20)]
+    stub.set("POST", SEARCH, {"results": hits, "total": 20})
+    bridge = bridge_factory(stub.url, LQRAG_MAX_OUTPUT="600")
+    response = bridge.call("local_search", {"query": "x"})
+    structured = response["result"]["structuredContent"]
+    assert 0 < structured["shown"] < 20 and structured["total"] == 20
+    assert "показано %d" % structured["shown"] in call_text(response)
+
+
+def test_match_marks_in_text_and_structured(stub, bridge):  # noqa: F811
+    """Документ, найденный по карточке, приходит без фрагментов — отметка
+    объясняет агенту, почему он в выдаче."""
+    by_code = _hit("/docs/ЦБ_21.pdf", ())
+    by_code["match"] = ["name_code", "card"]
+    by_card = _hit("/docs/Положение о резервах.docx")
+    by_card["match"] = ["card"]
+    plain = _hit("/docs/заметка.txt")
+    stub.set("POST", SEARCH, {"results": [by_code, by_card, plain], "total": 3})
+    response = bridge.call("local_search", {"query": "найди файл ЦБ_21"})
+    blocks = call_text(response).split("\n2. ")
+    assert "   код из имени файла; совпало по имени/названию файла" in blocks[0]
+    first, rest = blocks[1].split("\n3. ")
+    assert "совпало по имени/названию файла" in first and "код из имени" not in first
+    assert "совпало" not in rest and "код из имени" not in rest
+    results = response["result"]["structuredContent"]["results"]
+    assert [result["match"] for result in results] == [
+        ["name_code", "card"],
+        ["card"],
+        [],
+    ]
+    assert results[0]["chunks"] == []
+
+
+def test_total_counts_documents_of_the_response(stub, bridge):  # noqa: F811
+    """У демонов до «limit = документы» total считал строки, а не документы."""
+    stub.set("POST", SEARCH, {"results": [_hit("/a.txt"), _hit("/b.txt")], "total": 17})
+    response = bridge.call("local_search", {"query": "x"})
+    assert response["result"]["structuredContent"]["total"] == 2
+    assert call_text(response).startswith("Найдено документов: 2\n")
+
+
+def test_many_copies_do_not_eat_the_budget(stub, bridge):  # noqa: F811
+    hit = _hit("/a/отчёт.pdf")
+    hit["duplicates"] = ["/копия%d/отчёт.pdf" % i for i in range(8)]
+    stub.set("POST", SEARCH, {"results": [hit], "total": 1})
+    response = bridge.call("local_search", {"query": "отчёт"})
+    text = call_text(response)
+    assert "/копия4/отчёт.pdf и ещё 3" in text and "/копия5/" not in text
+    results = response["result"]["structuredContent"]["results"]
+    assert results[0]["duplicates"] == hit["duplicates"]
 
 
 def test_empty_result_during_indexing_is_not_a_denial(stub, bridge):  # noqa: F811

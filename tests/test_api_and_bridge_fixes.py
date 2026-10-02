@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import polars as pl
 import pytest
 
-from src.indexer.indexer import Index, _is_missing_fts_index
+from src.indexer.indexer import Index, _is_missing_fts_index, search_pool
 from src.server.model import UserConfig
 from src.server.router import update_config
 # Стенд MCP-моста: заглушка сайдкара и мост подпроцессом.
@@ -357,8 +357,8 @@ async def test_hybrid_search_degrades_on_unknown_lance_error(caplog):
     assert table.vector_searches == 1, "должны были откатиться к векторному поиску"
     assert len(frames) == 1
     assert frames[0]["path"].to_list() == ["/tmp/договор.txt"]
-    assert ("limit", (5,)) in table.builders["vector"].calls, (
-        f"top_k обязан дойти до отката, иначе поиск потянет таблицу целиком: "
+    assert ("limit", (search_pool(5),)) in table.builders["vector"].calls, (
+        f"пул по top_k обязан дойти до отката, иначе поиск потянет таблицу целиком: "
         f"{table.builders['vector'].calls}"
     )
     errors = [r for r in caplog.records if r.levelno >= logging.ERROR]

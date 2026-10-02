@@ -153,7 +153,7 @@ def test_token_len_cache_keeps_chunking_identical(config: Config):
 
 
 def test_search_limit_is_bounded():
-    """limit уходит прямо в LanceDB — без границы можно запросить что угодно."""
+    """limit задаёт пул LanceDB — без границы можно запросить что угодно."""
     from pydantic import ValidationError
 
     from src.server.model import SearchRequest

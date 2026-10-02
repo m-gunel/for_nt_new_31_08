@@ -102,20 +102,28 @@ def _is_missing_fts_index(exc: BaseException) -> bool:
     return any(all(part in msg for part in markers) for markers in _MISSING_FTS_MARKERS)
 
 
-# Во сколько раз больше чанков запрашивать, если в выдаче нашлись копии одного файла.
-DUP_FETCH_FACTOR = 3
+# Пул чанков на канал поиска, из которого собирается выдача limit ДОКУМЕНТОВ.
+# Канал — вектор и FTS гибрида по отдельности (их сливает RRF), а также
+# чисто векторный и чисто текстовый поиск. Пул по limit чанков отдавал меньше
+# документов, чем просили (10 чанков — в среднем 6,2 документа: длинный
+# документ занимает места соседей), а копии одного файла съедали места ещё
+# и сверху. Замер на стенде (1332 запроса): пул 50 при limit=10 — лучший
+# (Hit@1 +0,039, MRR +0,020 против 10 чанков), 100 не лучше. Кратность — чтобы
+# на больших limit документов в пуле хватало; потолок — чтобы limit=1000 не
+# собирал тысячи строк на канал.
+SEARCH_POOL_MIN = 50
+SEARCH_POOL_PER_DOC = 5
+SEARCH_POOL_MAX = 500
+
+# Сколько разделов IVF-индекса просматривает векторный поиск. Одно значение
+# для чистого вектора и для векторного канала гибрида: иначе гибрид находил бы
+# по смыслу меньше, чем query_type=vector на том же индексе.
+VECTOR_NPROBES = 32
 
 
-def _has_copies(frame: "pl.DataFrame | None") -> bool:
-    """Есть ли в выдаче разные пути одного содержимого (одинаковый sha256)."""
-    if frame is None or "meta" not in frame.columns or "path" not in frame.columns:
-        return False
-    first: dict[str, str] = {}
-    for meta, path in zip(frame["meta"].to_list(), frame["path"].to_list()):
-        sha = (meta or {}).get("sha256")
-        if sha and first.setdefault(sha, path) != path:
-            return True
-    return False
+def search_pool(limit: int) -> int:
+    """Чанков на канал поиска при выдаче limit документов."""
+    return min(SEARCH_POOL_MAX, max(SEARCH_POOL_MIN, limit * SEARCH_POOL_PER_DOC))
 
 
 class Index(AbstractAsyncContextManager):
@@ -1265,32 +1273,35 @@ class Index(AbstractAsyncContextManager):
     ) -> "list[pl.DataFrame | None]":
         """Искать в каждом запрошенном источнике отдельно, со своим top_k.
 
-        `.limit(top_k)` работает по таблице, поэтому общий запрос отдавал бы
-        почте места файлов. Возвращаем кадр на источник, а не склейку: схемы
-        расходятся, если по одной из таблиц гибридный поиск деградировал до
-        векторного.
+        top_k — число ДОКУМЕНТОВ на источник, а не чанков: из таблицы берётся
+        пул чанков `search_pool(top_k)` на канал, а документы из него собирает
+        SearchResponse.from_dataframes. `.limit()` работает по таблице, поэтому
+        общий запрос отдавал бы почте места файлов. Возвращаем кадр на
+        источник, а не склейку: схемы расходятся, если по одной из таблиц
+        гибридный поиск деградировал до векторного.
         """
         vec = (await self.cfg.ov_model.async_encode([query], role="search"))[0]
         stores = [
             self.email_store if source == EMAIL_SOURCE else self.files_store
             for source in dict.fromkeys(sources)
         ]
+        pool = search_pool(top_k)
 
-        def _vector_search(table, limit):
+        def _vector_search(table):
             return (
                 table.search(
                     vec,
                     query_type="vector",
                     vector_column_name="vector",
                 )
-                .nprobes(32)  # type: ignore
+                .nprobes(VECTOR_NPROBES)  # type: ignore
                 # .refine_factor(20)
                 .distance_type("cosine")  # type: ignore
-                .limit(limit)
+                .limit(pool)
                 .to_polars()
             )
 
-        def _search_in(table, limit):
+        def _search_in(table):
             if query_type == "hybrid":
                 try:
                     return (
@@ -1298,11 +1309,19 @@ class Index(AbstractAsyncContextManager):
                             # vec,
                             query_type="hybrid",
                             vector_column_name="vector",
+                            # FTS-часть — только по тексту чанка. Строковый
+                            # запрос гибрида без колонок LanceDB ищет по ВСЕМ
+                            # полям с FTS-индексом: появись второй индекс
+                            # (заголовок, раздел), он молча вошёл бы в RRF.
+                            fts_columns="text",
                         )
+                        .nprobes(VECTOR_NPROBES)  # type: ignore
                         .distance_type("cosine")  # type: ignore
                         .vector(vec)
                         .text(query)
-                        .limit(limit)
+                        # Лимит гибрида — и пул каждого канала до RRF, и
+                        # длина слитой выдачи.
+                        .limit(pool)
                         .to_polars()
                     )
                 except Exception as exc:
@@ -1328,17 +1347,19 @@ class Index(AbstractAsyncContextManager):
                             exc,
                             exc_info=True,
                         )
-                    return _vector_search(table, limit)
+                    return _vector_search(table)
             elif query_type == "vector":
-                return _vector_search(table, limit)
+                return _vector_search(table)
             elif query_type == "text":
                 try:
                     return (
                         table.search(
                             query,
                             query_type="fts",
+                            # Как в гибриде: только текст чанка.
+                            fts_columns="text",
                         )
-                        .limit(limit)
+                        .limit(pool)
                         .to_polars()
                     )
                 except Exception as exc:
@@ -1361,14 +1382,10 @@ class Index(AbstractAsyncContextManager):
                     # писать в хранилище.
                     lg.debug("таблица %s ещё не создана", store.table_name)
                     continue
-                frame = _search_in(store.table, top_k)
-                if _has_copies(frame):
-                    # Копии одного файла в разных папках займут места других
-                    # документов: берём запас, а SearchResponse схлопнет копии и
-                    # отрежет выдачу до top_k чанков. Без копий запрос прежний —
-                    # и ранжирование гибрида (RRF по top_k) не меняется.
-                    frame = _search_in(store.table, top_k * DUP_FETCH_FACTOR)
-                results.append(frame)
+                # Копии одного файла отдельного запроса с запасом больше не
+                # требуют: пул и так в несколько раз глубже выдачи, а
+                # SearchResponse схлопывает копии до отбора документов.
+                results.append(_search_in(store.table))
             return results
 
         return await asyncio.to_thread(_search_all)

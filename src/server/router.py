@@ -79,8 +79,16 @@ async def status_check(index: AppIndex) -> IndexingStatus:
     return await index.status()
 
 
-@router.post("/search")
+@router.post(
+    "/search",
+    description=(
+        "Поиск документов: limit — документов на источник, у каждого до трёх "
+        "лучших фрагментов"
+    ),
+)
 async def search(request: SearchRequest, index: AppIndex) -> SearchResponse:
+    # Индексатор берёт по limit глубокий пул чанков, документы из него
+    # собирает и обрезает до limit уже SearchResponse.
     results = await index.search(
         request.query,
         top_k=request.limit,

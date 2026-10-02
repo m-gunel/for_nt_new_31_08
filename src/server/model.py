@@ -1,14 +1,13 @@
 from collections import defaultdict
 from collections.abc import Sequence
 from datetime import datetime
-from itertools import chain
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import polars as pl
 from pydantic import BaseModel, Field, field_validator
 
-from src.common import strip_doc_prefix
+from src.common import CARD_KIND, strip_doc_prefix
 
 
 def _row_score(row: dict[str, Any]) -> float:
@@ -53,26 +52,6 @@ class Chunk(BaseModel):
 _CHUNK_PLACE = tuple(k for k in Chunk.model_fields if k not in ("content", "score"))
 
 
-def _distinct_rows(
-    frame: pl.DataFrame, limit: int | None, duplicates: dict[str, set[str]]
-):
-    """Строки выдачи по убыванию оценки без копий уже встреченного файла; не больше limit."""
-    rows = sorted(frame.iter_rows(named=True), key=_row_score, reverse=True)
-    first: dict[str, str] = {}  # sha256 → путь, который остаётся в выдаче
-    kept = 0
-    for row in rows:
-        sha = (row.get("meta") or {}).get("sha256")
-        if sha:
-            path = first.setdefault(sha, row["path"])
-            if path != row["path"]:
-                duplicates[path].add(row["path"])
-                continue
-        if limit is not None and kept >= limit:
-            break
-        kept += 1
-        yield row
-
-
 class DocumentInfo(BaseModel):
     """Свойства документа из индекса (src/common/doc_meta.py); всё необязательное."""
 
@@ -100,6 +79,93 @@ class DocumentInfo(BaseModel):
     origin_url: str | None = None
 
 
+# Фрагментов на документ в выдаче. Пул поиска глубокий (src/indexer/indexer.py,
+# search_pool), и у длинного документа в нём бывают десятки чанков: без
+# границы ответ раздувался бы ими, а агенту хватает лучших — остальное он
+# дочитает через /read_file. 3 — столько показывает и MCP-мост.
+MAX_FRAGMENTS_PER_DOC = 3
+
+
+class _Hit:
+    """Документ выдачи, собранный из строк пула (по убыванию оценки)."""
+
+    __slots__ = ("path", "score", "rows", "card", "title", "document")
+
+    def __init__(self, path: str, score: float) -> None:
+        self.path = path
+        self.score = score  # лучшая строка документа, карточка тоже считается
+        self.rows: list[dict[str, Any]] = []  # фрагменты, не больше MAX_FRAGMENTS
+        self.card = False
+        # Имя и свойства — из любой строки документа, карточки тоже: документ,
+        # найденный одной карточкой, иначе остался бы без заголовка.
+        self.title: str | None = None
+        self.document: DocumentInfo | None = None
+
+    def merge(self, other: "_Hit") -> None:
+        """Добавить строки того же пути из выдачи другого источника."""
+        self.score = max(self.score, other.score)
+        self.rows = sorted(self.rows + other.rows, key=_row_score, reverse=True)[
+            :MAX_FRAGMENTS_PER_DOC
+        ]
+        self.card = self.card or other.card
+        self.title = self.title or other.title
+        self.document = self.document or other.document
+
+    def take_meta(self, row: dict[str, Any]) -> None:
+        # meta в схеме чанка nullable (src/common/doc_meta.py): строка,
+        # записанная до появления метаданных, мигрированная из старой таблицы
+        # или вставленная руками, приходит с meta=None. Индексация по None —
+        # TypeError, то есть одна такая строка роняла весь /search в 500.
+        # Титул и так имеет фолбэк на имя файла.
+        meta = row.get("meta") or {}
+        self.title = self.title or meta.get("original_name")
+        if self.document is None and any(
+            meta.get(k) is not None for k in DocumentInfo.model_fields
+        ):
+            self.document = DocumentInfo.model_validate(
+                {k: meta.get(k) for k in DocumentInfo.model_fields}
+            )
+
+
+def _distinct_docs(
+    frame: pl.DataFrame, limit: int | None, duplicates: dict[str, set[str]]
+) -> list[_Hit]:
+    """Документы выдачи одного источника: не больше limit, в порядке лучшей строки.
+
+    Строки идут по убыванию оценки, поэтому первая строка документа — его
+    лучшая, и порядок первых вхождений — это порядок по оценке документа.
+    Копии уже встреченного файла (тот же sha256 под другим путём) мест не
+    занимают: их пути уходят в `duplicates` того пути, что встретился первым.
+    Карточка (kind="card") фрагментом не становится — она лишь отмечает, что
+    запрос совпал с именем или свойствами файла.
+    """
+    rows = sorted(frame.iter_rows(named=True), key=_row_score, reverse=True)
+    first: dict[str, str] = {}  # sha256 → путь, который остаётся в выдаче
+    docs: dict[str, _Hit] = {}
+    for row in rows:
+        path = row["path"]
+        sha = (row.get("meta") or {}).get("sha256")
+        if sha:
+            kept = first.setdefault(sha, path)
+            if kept != path:
+                duplicates[kept].add(path)
+                continue
+        hit = docs.get(path)
+        if hit is None:
+            if limit is not None and len(docs) >= limit:
+                # Документ за пределами выдачи. Строки дальше всё равно
+                # смотрим: они добирают фрагменты, карточки и копии уже
+                # отобранных документов.
+                continue
+            hit = docs[path] = _Hit(path, _row_score(row))
+        hit.take_meta(row)
+        if row.get("kind") == CARD_KIND:
+            hit.card = True
+        elif len(hit.rows) < MAX_FRAGMENTS_PER_DOC:
+            hit.rows.append(row)
+    return list(docs.values())
+
+
 class BaseSearchResponseItem(BaseModel):
     id: str
     title: str
@@ -110,6 +176,13 @@ class BaseSearchResponseItem(BaseModel):
     duplicates: list[str] = Field(
         default_factory=list,
         description="Другие пути того же содержимого (копии файла в других папках)",
+    )
+    match: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Чем ещё документ совпал с запросом, кроме фрагментов: "
+            "card — именем файла или свойствами (название, автор, тема)"
+        ),
     )
 
 
@@ -154,84 +227,80 @@ class SearchResponse(BaseModel):
         таблице гибридный поиск деградировал до векторного — в одной
         `_relevance_score`, в другой `_distance`.
 
-        Копии одного файла (одинаковый sha256) схлопываются: остаётся путь с
-        лучшим чанком, остальные — в `duplicates`, их чанки мест не занимают.
-        limit — чанков на источник после схлопывания (индексатор при копиях
-        берёт запас).
+        limit — ДОКУМЕНТОВ на источник (None — все из пула). Документ
+        оценивается лучшей своей строкой и несёт до MAX_FRAGMENTS_PER_DOC
+        лучших фрагментов. Копии одного файла (одинаковый sha256)
+        схлопываются: остаётся путь с лучшей строкой, остальные — в
+        `duplicates`, мест они не занимают. Карточка документа — не фрагмент,
+        а отметка "card" в `match`.
         """
-        res: dict[str, list[Chunk]] = defaultdict(list)
-        titles: dict[str, str] = {}
-        documents: dict[str, DocumentInfo] = {}
+        hits: dict[str, _Hit] = {}
         duplicates: dict[str, set[str]] = defaultdict(set)
         # None приходит, когда поиск невозможен (например, FTS-индекс ещё не
         # построен) — отдаём пустой ответ, а не падаем.
-        rows = chain.from_iterable(
-            _distinct_rows(df, limit, duplicates) for df in frames if df is not None
-        )
-        for row in rows:
-            # meta в схеме чанка nullable (src/common/doc_meta.py): строка,
-            # записанная до появления метаданных, мигрированная из старой
-            # таблицы или вставленная руками, приходит с meta=None. Индексация
-            # по None — TypeError, то есть одна такая строка роняла весь
-            # /search в 500. Титул ниже и так имеет фолбэк на имя файла.
-            meta = row.get("meta") or {}
-            if title := meta.get("original_name"):
-                if row["path"] not in titles:
-                    titles[row["path"]] = title
-            if row["path"] not in documents and any(
-                meta.get(k) is not None for k in DocumentInfo.model_fields
-            ):
-                documents[row["path"]] = DocumentInfo.model_validate(
-                    {k: meta.get(k) for k in DocumentInfo.model_fields}
-                )
-            chunk = Chunk(
-                # Строка «Документ: <имя>» нужна индексу, а не читателю: имя файла
-                # уже в заголовке результата.
-                content=strip_doc_prefix(row["text"], meta.get("original_name")),
-                score=_row_score(row),
-                **{k: row.get(k) for k in _CHUNK_PLACE},
-            )
-            res[row["path"]].append(chunk)
+        for df in frames:
+            if df is None:
+                continue
+            for hit in _distinct_docs(df, limit, duplicates):
+                if (seen := hits.get(hit.path)) is None:
+                    hits[hit.path] = hit
+                else:
+                    # Один путь в двух кадрах — один документ, а не два
+                    # элемента выдачи.
+                    seen.merge(hit)
 
-        return cls(
-            results=sorted(
-                [
-                    (
-                        SearchResponseItemFile
-                        if not file_path.startswith("email_")
-                        else SearchResponseItemEmail
-                        if file_path.endswith(":body")
-                        else SearchResponseItemEmailAttachment
-                    )(
-                        id=str(file_path),
-                        title=titles.get(file_path, Path(file_path).name),
-                        chunks=chunks,
-                        absolute_path=file_path,
-                        score=max(chunk.score for chunk in chunks),
-                        document=documents.get(file_path),
-                        duplicates=sorted(duplicates.get(file_path, ())),
-                    )
-                    for file_path, chunks in res.items()
-                ],
-                key=lambda x: x.score,
-                reverse=True,
-            ),
-            total=len(res),
-        )
+        results = []
+        for hit in sorted(hits.values(), key=lambda h: h.score, reverse=True):
+            file_path = hit.path
+            chunks = [
+                Chunk(
+                    # Строка «Документ: <имя>» нужна индексу, а не читателю:
+                    # имя файла уже в заголовке результата.
+                    content=strip_doc_prefix(
+                        row["text"], (row.get("meta") or {}).get("original_name")
+                    ),
+                    score=_row_score(row),
+                    **{k: row.get(k) for k in _CHUNK_PLACE},
+                )
+                for row in hit.rows
+            ]
+            results.append(
+                (
+                    SearchResponseItemFile
+                    if not file_path.startswith("email_")
+                    else SearchResponseItemEmail
+                    if file_path.endswith(":body")
+                    else SearchResponseItemEmailAttachment
+                )(
+                    id=str(file_path),
+                    title=hit.title or Path(file_path).name,
+                    chunks=chunks,
+                    absolute_path=file_path,
+                    score=hit.score,
+                    document=hit.document,
+                    duplicates=sorted(duplicates.get(file_path, ())),
+                    match=["card"] if hit.card else [],
+                )
+            )
+        return cls(results=results, total=len(results))
 
 
 class SearchRequest(BaseModel):
     query: str
-    # Верхняя граница обязательна: значение уходит прямо в .limit() LanceDB,
-    # и запрос с limit=1_000_000 соберёт сотни тысяч строк в pydantic-модели
-    # прямо в event loop. 1000 — с запасом над рабочими сценариями.
-    limit: int = Field(10, ge=1, le=1000)
+    # limit — документов на источник; пул чанков из LanceDB растёт с ним
+    # (search_pool в src/indexer/indexer.py, потолок там же). Верхняя граница
+    # всё равно обязательна: выдача из сотен тысяч документов собиралась бы в
+    # pydantic-модели прямо в event loop. 1000 — с запасом над рабочими
+    # сценариями.
+    limit: int = Field(
+        10, ge=1, le=1000, description="Сколько документов вернуть на источник"
+    )
     query_type: Literal["hybrid", "vector", "text"] = "hybrid"
     # Только файлы по умолчанию: письма ищутся своим top_k в своей таблице,
     # и смешанная выдача — явный выбор клиента.
     sources: list[Literal["files", "email"]] = Field(
         default_factory=lambda: ["files"],
-        description="Источники поиска; каждый получает свой limit",
+        description="Источники поиска; каждый получает свой limit документов",
     )
     # offset: int
 

@@ -12,7 +12,7 @@ import pytest
 from src.common import FileMetadata
 from src.common.doc_meta import doc_meta_schema
 from src.indexer.exclude import check_path
-from src.indexer.indexer import Index, _has_copies
+from src.indexer.indexer import Index
 from src.parsers.txt import decode_text
 from src.server.model import SearchRequest, SearchResponse
 from tests.mcp_fixture import bridge_factory, call_text, stub  # noqa: F401
@@ -61,9 +61,12 @@ async def test_three_copies_give_one_result_with_two_duplicates(index: Index):  
         [report_items[0].absolute_path, *report_items[0].duplicates]
     ) == sorted(COPIES)
     assert len(report_items[0].chunks) == 2
-    assert len(items) == 2 and any(
-        p not in COPIES for p in paths
-    )  # место копий занял другой файл
+    # limit=3 — документы: копии мест не заняли, в выдаче все три документа.
+    assert len(items) == 3
+    assert {p for p in paths if p not in COPIES} == {
+        "/d/договор.pdf",
+        "/e/инструкция.pdf",
+    }
 
     store.delete_sync(f"path = '{COPIES[2]}'")  # одну копию удалили с диска
     frames = await index.search(
@@ -98,7 +101,6 @@ def test_without_copies_response_is_unchanged():
     frame = _frame(
         [("/x/a.txt", 0.9, "1"), ("/y/b.txt", 0.8, "2"), ("/x/a.txt", 0.7, "1")]
     )
-    assert not _has_copies(frame)
     response = SearchResponse.from_dataframes([frame], limit=3)
     assert [i.absolute_path for i in response.results] == ["/x/a.txt", "/y/b.txt"]
     assert all(i.duplicates == [] for i in response.results)
@@ -114,7 +116,6 @@ def test_copies_do_not_take_slots():
             ("/w/c.txt", 0.7, "3"),
         ]
     )
-    assert _has_copies(frame)
     items = SearchResponse.from_dataframes([frame], limit=2).results
     assert [(i.absolute_path, i.duplicates) for i in items] == [
         ("/x/a.txt", ["/z/a.txt"]),

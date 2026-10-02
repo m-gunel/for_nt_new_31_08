@@ -138,7 +138,11 @@ async def wrap_iter_to_async(
                 # производителя умер, не успев отдать сентинел.
                 ret = await loop.run_in_executor(_ITER_EXECUTOR, que.get, True, 0.25)
             except queue.Empty:
-                if task.done():
+                # Таймаут мог сработать, пока производитель ещё разбирал файл, а до
+                # потребителя дойти уже после того, как тот сложил в очередь все
+                # чанки и завершился. Выход по одному task.done() бросал их в
+                # очереди: файл без единого чанка помечался обработанным навсегда.
+                if task.done() and que.empty():
                     break
                 continue
             if ret is _stop:

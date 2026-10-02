@@ -83,19 +83,24 @@ async def status_check(index: AppIndex) -> IndexingStatus:
     "/search",
     description=(
         "Поиск документов: limit — документов на источник, у каждого до трёх "
-        "лучших фрагментов"
+        "лучших фрагментов. Файлы, в имени которых есть код из запроса "
+        "(«ЦБ_21», «5348-У»), идут первыми"
     ),
 )
 async def search(request: SearchRequest, index: AppIndex) -> SearchResponse:
     # Индексатор берёт по limit глубокий пул чанков, документы из него
-    # собирает и обрезает до limit уже SearchResponse.
+    # собирает и обрезает до limit уже SearchResponse. pinned — документы,
+    # найденные по коду из имени файла: индексатор их находит и дочитывает,
+    # SearchResponse ставит первыми.
+    pinned: list[str] = []
     results = await index.search(
         request.query,
         top_k=request.limit,
         query_type=request.query_type,
         sources=request.sources,
+        pinned=pinned,
     )
-    return SearchResponse.from_dataframes(results, limit=request.limit)
+    return SearchResponse.from_dataframes(results, limit=request.limit, pinned=pinned)
 
 
 @router.get("/config")

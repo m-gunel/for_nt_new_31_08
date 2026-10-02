@@ -42,6 +42,7 @@ from src.utils.lsm_adapter import to_thread as lsm_to_thread
 from src.utils.lsm_adapter import wait_idle as lsm_wait_idle
 from src.utils.thread_priority import background_pool_initializer
 
+from .name_codes import NameIndex, pinned_rows, query_codes
 from .scanners import EmailsScanner, FilesScanner
 
 if TYPE_CHECKING:
@@ -178,6 +179,8 @@ class Index(AbstractAsyncContextManager):
             cfg.ld_files_table: 0.0,
             cfg.ld_email_table: 0.0,
         }
+        # Имена документов для поиска файла по коду из имени — по таблице.
+        self._name_indexes: dict[str, NameIndex] = {}
         self.lsm_collection = LSMCollection()
         self.files_scanner = FilesScanner(
             queue_path=Path(cfg.lsm_root) / "files",
@@ -1264,12 +1267,52 @@ class Index(AbstractAsyncContextManager):
         except Exception:
             lg.exception("failed to purge stale chunks for %s path(s)", len(fresh))
 
+    def _pin_name_codes(
+        self,
+        store: LanceWrapper,
+        table,
+        codes: list[str],
+        frame: "pl.DataFrame | None",
+        pinned: list[str],
+    ) -> "pl.DataFrame | None":
+        """Найти документы по коду из имени и дочитать тех, кого нет в пуле.
+
+        Сбой здесь поиск не роняет: код из имени — надбавка к выдаче, и без
+        неё ответ остаётся тем же, что был до неё.
+        """
+        try:
+            index = self._name_indexes.setdefault(store.table_name, NameIndex())
+            paths = index.hits(table, codes)
+            if not paths:
+                return frame
+            have = set(frame["path"].to_list()) if frame is not None else set()
+            missing = [p for p in paths if p not in have]
+            if missing:
+                import polars as pl
+
+                extra = pinned_rows(table, missing)
+                # diagonal_relaxed: у дочитанных строк нет колонок оценки, и
+                # они остаются пустыми — по ним выдача и отличает строки пула.
+                frame = (
+                    extra
+                    if frame is None
+                    else pl.concat([frame, extra], how="diagonal_relaxed")
+                )
+        except Exception:
+            lg.exception(
+                "поиск файла по коду из имени в %s не удался", store.table_name
+            )
+            return frame
+        pinned.extend(paths)
+        return frame
+
     async def search(
         self,
         query: str,
         top_k: int = 10,
         query_type: Literal["hybrid", "vector", "text"] = "hybrid",
         sources: Sequence[SearchSource] = (FILES_SOURCE,),
+        pinned: list[str] | None = None,
     ) -> "list[pl.DataFrame | None]":
         """Искать в каждом запрошенном источнике отдельно, со своим top_k.
 
@@ -1279,7 +1322,14 @@ class Index(AbstractAsyncContextManager):
         общий запрос отдавал бы почте места файлов. Возвращаем кадр на
         источник, а не склейку: схемы расходятся, если по одной из таблиц
         гибридный поиск деградировал до векторного.
+
+        pinned — список, в который дописываются пути документов, найденных по
+        коду из имени файла (src/indexer/name_codes.py); их строки, если в
+        пуле их нет, дочитываются в кадр источника. Выдача ставит эти
+        документы первыми (SearchResponse.from_dataframes, тот же параметр).
+        None — код из имени не ищется вовсе.
         """
+        codes = query_codes(query) if pinned is not None else []
         vec = (await self.cfg.ov_model.async_encode([query], role="search"))[0]
         stores = [
             self.email_store if source == EMAIL_SOURCE else self.files_store
@@ -1385,7 +1435,11 @@ class Index(AbstractAsyncContextManager):
                 # Копии одного файла отдельного запроса с запасом больше не
                 # требуют: пул и так в несколько раз глубже выдачи, а
                 # SearchResponse схлопывает копии до отбора документов.
-                results.append(_search_in(store.table))
+                table = store.table
+                frame = _search_in(table)
+                if codes:
+                    frame = self._pin_name_codes(store, table, codes, frame, pinned)
+                results.append(frame)
             return results
 
         return await asyncio.to_thread(_search_all)

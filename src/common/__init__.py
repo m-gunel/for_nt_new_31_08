@@ -11,6 +11,7 @@ from .doc_meta import (
     doc_prefix,
     document_card_text,
     is_email_path,
+    norm_words,
     strip_doc_prefix,
 )
 from .models import IndexingStatus
@@ -29,5 +30,6 @@ __all__ = [
     "doc_prefix",
     "document_card_text",
     "is_email_path",
+    "norm_words",
     "strip_doc_prefix",
 ]

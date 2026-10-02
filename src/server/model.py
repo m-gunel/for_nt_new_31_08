@@ -1,5 +1,5 @@
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -23,6 +23,20 @@ def _row_score(row: dict[str, Any]) -> float:
     if (distance := row.get("_distance")) is not None:
         return -distance
     return row.get("_score") or 0.0
+
+
+_SCORE_COLUMNS = ("relevance", "_relevance_score", "_distance", "_score")
+
+
+def _row_rank(row: dict[str, Any]) -> tuple[bool, float]:
+    """Ключ сортировки строк: строки пула — по оценке, дочитанные — после всех.
+
+    Строки документа, найденного по коду из имени и дочитанного вне пула
+    (src/indexer/name_codes.py), оценки не имеют. Без этого их 0.0 обгонял
+    бы векторный пул, где оценка — минус расстояние, и дочитанный путь
+    отбирал бы у копии из пула место «первого» пути в `duplicates`.
+    """
+    return (any(row.get(k) is not None for k in _SCORE_COLUMNS), _row_score(row))
 
 
 class HealthCheckResponse(BaseModel):
@@ -89,11 +103,24 @@ MAX_FRAGMENTS_PER_DOC = 3
 class _Hit:
     """Документ выдачи, собранный из строк пула (по убыванию оценки)."""
 
-    __slots__ = ("path", "score", "rows", "card", "title", "document")
+    __slots__ = (
+        "path",
+        "score",
+        "pooled",
+        "pinned",
+        "rows",
+        "card",
+        "title",
+        "document",
+    )
 
-    def __init__(self, path: str, score: float) -> None:
+    def __init__(self, path: str, row: dict[str, Any], pinned: bool) -> None:
         self.path = path
-        self.score = score  # лучшая строка документа, карточка тоже считается
+        # Лучшая строка документа, карточка тоже считается. pooled — была ли
+        # у документа строка из пула поиска, а не только дочитанные.
+        self.pooled, self.score = _row_rank(row)
+        # Найден по коду из имени файла: в выдаче идёт первым.
+        self.pinned = pinned
         self.rows: list[dict[str, Any]] = []  # фрагменты, не больше MAX_FRAGMENTS
         self.card = False
         # Имя и свойства — из любой строки документа, карточки тоже: документ,
@@ -101,10 +128,18 @@ class _Hit:
         self.title: str | None = None
         self.document: DocumentInfo | None = None
 
+    @property
+    def rank(self) -> tuple[bool, bool, float]:
+        """Ключ порядка выдачи: найденные по коду из имени — первыми."""
+        return (self.pinned, self.pooled, self.score)
+
     def merge(self, other: "_Hit") -> None:
         """Добавить строки того же пути из выдачи другого источника."""
-        self.score = max(self.score, other.score)
-        self.rows = sorted(self.rows + other.rows, key=_row_score, reverse=True)[
+        self.pooled, self.score = max(
+            (self.pooled, self.score), (other.pooled, other.score)
+        )
+        self.pinned = self.pinned or other.pinned
+        self.rows = sorted(self.rows + other.rows, key=_row_rank, reverse=True)[
             :MAX_FRAGMENTS_PER_DOC
         ]
         self.card = self.card or other.card
@@ -128,7 +163,10 @@ class _Hit:
 
 
 def _distinct_docs(
-    frame: pl.DataFrame, limit: int | None, duplicates: dict[str, set[str]]
+    frame: pl.DataFrame,
+    limit: int | None,
+    duplicates: dict[str, set[str]],
+    pinned: Collection[str] = (),
 ) -> list[_Hit]:
     """Документы выдачи одного источника: не больше limit, в порядке лучшей строки.
 
@@ -138,10 +176,15 @@ def _distinct_docs(
     занимают: их пути уходят в `duplicates` того пути, что встретился первым.
     Карточка (kind="card") фрагментом не становится — она лишь отмечает, что
     запрос совпал с именем или свойствами файла.
+
+    Документы из `pinned` (найдены по коду из имени файла) идут первыми и
+    занимают места из того же limit. Копия закреплённого файла закрепляет
+    путь, под которым она осталась в выдаче.
     """
-    rows = sorted(frame.iter_rows(named=True), key=_row_score, reverse=True)
+    rows = sorted(frame.iter_rows(named=True), key=_row_rank, reverse=True)
     first: dict[str, str] = {}  # sha256 → путь, который остаётся в выдаче
-    docs: dict[str, _Hit] = {}
+    by_path: dict[str, list[dict[str, Any]]] = {}  # в порядке лучшей строки
+    pins: set[str] = set()
     for row in rows:
         path = row["path"]
         sha = (row.get("meta") or {}).get("sha256")
@@ -149,21 +192,27 @@ def _distinct_docs(
             kept = first.setdefault(sha, path)
             if kept != path:
                 duplicates[kept].add(path)
+                if path in pinned:
+                    pins.add(kept)
                 continue
-        hit = docs.get(path)
-        if hit is None:
-            if limit is not None and len(docs) >= limit:
-                # Документ за пределами выдачи. Строки дальше всё равно
-                # смотрим: они добирают фрагменты, карточки и копии уже
-                # отобранных документов.
-                continue
-            hit = docs[path] = _Hit(path, _row_score(row))
-        hit.take_meta(row)
-        if row.get("kind") == CARD_KIND:
-            hit.card = True
-        elif len(hit.rows) < MAX_FRAGMENTS_PER_DOC:
-            hit.rows.append(row)
-    return list(docs.values())
+        by_path.setdefault(path, []).append(row)
+        if path in pinned:
+            pins.add(path)
+    # Строки за пределами limit всё равно просмотрены: они добирают
+    # фрагменты, карточки и копии отобранных документов.
+    order = [p for p in by_path if p in pins] + [p for p in by_path if p not in pins]
+    hits = []
+    for path in order[:limit]:
+        doc_rows = by_path[path]
+        hit = _Hit(path, doc_rows[0], pinned=path in pins)
+        for row in doc_rows:
+            hit.take_meta(row)
+            if row.get("kind") == CARD_KIND:
+                hit.card = True
+            elif len(hit.rows) < MAX_FRAGMENTS_PER_DOC:
+                hit.rows.append(row)
+        hits.append(hit)
+    return hits
 
 
 class BaseSearchResponseItem(BaseModel):
@@ -181,7 +230,9 @@ class BaseSearchResponseItem(BaseModel):
         default_factory=list,
         description=(
             "Чем ещё документ совпал с запросом, кроме фрагментов: "
-            "card — именем файла или свойствами (название, автор, тема)"
+            "name_code — код из запроса есть в имени файла (такие документы "
+            "идут первыми), card — именем файла или свойствами (название, "
+            "автор, тема)"
         ),
     )
 
@@ -219,7 +270,10 @@ class SearchResponse(BaseModel):
 
     @classmethod
     def from_dataframes(
-        cls, frames: Sequence[pl.DataFrame | None], limit: int | None = None
+        cls,
+        frames: Sequence[pl.DataFrame | None],
+        limit: int | None = None,
+        pinned: Collection[str] = (),
     ):
         """Собрать ответ из выдач нескольких источников.
 
@@ -233,15 +287,22 @@ class SearchResponse(BaseModel):
         схлопываются: остаётся путь с лучшей строкой, остальные — в
         `duplicates`, мест они не занимают. Карточка документа — не фрагмент,
         а отметка "card" в `match`.
+
+        pinned — пути документов, найденных по коду из имени файла
+        (Index.search, тот же параметр). Они идут первыми — в порядке своей
+        лучшей строки пула, дочитанные вне пула — после них — и несут
+        "name_code" в `match`. Порядок задан явно, а не подменой оценок:
+        score остаётся настоящей оценкой поиска.
         """
         hits: dict[str, _Hit] = {}
         duplicates: dict[str, set[str]] = defaultdict(set)
+        pinned = set(pinned)  # проверяется на каждой строке пула
         # None приходит, когда поиск невозможен (например, FTS-индекс ещё не
         # построен) — отдаём пустой ответ, а не падаем.
         for df in frames:
             if df is None:
                 continue
-            for hit in _distinct_docs(df, limit, duplicates):
+            for hit in _distinct_docs(df, limit, duplicates, pinned):
                 if (seen := hits.get(hit.path)) is None:
                     hits[hit.path] = hit
                 else:
@@ -250,7 +311,7 @@ class SearchResponse(BaseModel):
                     seen.merge(hit)
 
         results = []
-        for hit in sorted(hits.values(), key=lambda h: h.score, reverse=True):
+        for hit in sorted(hits.values(), key=lambda h: h.rank, reverse=True):
             file_path = hit.path
             chunks = [
                 Chunk(
@@ -279,7 +340,11 @@ class SearchResponse(BaseModel):
                     score=hit.score,
                     document=hit.document,
                     duplicates=sorted(duplicates.get(file_path, ())),
-                    match=["card"] if hit.card else [],
+                    match=[
+                        mark
+                        for mark, on in (("name_code", hit.pinned), ("card", hit.card))
+                        if on
+                    ],
                 )
             )
         return cls(results=results, total=len(results))

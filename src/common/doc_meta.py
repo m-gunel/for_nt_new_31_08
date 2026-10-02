@@ -44,12 +44,17 @@ CARD_FIELDS = (
 # Длинное «Описание» или «Ключевые слова» не должны вытеснять из карточки
 # остальное: вектор строится по началу текста.
 CARD_VALUE_MAX = 300
-_CARD_WORD = re.compile(r"[0-9a-zа-я]+")
+_WORD = re.compile(r"[0-9a-zа-я]+")
 
 
-def _card_words(text: str) -> str:
-    """Слова текста для сравнения: нижний регистр, ё→е, без знаков."""
-    return " ".join(_CARD_WORD.findall(text.lower().replace("ё", "е")))
+def norm_words(text: str) -> str:
+    """Слова текста для сравнения: нижний регистр, ё→е, без знаков.
+
+    Одна нормализация на карточку и на поиск файла по коду из имени
+    (src/indexer/name_codes.py): «ЦБ_21» и «цб 21» должны совпадать и там,
+    и там.
+    """
+    return " ".join(_WORD.findall(text.lower().replace("ё", "е")))
 
 
 def document_card_text(meta: Mapping | None) -> str:
@@ -64,7 +69,7 @@ def document_card_text(meta: Mapping | None) -> str:
     lines = [p.rstrip("\n")] if (p := doc_prefix(meta.get("original_name"))) else []
     for label, key in CARD_FIELDS:
         value = " ".join(str(meta.get(key) or "").split())
-        if value and _card_words(value) not in _card_words("\n".join(lines)):
+        if value and norm_words(value) not in norm_words("\n".join(lines)):
             lines.append(f"{label}: {value[:CARD_VALUE_MAX]}")
     return "\n".join(lines)
 

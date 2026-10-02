@@ -133,7 +133,8 @@ def test_pdf_pipeline_keeps_running_headers_and_joins_hyphens(tmp_path):
             )
             page.insert_text((72, 780), str(i))
         doc.save(str(path))
-    joined = "\n".join(r["text"] for r in file_chunks(path))
+    # Карточка документа (kind="card") повторяет название — считаем только чанки.
+    joined = "\n".join(r["text"] for r in file_chunks(path) if r["kind"] != "card")
     # В колонтитуле банк, период и номер акта — он остаётся на каждой странице.
     assert joined.count("BANK HERALD") == 6
     assert "applicable to every bank" in joined and "appli-" not in joined

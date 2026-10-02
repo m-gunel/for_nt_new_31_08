@@ -22,9 +22,12 @@ from src.parsers import metadata as md
 
 
 def _rows(path):
+    """Чанки документа без карточки — она идёт последней и полей места не имеет."""
     rows = list(file_chunks(path))
     assert rows, "документ не дал чанков"
-    return rows, rows[0]["meta"]
+    *chunks, card = rows
+    assert card["kind"] == "card" and all(r["kind"] != "card" for r in chunks)
+    return chunks, rows[0]["meta"]
 
 
 def _local(dt: datetime) -> datetime:

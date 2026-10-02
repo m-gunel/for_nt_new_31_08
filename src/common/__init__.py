@@ -1,4 +1,6 @@
 from .doc_meta import (
+    CARD_IDX,
+    CARD_KIND,
     DOC_PREFIX,
     EMAIL_PREFIX,
     Chunk,
@@ -7,12 +9,15 @@ from .doc_meta import (
     FileMetadata,
     chunk_with_meta_schema,
     doc_prefix,
+    document_card_text,
     is_email_path,
     strip_doc_prefix,
 )
 from .models import IndexingStatus
 
 __all__ = [
+    "CARD_IDX",
+    "CARD_KIND",
     "DOC_PREFIX",
     "EMAIL_PREFIX",
     "Chunk",
@@ -22,6 +27,7 @@ __all__ = [
     "IndexingStatus",
     "chunk_with_meta_schema",
     "doc_prefix",
+    "document_card_text",
     "is_email_path",
     "strip_doc_prefix",
 ]

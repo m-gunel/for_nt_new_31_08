@@ -1,3 +1,5 @@
+import re
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import PurePath
 from typing import NamedTuple, NotRequired, TypedDict
@@ -22,6 +24,51 @@ def doc_prefix(original_name: str | None) -> str:
     return f"{DOC_PREFIX}{PurePath(original_name).stem}\n" if original_name else ""
 
 
+# Карточка документа — лишняя строка индекса после всех чанков документа: имя
+# файла и свойства (название, автор, тема…), которых нет в самих чанках. Запрос
+# «найди файл …» и код из имени («ЦБ_21», «5348-У») попадают в неё целиком,
+# а не в случайный кусок текста, где имя — лишь первая строка. idx=-1: у чанков
+# idx с нуля, и карточка не занимает чужой номер; поле idx ни для чего, кроме
+# порядка внутри документа, не используется.
+CARD_KIND = "card"
+CARD_IDX = -1
+# Свойства документа в карточке — подпись и ключ в meta, в этом порядке.
+CARD_FIELDS = (
+    ("Название", "title"),
+    ("Автор", "author"),
+    ("Изменил", "last_modified_by"),
+    ("Тема", "subject"),
+    ("Ключевые слова", "keywords"),
+    ("Описание", "description"),
+)
+# Длинное «Описание» или «Ключевые слова» не должны вытеснять из карточки
+# остальное: вектор строится по началу текста.
+CARD_VALUE_MAX = 300
+_CARD_WORD = re.compile(r"[0-9a-zа-я]+")
+
+
+def _card_words(text: str) -> str:
+    """Слова текста для сравнения: нижний регистр, ё→е, без знаков."""
+    return " ".join(_CARD_WORD.findall(text.lower().replace("ё", "е")))
+
+
+def document_card_text(meta: Mapping | None) -> str:
+    """Текст карточки документа: «Документ: <имя>» и непустые свойства.
+
+    Свойство пропускаем, если его слова уже есть в карточке: название,
+    совпадающее с именем файла, или автор, повторённый в «Изменил», только
+    раздули бы её и сместили вектор к повтору. Пустая строка — карточке
+    не из чего состоять.
+    """
+    meta = meta or {}
+    lines = [p.rstrip("\n")] if (p := doc_prefix(meta.get("original_name"))) else []
+    for label, key in CARD_FIELDS:
+        value = " ".join(str(meta.get(key) or "").split())
+        if value and _card_words(value) not in _card_words("\n".join(lines)):
+            lines.append(f"{label}: {value[:CARD_VALUE_MAX]}")
+    return "\n".join(lines)
+
+
 def strip_doc_prefix(text: str, original_name: str | None) -> str:
     """Текст чанка без строки «Документ: …» — только если это ровно префикс этого файла."""
     prefix = doc_prefix(original_name)
@@ -38,7 +85,7 @@ class Chunk(TypedDict):
     idx: int | None
     text: str
     # Место чанка в документе (src/parsers/doc_model.py); у старых строк — null.
-    kind: NotRequired[str | None]  # text / table / table_row / notes / ocr
+    kind: NotRequired[str | None]  # text / table / table_row / notes / ocr / card
     page_start: NotRequired[int | None]  # страница PDF, слайд, лист — с 1
     page_end: NotRequired[int | None]
     line_start: NotRequired[int | None]  # строка txt — с 1

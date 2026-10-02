@@ -17,10 +17,14 @@ from aiofiles.threadpool.binary import AsyncBufferedReader
 from lxml import etree
 
 from src.common import (
+    CARD_IDX,
+    CARD_KIND,
+    Chunk,
     ChunkWithMeta,
     DocumentMetadata,
     FileMetadata,
     doc_prefix,
+    document_card_text,
     is_email_path,
 )
 from src.thunderbird.get_body import Attachment, Body, process_message
@@ -66,6 +70,12 @@ _CORRUPT = (
 )
 
 
+# Поля места чанка (src/common/doc_meta.py: Chunk) — у карточки все пустые.
+_PLACE_FIELDS = tuple(
+    k for k in Chunk.__annotations__ if k not in ("idx", "text", "kind")
+)
+
+
 def _document_meta(doc: ParsedDoc, base: DocumentMetadata) -> DocumentMetadata:
     """Метаданные документа: поля ФС/письма + свойства файла + производные от текста."""
     meta: dict = dict(base)
@@ -93,8 +103,9 @@ def document_chunks(
     """Конвейер разбора одного документа — общий для индексации, стенда и вложений.
 
     Разбор → нормализация → метаданные → нарезка с полями места → фильтр пустого
-    и повторов → «Документ: <имя>» сверху каждого чанка. Синхронный: в индексации
-    идёт в потоке через wrap_iter_to_async.
+    и повторов → «Документ: <имя>» сверху каждого чанка → карточка документа
+    последней строкой (src/common/doc_meta.py: document_card_text). Синхронный:
+    в индексации идёт в потоке через wrap_iter_to_async.
     """
     if io is None:
         with open(path, "rb") as f:
@@ -116,12 +127,34 @@ def document_chunks(
     doc = prepare(parsed)
     meta = _document_meta(doc, DocumentMetadata(**base))
     prefix = doc_prefix(meta.get("original_name"))
+    emitted = False
     for chunk in chunk_document(doc, get_config().embed_splitter):
         chunk["text"] = prefix + chunk["text"]
-        row = ChunkWithMeta(**chunk, meta=meta, path=str(path))
-        if file_meta is not None:
-            row["file_meta"] = file_meta
-        yield row
+        yield _row(chunk, meta, path, file_meta)
+        emitted = True
+    # Карточка — только у документа с текстом: без чанков файл в индекс не
+    # попадает (_process_path помечает его «без текста»), и одинокая карточка
+    # находила бы пустой документ. Последней — индексатор отмечает файл
+    # готовым по чанку следующего файла, и карточка уходит с тем же файлом.
+    if emitted and (card := document_card_text(meta)):
+        # Поля места явно пустые: у карточки нет страницы и позиции в тексте,
+        # а читатели строк (стенд, тесты) берут их по ключу, как у чанков.
+        place = dict.fromkeys(_PLACE_FIELDS)
+        yield _row(
+            {**place, "idx": CARD_IDX, "text": card, "kind": CARD_KIND},
+            meta,
+            path,
+            file_meta,
+        )
+
+
+def _row(
+    chunk: dict, meta: DocumentMetadata, path: Path, file_meta: FileMetadata | None
+) -> ChunkWithMeta:
+    row = ChunkWithMeta(**chunk, meta=meta, path=str(path))
+    if file_meta is not None:
+        row["file_meta"] = file_meta
+    return row
 
 
 def file_chunks(path: str | Path) -> Iterator[ChunkWithMeta]:

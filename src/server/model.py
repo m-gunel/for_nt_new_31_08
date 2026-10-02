@@ -35,7 +35,9 @@ class Chunk(BaseModel):
     score: float
     # Место фрагмента в документе. Необязательные: у строк, записанных до
     # появления полей, и в выдаче почты их нет.
-    kind: str | None = Field(None, description="text / table / table_row / notes / ocr")
+    kind: str | None = Field(
+        None, description="text / table / table_row / notes / ocr / card"
+    )
     page_start: int | None = Field(
         None, description="Страница PDF, слайд или лист — с 1"
     )

@@ -27,6 +27,7 @@ from src.thunderbird.get_body import Attachment, Body, process_message
 from src.thunderbird.lazy_iter_mbox import _decode_filename
 from src.utils import get_config, get_logger, wrap_iter_to_async
 
+from . import ocr
 from .base import Parser, SkipFile, file_extension, get_parser, get_parsers_registry
 from .doc_model import ParsedDoc, chunk_document, full_text, prepare
 from .docx import DocParser, DocxParser
@@ -138,7 +139,8 @@ def read_document_text(path: str | Path) -> str | None:
     p = Path(path)
     if (parser := get_parser(file_extension(p))) is None:
         return None
-    with open(p, "rb") as f:
+    # OCR — только из кэша индексации: ждать распознавания скана здесь нельзя.
+    with open(p, "rb") as f, ocr.cache_only():
         return full_text(prepare(parser.parse_io(f)))
 
 

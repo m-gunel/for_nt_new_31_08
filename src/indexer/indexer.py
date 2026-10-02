@@ -26,6 +26,7 @@ from src.common import (
 from src.malloc_tuning import safe_malloc_trim
 from src.parsers import (
     async_parse_files,
+    ocr,
 )
 from src.thunderbird.find_files import list_email_folders
 from src.utils import (
@@ -303,6 +304,8 @@ class Index(AbstractAsyncContextManager):
     async def stop_index(self):
         if self.task is not None:
             self.task.cancel()
+            # Воркер OCR — отдельный процесс: отмена задачи его не останавливает.
+            ocr.kill_running()
             with suppress(asyncio.CancelledError):
                 await self.task
             # Вне suppress: внутри строка печаталась только когда задача НЕ

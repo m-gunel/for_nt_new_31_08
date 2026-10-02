@@ -156,10 +156,11 @@ def test_bridge_shows_place_and_document(stub, bridge):  # noqa: F811
                     },
                 ),
                 _hit("/docs/план.pptx", {"page_start": 2, "page_end": 2}),
+                _hit("/docs/скан.pdf", {"kind": "ocr", "page_start": 7, "page_end": 7}),
                 _hit("/docs/заметка.txt", {"line_start": 10, "line_end": 12}),
                 _hit("/docs/старый.docx", {}),
             ],
-            "total": 4,
+            "total": 5,
         },
     )
     response = bridge.call("local_search", {"query": "резервы"})
@@ -170,6 +171,7 @@ def test_bridge_shows_place_and_document(stub, bridge):  # noqa: F811
         in text
     )
     assert "· [слайд 2] текст фрагмента" in text
+    assert "· [стр. 7 · распознано OCR] текст фрагмента" in text
     assert "· [строки 10–12] текст фрагмента" in text
     assert "· текст фрагмента" in text  # у старого демона места нет — без скобок
     results = response["result"]["structuredContent"]["results"]
@@ -184,4 +186,4 @@ def test_bridge_shows_place_and_document(stub, bridge):  # noqa: F811
         "date_modified": "2025-03-01T10:00:00",
         "page_count": 12,
     }
-    assert "document" not in results[3]
+    assert "document" not in results[4]

@@ -1,3 +1,12 @@
+import sys
+
+if sys.argv[1:2] == ["--ocr-worker"]:
+    # Воркер OCR (src/ocr_worker.py): тот же бинарь, но без OpenVINO, конфига и
+    # сервера — только pymupdf. Проверка до всех тяжёлых импортов ниже.
+    from src.ocr_worker import main as _ocr_worker
+
+    raise SystemExit(_ocr_worker())
+
 import faulthandler
 import logging
 import os

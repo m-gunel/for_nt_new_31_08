@@ -142,7 +142,7 @@ def split_headings(
             i += 1
             continue
         if buf:
-            out.append(Block("\n".join(buf), page=block.page))
+            out.append(Block("\n".join(buf), kind=block.kind, page=block.page))
             buf = []
         # Текст блока — строки страницы как есть: заголовок не меняет текст чанков.
         level, text = marks[i], lines[i]
@@ -157,10 +157,10 @@ def split_headings(
         ):
             text = f"{text}\n{lines[i + 1]}"
             i += 1
-        out.append(Block(text, page=block.page, heading=level))
+        out.append(Block(text, kind=block.kind, page=block.page, heading=level))
         i += 1
     if buf:
-        out.append(Block("\n".join(buf), page=block.page))
+        out.append(Block("\n".join(buf), kind=block.kind, page=block.page))
     return [b for b in out if b.text.strip()]
 
 

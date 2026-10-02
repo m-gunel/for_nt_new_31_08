@@ -22,6 +22,15 @@ Comment:
  аудит состава dist/main/_internal и перечисление лицензий здесь — у части
  зависимостей условия строже проприетарных (например, у PyMuPDF).
 
+Files: models/tessdata/*
+Copyright: Google Inc., Hewlett-Packard Company и авторы Tesseract
+License: Apache-2.0
+Comment:
+ Языковые данные Tesseract (tessdata_fast, тег 4.1.0, rus и eng) для OCR
+ сканов в PDF. Источник: https://github.com/tesseract-ocr/tessdata_fast.
+ Полный текст лицензии лежит рядом с данными: models/tessdata/LICENSE
+ (в пакете — внутри /opt/lib-local-rag вместе с моделью).
+
 License: proprietary
  Внутреннее программное обеспечение ПАО Сбербанк.
  Распространение за пределы контура организации не допускается.

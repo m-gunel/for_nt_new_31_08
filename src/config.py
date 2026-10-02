@@ -78,6 +78,25 @@ class ExcelParserConfig(BaseModel):
     max_rows: int = 5000
 
 
+class OcrConfig(BaseModel):
+    """OCR страниц PDF без текстового слоя (src/parsers/ocr.py, src/ocr_worker.py).
+
+    Страницы сверх лимита и не уложившиеся во время не распознаются: одна строка
+    WARNING, файл индексируется с тем, что есть. Из окружения секция задаётся
+    JSON: RAG_OCR_CFG='{"enabled": false}'.
+    """
+
+    enabled: bool = True
+    languages: str = "rus+eng"
+    # 200, а не 300: на сканах 100 dpi точнее (сумм 94,8% против 92,2%), на настоящих
+    # сканах — то же качество, и на 10–20% быстрее (замер КТ-OCR1, 02.10.2026).
+    dpi: int = 200
+    max_pages_per_file: int = 200
+    max_seconds_per_file: float = 1200
+    # tessdata_fast (LSTM, int8): Tesseract в MuPDF собран без старого движка.
+    tessdata_path: str = str(base_path / "models/tessdata")
+
+
 class FileScanConfig(BaseModel):
     path: str | None = None
     # Умолчание — домашний каталог, а НЕ пустой список. Пустой список означал,
@@ -181,6 +200,7 @@ class Config(BaseSettings):
     # транзакция и новая версия таблицы, а компакция версий стоит CPU.
     parquet_record_batch_size: int = 500
     excel_config: ExcelParserConfig = Field(default_factory=ExcelParserConfig)
+    ocr_cfg: OcrConfig = Field(default_factory=OcrConfig)
     user_home: str | None = None
     logging_level: Literal[
         "CRITICAL",

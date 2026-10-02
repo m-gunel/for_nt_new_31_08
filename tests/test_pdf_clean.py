@@ -84,6 +84,8 @@ def test_split_headings_by_numbering_and_two_line_heading():
         ("Текст главы 2.", None),
     ]
     assert {b.page for b in out} == {3}
+    ocr_page = Block(page.text, kind="ocr", page=3)
+    assert {b.kind for b in split_headings(ocr_page, [], numbering=True)} == {"ocr"}
 
 
 def test_split_headings_by_bookmarks():

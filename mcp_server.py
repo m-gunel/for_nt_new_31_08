@@ -870,6 +870,9 @@ def _chunk_place(chunk, ext):
         parts.append("строки %s" % _span(chunk["line_start"], chunk.get("line_end")))
     if chunk.get("section"):
         parts.append(str(chunk["section"]))
+    if chunk.get("kind") == "ocr":
+        # Скан: текст распознан, в цифрах и редких словах возможны ошибки.
+        parts.append("распознано OCR")
     return " · ".join(parts)
 
 

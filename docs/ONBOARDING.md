@@ -268,8 +268,8 @@ make tests                      # uv run pytest -m "not integration"
 платформу разработчика, и `lancedb` приезжает без wheel под целевую — типовой симптом
 `lancedb ... doesn't have a wheel for the current platform`.
 
-**Модель в репозитории.** `models/rubert-tiny2_002` (~14 МБ, OpenVINO IR + токенизатор)
-лежит в git. Доступ к внешнему хранилищу моделей не нужен, но без этой директории демон
+**Модель в репозитории.** `models/multilingual-e5-small` (~125 МБ, OpenVINO IR + токенизатор)
+лежит в git; веса — тремя частями `*.bin.partNN`, GitHub не принимает файлы больше 100 МБ. Доступ к внешнему хранилищу моделей не нужен, но без этой директории демон
 не стартует.
 
 **Pre-commit** ([`.pre-commit-config.yaml`](../.pre-commit-config.yaml)) — четыре

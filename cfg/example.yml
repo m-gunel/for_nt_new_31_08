@@ -23,7 +23,7 @@ file_scan_cfg: # список директорий для сканировани
     - "/home"
 embed_model_cfg:
   # model_path: models/user2-small
-  model_path: models/rubert-tiny2_002
+  model_path: models/multilingual-e5-small
 
 # user_home: /home/work/<логин>@sigma.sbrf.ru  # переопределить домашний каталог
 email_poll_interval: 60

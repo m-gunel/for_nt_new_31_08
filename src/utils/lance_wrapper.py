@@ -419,6 +419,13 @@ class LanceWrapper:
         self.table.delete(predicate)
         self._mark_stale()
 
+    def vector_dim(self) -> int | None:
+        """Размерность колонки vector в таблице на диске; None — таблицы нет."""
+        if self.table_name not in self.lancedb.table_names():
+            return None
+        field = self.lancedb.open_table(self.table_name).schema.field("vector")
+        return getattr(field.type, "list_size", None)
+
     def drop(self) -> None:
         """Удалить таблицу целиком и забыть её индексы.
 

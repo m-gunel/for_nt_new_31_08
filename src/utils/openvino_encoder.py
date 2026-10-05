@@ -2,6 +2,7 @@ import asyncio
 import concurrent
 import concurrent.futures
 import gc
+import json
 import os
 import threading
 from functools import cached_property, partial
@@ -24,7 +25,10 @@ _cfg = {
     # LATENCY, а не THROUGHPUT: под THROUGHPUT плагин дробит пул на streams по
     # числу ядер и отдаёт каждому по одному потоку, что резко замедляет
     # индексацию. Нужны ровно два независимых канала — streams задаём явно.
-    op.hint.performance_mode(): op.hint.PerformanceMode.LATENCY  # type: ignore
+    op.hint.performance_mode(): op.hint.PerformanceMode.LATENCY,  # type: ignore
+    # FP32 явно: на x86 так и по умолчанию, а на ARM (Apple M1 стенда) плагин считает в FP16 —
+    # расходится с x86 и роняет Unigram-токенизатор (e5) на f16-тензорах.
+    op.hint.inference_precision(): ov.Type.f32,  # type: ignore
 }
 
 # Ровно по числу каналов инференса: search и index. Одного stream на оба мало —
@@ -92,6 +96,21 @@ else:
 Role = Literal["search", "index"]
 
 
+def read_model(core: ov.Core, xml: Path) -> ov.Model:
+    """IR модели; веса могут лежать частями `<имя>.bin.partNN`.
+
+    GitHub не принимает файлы больше 100 МБ, а веса multilingual-e5-small в
+    INT8 — 119 МБ, поэтому в репозитории они разрезаны. Склеиваем в памяти, а
+    не на диске: в установленном пакете каталог модели только для чтения.
+    """
+    weights = xml.with_suffix(".bin")
+    parts = sorted(xml.parent.glob(f"{weights.name}.part*"))
+    if weights.exists() or not parts:
+        return core.read_model(xml)
+    data = np.frombuffer(b"".join(p.read_bytes() for p in parts), dtype=np.uint8)
+    return core.read_model(xml.read_bytes(), ov.Tensor(data))
+
+
 class _InferChannel:
     """Независимый канал инференса: своя пара infer-request'ов и свой поток.
 
@@ -109,6 +128,9 @@ class _InferChannel:
         self.name = name
         self.model = model
         self.tokenizer = tokenizer
+        # Токенизатор отдаёт token_type_ids, а у моделей без них (ModernBERT)
+        # такого входа нет: лишнее имя во входах infer-request не принимает.
+        self.input_names = {name for port in model.inputs for name in port.get_names()}
         self.reset_memory_every_n = reset_memory_every_n
         self._tok_inf: ov.InferRequest | None = None
         self._model_inf: ov.InferRequest | None = None
@@ -147,8 +169,12 @@ class _InferChannel:
             # вернуть их страницы ОС, пока арены glibc их не удержали.
             safe_malloc_trim()
 
-    def infer(self, texts: list[str]) -> np.ndarray:
-        """Синхронный инференс. Выполняется в собственном потоке канала."""
+    def infer(self, texts: list[str]) -> tuple[np.ndarray, np.ndarray]:
+        """Синхронный инференс. Выполняется в собственном потоке канала.
+
+        Возвращает скрытые состояния токенов и маску внимания — маска нужна
+        mean-пулингу, чтобы не усреднять паддинг.
+        """
         with self._lock:
             self._maybe_reset_memory()
 
@@ -160,13 +186,21 @@ class _InferChannel:
                 for x, v in zip(self.tokenizer.outputs, tok_inf.output_tensors)
             }
 
+            inputs = {k: v for k, v in toks.items() if k in self.input_names}
+            if "token_type_ids" in self.input_names and "token_type_ids" not in inputs:
+                # Токенизатор XLM-R (e5) типов сегментов не отдаёт, а BERT их ждёт:
+                # нули, как подставляет transformers.
+                inputs["token_type_ids"] = np.zeros_like(toks["input_ids"])
             model_inf = self.model_inf
-            model_inf.start_async(inputs=toks)
+            model_inf.start_async(inputs=inputs)
             model_inf.wait()
             # Копия обязательна: .data — это view на буфер infer-request'а,
             # который переиспользуется следующим вызовом. Без копии вызывающий
             # код может получить данные уже другого батча.
-            return np.array(model_inf.output_tensors[0].data, copy=True)
+            return (
+                np.array(model_inf.output_tensors[0].data, copy=True),
+                np.array(toks["attention_mask"], copy=True),
+            )
 
     def shutdown(self):
         self.executor.shutdown(wait=False)
@@ -183,7 +217,9 @@ class OpenVINOEmbedder:
         tokenizer_path = Path(model_path) / tokenizer
         self.core = ov.Core()
         self._path = model_path
-        self.model = self.core.compile_model(Path(model_path) / openvino, device, _cfg)
+        self.model = self.core.compile_model(
+            read_model(self.core, Path(model_path) / openvino), device, _cfg
+        )
         self.tokenizer = self.core.compile_model(tokenizer_path, device, _cfg)
 
         # Отдельные каналы: интерактивный поиск не должен ждать фоновую индексацию.
@@ -218,10 +254,35 @@ class OpenVINOEmbedder:
         return len(tokens["input_ids"][0])
 
     @cached_property
-    def prefix(self):
-        if "user2" in self._path:
-            return {"query": "search_query", "document": "search_document"}
-        return None
+    def prefix(self) -> dict[str, str] | None:
+        """Префиксы задач из config_sentence_transformers.json модели.
+
+        Имена промптов у моделей разные: query/document у нашей, search_query/
+        search_document у USER2 и FRIDA, query/passage у e5. Пустые строки —
+        модель без префиксов.
+        """
+        path = Path(self._path) / "config_sentence_transformers.json"
+        prompts = {}
+        if path.exists():
+            prompts = json.loads(path.read_text()).get("prompts") or {}
+        found = {
+            task: next((prompts[n] for n in names if prompts.get(n)), "")
+            for task, names in (
+                ("query", ("query", "search_query")),
+                ("document", ("document", "search_document", "passage")),
+            )
+        }
+        return found if any(found.values()) else None
+
+    @cached_property
+    def pooling(self) -> Literal["cls", "mean"]:
+        """Пулинг из 1_Pooling/config.json модели; без файла — CLS, как у rubert-tiny2."""
+        path = Path(self._path) / "1_Pooling" / "config.json"
+        cfg = json.loads(path.read_text()) if path.exists() else {}
+        # Два формата: pooling_mode_mean_tokens до sentence-transformers 6, pooling_mode — с 6.
+        if cfg.get("pooling_mode_mean_tokens") or cfg.get("pooling_mode") == "mean":
+            return "mean"
+        return "cls"
 
     def _apply_prefix(self, texts: list[str], task: Literal["query", "document"]):
         # Вход модели — в нижнем регистре: rubert-tiny2 различает регистр, и запрос
@@ -241,9 +302,7 @@ class OpenVINOEmbedder:
         """
         texts = self._apply_prefix(texts, task)
         result = self._channels["index"].infer(texts)
-        embeddings = self.cls_pooling(result)
-        embeddings: np.ndarray = self.l2_normalize(embeddings)
-        return embeddings
+        return self.l2_normalize(self._pool(*result))
 
     async def async_encode(
         self,
@@ -263,13 +322,18 @@ class OpenVINOEmbedder:
         res = await loop.run_in_executor(
             channel.executor, partial(channel.infer, texts)
         )
-        embeddings = self.cls_pooling(res)
-        embeddings: np.ndarray = self.l2_normalize(embeddings)
-        return embeddings
+        return self.l2_normalize(self._pool(*res))
 
     def shutdown(self):
         for channel in self._channels.values():
             channel.shutdown()
+
+    def _pool(self, last_hidden_state, attention_mask) -> np.ndarray:
+        if self.pooling == "mean":
+            mask = attention_mask[..., None].astype(last_hidden_state.dtype)
+            summed = (last_hidden_state * mask).sum(axis=1)
+            return summed / np.clip(mask.sum(axis=1), 1e-9, None)
+        return self.cls_pooling(last_hidden_state)
 
     @staticmethod
     def cls_pooling(last_hidden_state) -> np.ndarray:

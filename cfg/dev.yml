@@ -11,7 +11,7 @@ file_scan_cfg:
   # Пусто намеренно: каждый тест задаёт себе пути сам, через monkeypatch.
   paths: []
 embed_model_cfg:
-  model_path: models/rubert-tiny2_002
+  model_path: models/multilingual-e5-small
 
 email_poll_interval: 60
 email:

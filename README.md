@@ -137,11 +137,13 @@ python3 -m venv .venv
 ```bash
 .venv/bin/python -c "
 from src.utils.openvino_encoder import OpenVINOEmbedder
-e = OpenVINOEmbedder('models/rubert-tiny2_002')
+e = OpenVINOEmbedder('models/multilingual-e5-small')
 print('размерность:', e.encode(['проверка']).shape)"
 ```
 
-Без каталога `models/rubert-tiny2_002` индексатор не стартует.
+Без каталога `models/multilingual-e5-small` индексатор не стартует. Веса модели лежат
+в `openvino/` тремя частями `*.bin.partNN` (GitHub не принимает файлы больше 100 МБ),
+энкодер склеивает их в памяти при загрузке.
 
 ### 2. Подготовить конфиг
 
@@ -151,7 +153,7 @@ file_scan_cfg:
   paths:
     - "~"          # весь домашний каталог; можно сузить до конкретных папок
 embed_model_cfg:
-  model_path: models/rubert-tiny2_002
+  model_path: models/multilingual-e5-small
 email:
   enabled: false
 app_logging_level: INFO
@@ -394,7 +396,7 @@ passwd и, если там есть каталог агента, в `$HOME` те
 
 Основная конфигурация находится в `cfg/dev.yml`. Основные параметры:
 
-- `embed_model_cfg.model_path` - путь к модели эмбеддингов (по умолчанию `models/rubert-tiny2_002`)
+- `embed_model_cfg.model_path` - путь к модели эмбеддингов (по умолчанию `models/multilingual-e5-small`)
 - `file_scan_cfg` - параметры сканирования файлов
   - `paths` - пути для сканирования
   - `allowed_extensions` - разрешенные расширения файлов
@@ -609,7 +611,7 @@ inotify-лимиты, живость API и укомплектованность
 
 ### Модель эмбеддингов
 
-Проект использует модель `rubert-tiny2` для создания векторных представлений текста. Модель оптимизирована для работы с OpenVINO, что позволяет выполнять инференс на CPU без необходимости в GPU.
+Проект использует модель `multilingual-e5-small` (intfloat, MIT) для создания векторных представлений текста: 12 слоёв × 384, вектор из 384 чисел, mean-пулинг, префиксы `query: ` и `passage: `. Модель сконвертирована в OpenVINO IR со статическим INT8 и работает на CPU без GPU. Пулинг, префиксы и размерность энкодер берёт из файлов модели (`1_Pooling/config.json`, `config_sentence_transformers.json`), так что модель меняется заменой каталога и `embed_model_cfg.model_path`. При смене модели индекс пересобирается сам (`Index.migrate_embedding_model`, метка `~/.files-search/embedding_model.json`). Происхождение и параметры конвертации — `models/multilingual-e5-small/README.md`.
 
 ## Особенности реализации
 

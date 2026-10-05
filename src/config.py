@@ -1,5 +1,7 @@
 import contextlib
 import datetime
+import hashlib
+import json
 import os
 import shutil
 import sys
@@ -166,11 +168,41 @@ class SplitterCfg(BaseModel):
 
 class EmbeddingModelConfig(BaseModel):
     model_type: Literal["jina", "st", "fake", "ov"] = "ov"
-    model_path: str = str(base_path / "models/rubert-tiny2_002")
+    model_path: str = str(base_path / "models/multilingual-e5-small")
     device: str = "cpu"
     batch_size: int = 8
     passages_promt_name: str | None = None
     query_promt_name: str | None = None
+
+
+# Файлы модели, от которых зависит вектор: IR (целиком или частями), токенизатор,
+# пулинг и префиксы задач.
+_MODEL_SIGNATURE_FILES = (
+    "openvino",
+    "openvino_tokenizer.xml",
+    "openvino_tokenizer.bin",
+    "1_Pooling/config.json",
+    "config_sentence_transformers.json",
+)
+
+
+def model_embed_dim(model_path: Path) -> int | None:
+    """Размерность вектора по файлам модели sentence-transformers.
+
+    1_Pooling/config.json: word_embedding_dimension до sentence-transformers 6,
+    embedding_dimension — с 6; без него — hidden_size из config.json.
+    """
+    for name, keys in (
+        ("1_Pooling/config.json", ("word_embedding_dimension", "embedding_dimension")),
+        ("config.json", ("hidden_size",)),
+    ):
+        path = model_path / name
+        if path.exists():
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+            for key in keys:
+                if isinstance(cfg.get(key), int):
+                    return cfg[key]
+    return None
 
 
 class RarankerModelConfig(BaseModel):
@@ -356,6 +388,10 @@ class Config(BaseSettings):
         if self.embed_model_cfg.model_type == "jina":
             return 1024
         elif self.embed_model_cfg.model_type in {"st", "ov"}:
+            # Из файлов модели, а не по имени каталога: у модели с неугаданным
+            # именем выходило 1024, и запись в LanceDB падала на схеме.
+            if dim := model_embed_dim(Path(self.embed_model_cfg.model_path)):
+                return dim
             if "minilm" in self.embed_model_cfg.model_path.lower():
                 return 384
             elif "rubert-tiny" in self.embed_model_cfg.model_path.lower():
@@ -368,6 +404,31 @@ class Config(BaseSettings):
             return 1024
         else:
             raise ValueError(f"{self.embed_model_cfg.model_type=} is not supported")
+
+    @cached_property
+    def embed_model_signature(self) -> dict:
+        """Чем посчитаны векторы: каталог модели, размерность и хэш файлов,
+        от которых зависит вектор (веса, токенизатор, пулинг, префиксы).
+
+        Сменилась — индекс пересобирается (Index.migrate_embedding_model).
+        Карточка модели и прочие описания в хэш не входят: их правка индекс
+        не трогает.
+        """
+        root = Path(self.embed_model_cfg.model_path)
+        files: list[Path] = []
+        for name in _MODEL_SIGNATURE_FILES:
+            path = root / name
+            if path.is_dir():
+                files += sorted(p for p in path.rglob("*") if p.is_file())
+            elif path.is_file():
+                files.append(path)
+        digest = hashlib.sha256()
+        for path in files:
+            digest.update(path.relative_to(root).as_posix().encode())
+            with open(path, "rb") as f:
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    digest.update(block)
+        return {"model": root.name, "dim": self.embed_dim, "sha256": digest.hexdigest()}
 
     def _ov_token_len(self, text: str):
         # Через count_tokens, а не напрямую в CompiledModel: сплиттер вызывается

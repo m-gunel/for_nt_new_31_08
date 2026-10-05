@@ -6,18 +6,20 @@ Files: *
 Copyright: 2026 ПАО Сбербанк
 License: proprietary
 
-Files: models/*
-Copyright: 2026 ПАО Сбербанк
-License: proprietary
+Files: models/multilingual-e5-small/*
+Copyright: Liang Wang, Nan Yang и соавторы (intfloat/multilingual-e5-small)
+License: MIT
 Comment:
- Каталог модели вшивается в бинарь PyInstaller (см. main.spec) и уезжает в
- пакет внутри /opt/lib-local-rag. Модель — внутренний дообученный вариант
- rubert-tiny2; карточка модели (README.md) в поставку не попадает, её отсекает
- фильтр _MODEL_EXCLUDE в main.spec.
+ Модель эмбеддингов, сконвертированная в OpenVINO IR (статическое INT8);
+ источник — https://huggingface.co/intfloat/multilingual-e5-small, ревизия
+ 614241f622f53c4eeff9890bdc4f31cfecc418b3. Каталог вшивается в бинарь
+ PyInstaller (см. main.spec) и уезжает в пакет внутри /opt/lib-local-rag;
+ описание каталога (README.md) в поставку не попадает, его отсекает фильтр
+ _MODEL_EXCLUDE в main.spec.
  .
- ВНИМАНИЕ, НЕ ЗАКРЫТО: лицензия базовой модели в карточке не указана, а вместе
- с бинарём в /opt едут сторонние библиотеки, которые PyInstaller кладёт в
- _internal (OpenVINO, LanceDB, tantivy, PyMuPDF и другие). Их лицензии этим
+ ВНИМАНИЕ, НЕ ЗАКРЫТО: вместе с бинарём в /opt едут сторонние библиотеки,
+ которые PyInstaller кладёт в _internal (OpenVINO, LanceDB, tantivy, PyMuPDF и
+ другие). Их лицензии этим
  файлом пока НЕ покрыты. До поставки за пределы внутреннего контура требуется
  аудит состава dist/main/_internal и перечисление лицензий здесь — у части
  зависимостей условия строже проприетарных (например, у PyMuPDF).
@@ -30,6 +32,25 @@ Comment:
  сканов в PDF. Источник: https://github.com/tesseract-ocr/tessdata_fast.
  Полный текст лицензии лежит рядом с данными: models/tessdata/LICENSE
  (в пакете — внутри /opt/lib-local-rag вместе с моделью).
+
+License: MIT
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included in all
+ copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
 
 License: proprietary
  Внутреннее программное обеспечение ПАО Сбербанк.

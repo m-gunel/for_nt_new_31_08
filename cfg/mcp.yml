@@ -32,7 +32,7 @@ file_scan_cfg:
   max_size: 104857600 # 100 МиБ
 
 embed_model_cfg:
-  model_path: models/rubert-tiny2_002
+  model_path: models/multilingual-e5-small
 
 email_poll_interval: 3600
 email:

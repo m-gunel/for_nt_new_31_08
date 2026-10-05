@@ -158,7 +158,7 @@ python3 mcp/register_mcp.py                # из распакованного d
 | `lancedb ... doesn't have a wheel for the current platform` | Потерялся `required-environments` в `pyproject.toml` | Вернуть `["sys_platform == 'linux' and platform_machine == 'x86_64'"]` |
 | `ModuleNotFoundError: pytest_asyncio` | Ставили без группы `test` | `uv sync --frozen` (группа `dev` включает `test`) |
 | Почтовые тесты падают с `assert 1 == 4` | Даты фикстуры разошлись с окном `index_last_n_days` | Проверьте `_NOW` в `tests/mbox_fixture.py` — даты должны быть относительными |
-| Демон не поднимается | Нет модели или зависимостей | `/tmp/rag.log`; модель — в `models/rubert-tiny2_002` |
+| Демон не поднимается | Нет модели или зависимостей | `/tmp/rag.log`; модель — в `models/multilingual-e5-small` |
 | Поиск пуст, файлы на месте | Индексация ещё идёт | `curl /api/v1/status`, либо инструмент `local_index_status` |
 | В логе `nothing new`, `total=0` | Папки меняли правкой YAML мимо API | Задать через `POST /config`, либо сбросить `~/.files-search` |
 | Мост: «сайдкар недоступен» | Демон не поднят, либо порт не опубликован | `curl /health`; проверить `~/.files-search/port`; при нестандартной установке задать `LQRAG_URL` |

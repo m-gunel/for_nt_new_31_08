@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import inspect
+import json
 import os
 import shutil
 import time
@@ -82,6 +83,19 @@ _INDEX_BUILD_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 # смешивать их в общую выдачу по умолчанию значит вытеснять ими документы.
 FILES_SOURCE = "files"
 EMAIL_SOURCE = "email"
+
+# Метка модели эмбеддингов, которой посчитан индекс (Index.migrate_embedding_model).
+EMBEDDING_MODEL_FILE = "embedding_model.json"
+
+
+def _write_json(path: Path, data: dict) -> None:
+    """Через временный файл: оборванная запись не оставит битую метку."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(path)
+
+
 SearchSource = Literal["files", "email"]
 
 # starts_with, а не LIKE: в LIKE `_` — «любой символ», и `path like 'email_%'`
@@ -281,6 +295,12 @@ class Index(AbstractAsyncContextManager):
                     "failed to pre-initialize lance table %s", store.table_name
                 )
         async with self:
+            # Первой: если векторы посчитаны другой моделью, индекс сносится, и
+            # остальным миграциям переносить и пересобирать уже нечего.
+            try:
+                await self.migrate_embedding_model()
+            except Exception:
+                lg.exception("сверка модели эмбеддингов с индексом не удалась")
             # До первого прохода: он считает table_was_empty и строит индексы
             # уже по разъехавшимся таблицам. Сканеры к этому моменту подняты.
             try:
@@ -560,6 +580,62 @@ class Index(AbstractAsyncContextManager):
         await self.create_index(self.files_store, force_fts=True, force_vector=True)
         await self.create_index(self.email_store)
         return moved
+
+    async def migrate_embedding_model(self) -> bool:
+        """Пересобрать индекс, посчитанный другой моделью эмбеддингов.
+
+        Векторы разных моделей несравнимы. Без пересборки старые остались бы в
+        таблицах, а запросы считались бы новой моделью: векторный поиск молча
+        превратился бы в шум, а при другой размерности запись падала бы на
+        схеме. Сами файлы при этом не переиндексируются — LSM считает их
+        готовыми. Поэтому при смене модели данные индекса сбрасываются
+        (пользовательский конфиг остаётся) и следующий проход идёт заново.
+
+        Метка модели — `embedding_model.json` рядом с LSM. Индексу версии без
+        метки верим, если размерность векторов в его таблицах совпадает: до
+        метки в продукте была одна модель. True — индекс сброшен.
+        """
+        path = Path(self.cfg.lsm_root) / EMBEDDING_MODEL_FILE
+        current = await asyncio.to_thread(lambda: self.cfg.embed_model_signature)
+        saved = None
+        if path.exists():
+            try:
+                saved = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                lg.warning("метка модели %s не читается — сверяю по таблицам", path)
+        if saved == current:
+            return False
+        if saved is None:
+            dims = {
+                dim
+                for store in (self.files_store, self.email_store)
+                if (dim := await asyncio.to_thread(store.vector_dim)) is not None
+            }
+            if dims <= {current["dim"]}:
+                await asyncio.to_thread(_write_json, path, current)
+                return False
+            lg.warning(
+                "векторы индекса размерности %s, а у модели %s — %s: индекс посчитан "
+                "другой моделью, сбрасываю и индексирую заново",
+                sorted(dims),
+                current["model"],
+                current["dim"],
+            )
+        else:
+            lg.warning(
+                "модель эмбеддингов сменилась (%s → %s): сбрасываю индекс и "
+                "индексирую заново, пользовательский конфиг сохраняется",
+                saved.get("model"),
+                current["model"],
+            )
+        # reset_index выключает индексацию (так требует БТ §5.3 для ручного
+        # сброса); здесь это не сброс по просьбе пользователя — состояние
+        # возвращаем, и первый проход пересчитает всё новой моделью.
+        was_active = self.active
+        await self.reset_index()
+        self.active = was_active
+        await asyncio.to_thread(_write_json, path, current)
+        return True
 
     async def migrate_fts_config(self) -> list[str]:
         """Пересобрать FTS-индексы, построенные не с параметрами `fts_cfg`.

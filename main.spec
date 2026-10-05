@@ -14,10 +14,12 @@ from PyInstaller.utils.hooks import collect_all
 #   * trainer_state.json — история обучения: метрики, шаги, гиперпараметры;
 #   * README.md — карточка модели с HuggingFace, к продукту отношения не имеет.
 #
-# В рантайме модели нужны ровно четыре файла (src/utils/openvino_encoder.py:179-186):
-# openvino/openvino_model_qint8_quantized.{xml,bin} и
-# openvino_tokenizer.{xml,bin}. Остальное оставлено намеренно: отсекаем только
-# то, в чём уверены, а не всё, что кажется лишним. Каталог models/tessdata
+# В рантайме модели нужны (src/utils/openvino_encoder.py, src/config.py):
+# openvino/openvino_model_qint8_quantized.xml с весами — целым .bin или частями
+# .bin.partNN, openvino_tokenizer.{xml,bin}, 1_Pooling/config.json (пулинг и
+# размерность) и config_sentence_transformers.json (префиксы задач). Остальное
+# оставлено намеренно: отсекаем только то, в чём уверены, а не всё, что кажется
+# лишним. Каталог models/tessdata
 # (языковые данные OCR и их LICENSE) едет целиком тем же фильтром.
 _MODEL_EXCLUDE = {
     "rng_state.pth",

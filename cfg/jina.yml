@@ -1,0 +1,25 @@
+# Эксперимент: демон с моделью jina-embeddings-v5-text-nano-retrieval (веса INT4).
+#
+# ЛИЦЕНЗИЯ МОДЕЛИ — CC BY-NC 4.0: только для сравнения качества, не для продукта.
+# Порядок:
+#   make jina-model     # скачать, сжать, сверить с оригиналом → models/jina-v5-nano-retrieval-int4
+#   make run-jina       # демон с этим конфигом (токенизатор — пакет tokenizers)
+#
+# Индекс другой моделью пересоберётся сам (метка ~/.files-search/embedding_model.json),
+# пользовательский конфиг при этом сохраняется. ВНИМАНИЕ: сохранённый ~/.ragsearch/user_conf.yml
+# перебивает paths ниже — папки тогда меняются через POST /api/v1/config.
+
+file_scan_cfg:
+  # Тестовые данные — поправьте под себя.
+  paths:
+    - "~/index_test_files"
+  max_size: 104857600 # 100 МиБ
+
+embed_model_cfg:
+  model_path: models/jina-v5-nano-retrieval-int4
+  ir_file: openvino/openvino_model_int4.xml
+
+email:
+  enabled: false
+
+app_logging_level: INFO

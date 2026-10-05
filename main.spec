@@ -31,9 +31,15 @@ _MODEL_EXCLUDE = {
 
 
 def _model_datas(root="models"):
-    """Пары (файл, каталог назначения) для всего каталога модели, кроме мусора."""
+    """Пары (файл, каталог назначения) для всего каталога модели, кроме мусора.
+
+    Каталоги models/jina-* — эксперимент с моделью под лицензией CC BY-NC 4.0
+    (utils/jina_model.py): коммерческое использование запрещено, в поставку не идут.
+    """
     out = []
     for path in sorted(Path(root).rglob("*")):
+        if any(p.startswith("jina-") for p in path.relative_to(root).parts):
+            continue
         if path.is_file() and path.name not in _MODEL_EXCLUDE:
             out.append((str(path), str(path.parent)))
     return out

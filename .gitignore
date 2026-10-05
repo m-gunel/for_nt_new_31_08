@@ -36,3 +36,5 @@ debian/files
 debian/*.substvars
 debian/.debhelper/
 debian/lib-local-rag/
+# Эксперимент с jina (utils/jina_model.py): лицензия CC BY-NC 4.0, модель в git не кладём.
+models/jina-*/

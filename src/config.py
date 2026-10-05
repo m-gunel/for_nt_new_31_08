@@ -169,6 +169,8 @@ class SplitterCfg(BaseModel):
 class EmbeddingModelConfig(BaseModel):
     model_type: Literal["jina", "st", "fake", "ov"] = "ov"
     model_path: str = str(base_path / "models/multilingual-e5-small")
+    # IR модели внутри model_path: у сжатых только по весам (jina, INT4) — своё имя.
+    ir_file: str = "openvino/openvino_model_qint8_quantized.xml"
     device: str = "cpu"
     batch_size: int = 8
     passages_promt_name: str | None = None
@@ -183,6 +185,7 @@ _MODEL_SIGNATURE_FILES = (
     "openvino_tokenizer.bin",
     "1_Pooling/config.json",
     "config_sentence_transformers.json",
+    "tokenizer.json",  # у моделей без OpenVINO-токенизатора (jina)
 )
 
 
@@ -512,7 +515,9 @@ class Config(BaseSettings):
         lg.debug("loading openvino model")
         from .utils.openvino_encoder import OpenVINOEmbedder
 
-        return OpenVINOEmbedder(self.embed_model_cfg.model_path)
+        return OpenVINOEmbedder(
+            self.embed_model_cfg.model_path, openvino=self.embed_model_cfg.ir_file
+        )
 
     @cached_property
     def lsm(self):

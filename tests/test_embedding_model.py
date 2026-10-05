@@ -17,7 +17,7 @@ import pytest
 from src.config import model_embed_dim
 from src.indexer.indexer import EMBEDDING_MODEL_FILE, Index
 from src.utils.lance_wrapper import LanceWrapper
-from src.utils.openvino_encoder import OpenVINOEmbedder, read_model
+from src.utils.openvino_encoder import HFTokenizer, OpenVINOEmbedder, read_model
 
 # Фикстуры поднимают Index на временном хранилище — переиспользуем их.
 from tests.test_indexing_live import (  # noqa: F401
@@ -87,6 +87,63 @@ def test_mean_pooling_ignores_padding():
     hidden = np.array([[[1.0, 1.0], [3.0, 3.0], [100.0, 100.0]]])
     mask = np.array([[1, 1, 0]])
     np.testing.assert_allclose(e5._pool(hidden, mask), [[2.0, 2.0]])
+
+
+def test_last_token_pooling_skips_padding(tmp_path):
+    """jina берёт вектор последнего настоящего токена, а не последней позиции батча."""
+    (tmp_path / "1_Pooling").mkdir()
+    (tmp_path / "1_Pooling/config.json").write_text(
+        json.dumps({"pooling_mode_lasttoken": True})
+    )
+    emb = OpenVINOEmbedder.__new__(OpenVINOEmbedder)
+    emb._path = str(tmp_path)
+    assert emb.pooling == "lasttoken"
+    hidden = np.arange(12, dtype=np.float32).reshape(2, 3, 2)
+    mask = np.array([[1, 1, 1], [1, 1, 0]])
+    np.testing.assert_allclose(emb._pool(hidden, mask), [hidden[0, 2], hidden[1, 1]])
+
+
+def _tiny_model_with_tokenizer_json(path: Path) -> None:
+    """Каталог модели без OpenVINO-токенизатора: tokenizer.json и IR, где вектор токена — строка таблицы."""
+    from tokenizers import Tokenizer, models, pre_tokenizers, processors
+
+    vocab = {"<pad>": 0, "<eos>": 1, "a": 2, "b": 3, "c": 4}
+    tok = Tokenizer(models.WordLevel(vocab, unk_token="<pad>"))
+    tok.pre_tokenizer = pre_tokenizers.Whitespace()
+    tok.post_processor = processors.TemplateProcessing(
+        single="$A <eos>", special_tokens=[("<eos>", 1)]
+    )
+    tok.save(str(path / "tokenizer.json"))
+    (path / "tokenizer_config.json").write_text(json.dumps({"pad_token": "<pad>"}))
+    (path / "config.json").write_text(
+        json.dumps({"hidden_size": 4, "max_position_embeddings": 8})
+    )
+    (path / "1_Pooling").mkdir()
+    (path / "1_Pooling/config.json").write_text(
+        json.dumps({"word_embedding_dimension": 4, "pooling_mode_lasttoken": True})
+    )
+    table = np.arange(20, dtype=np.float32).reshape(5, 4) + 1
+    ids = ops.parameter([-1, -1], ov.Type.i64, name="input_ids")
+    mask = ops.parameter([-1, -1], ov.Type.i64, name="attention_mask")
+    model = ov.Model([ops.gather(ops.constant(table), ids, 0)], [ids, mask])
+    (path / "openvino").mkdir()
+    ov.save_model(model, path / "openvino/model.xml", compress_to_fp16=False)
+
+
+def test_tokenizer_json_when_no_openvino_tokenizer(tmp_path):
+    """jina: OpenVINO-токенизатор не умеет ignore_merges — энкодер берёт tokenizer.json."""
+    pytest.importorskip("tokenizers")
+    _tiny_model_with_tokenizer_json(tmp_path)
+    emb = OpenVINOEmbedder(str(tmp_path), openvino="openvino/model.xml")
+    try:
+        assert isinstance(emb.tokenizer, HFTokenizer)
+        assert emb.count_tokens("a b") == 3  # два слова и <eos>
+        # У «c» короче: дополнение <pad> справа. Последний настоящий токен у обоих — <eos>,
+        # поэтому векторы совпадают; возьми пулинг последнюю позицию, у «c» был бы <pad>.
+        vecs = emb.encode(["a b", "c"], task="document")
+        np.testing.assert_allclose(vecs[0], vecs[1], rtol=1e-6)
+    finally:
+        emb.shutdown()
 
 
 @pytest.mark.parametrize(

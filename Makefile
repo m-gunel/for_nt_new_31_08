@@ -1,4 +1,4 @@
-.PHONY: build deb dist_mcp dist_extras docker_build openvino spec tests
+.PHONY: build deb dist_mcp dist_extras docker_build openvino spec tests jina-model run-jina
 # Дефис обязателен: .secret создаёт Jenkins и разработчик, в чистом клоне его
 # нет. Без дефиса make отказывается выполнять ЛЮБУЮ цель — включая tests, ruff
 # и dist_mcp, которым токен не нужен вовсе.
@@ -142,6 +142,22 @@ openvino:
 	uv sync --active --native-tls --group torch
 	uv run utils/convert_openvino_tokenizer.py
 	uv run utils/convert_openvino.py
+
+# Эксперимент: jina-embeddings-v5-text-nano (лицензия CC BY-NC 4.0 — только для сравнения,
+# в deb и в git не идёт). Скачать с Hugging Face, сжать веса (по умолчанию INT4), сверить
+# с оригиналом: utils/jina_model.py. Пакеты конвертации берутся из зеркала на один запуск
+# (uv run --with) — uv.lock не меняется. Сертификаты для Hugging Face — системные: в них
+# корпоративный CA. Другой режим или свои файлы: JINA_ARGS="--mode int8 --src /папка".
+JINA_WITH = --with nncf --with huggingface-hub --with tokenizers --with onnxruntime
+SYS_CA = /etc/ssl/certs/ca-certificates.crt
+jina-model:
+	$(if $(wildcard $(SYS_CA)),SSL_CERT_FILE=$(SYS_CA) REQUESTS_CA_BUNDLE=$(SYS_CA)) \
+	uv run --frozen $(JINA_WITH) python utils/jina_model.py $(JINA_ARGS)
+
+# Демон с моделью jina: токенизатор — пакет tokenizers (OpenVINO-токенизатор не умеет
+# ignore_merges), конфиг — cfg/jina.yml, если CONFIG_PATH не задан.
+run-jina:
+	CONFIG_PATH=$${CONFIG_PATH:-cfg/jina.yml} uv run --frozen --with tokenizers python main.py
 
 export_zip:
 	git archive --format=zip --output repo.zip HEAD

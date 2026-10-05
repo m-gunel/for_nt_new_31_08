@@ -111,6 +111,51 @@ def read_model(core: ov.Core, xml: Path) -> ov.Model:
     return core.read_model(xml.read_bytes(), ov.Tensor(data))
 
 
+def _read_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+class HFTokenizer:
+    """Токенизатор из tokenizer.json (пакет tokenizers) — для моделей без OpenVINO-токенизатора.
+
+    openvino-tokenizers 2026.3 не поддерживает ignore_merges у BPE Llama-3, на котором
+    построена jina-embeddings-v5: часть русских слов режется иначе, чем в оригинале
+    («зависимости» — три токена вместо одного), и векторы расходятся (косинус до 0,979).
+    Пакет tokenizers — та же реализация, что в transformers, и его можно звать из
+    нескольких потоков сразу.
+    """
+
+    def __init__(self, model_path: Path):
+        try:
+            from tokenizers import Tokenizer
+        except ImportError as exc:
+            raise RuntimeError(
+                f"у модели {model_path} нет openvino_tokenizer.xml, а пакет tokenizers "
+                "не установлен — запускайте через `make run-jina`"
+            ) from exc
+        self._tok = Tokenizer.from_file(str(model_path / "tokenizer.json"))
+        pad = _read_json(model_path / "tokenizer_config.json").get("pad_token")
+        pad = pad.get("content") if isinstance(pad, dict) else pad
+        self.pad_id = (self._tok.token_to_id(pad) if pad else None) or 0
+        limit = _read_json(model_path / "config.json").get("max_position_embeddings")
+        if isinstance(limit, int):
+            self._tok.enable_truncation(limit)
+        self._tok.no_padding()  # дополняем сами, справа, с маской
+
+    def __call__(self, texts: list[str]) -> dict[str, np.ndarray]:
+        encodings = self._tok.encode_batch(texts)
+        width = max(len(e.ids) for e in encodings)
+        ids = np.full((len(texts), width), self.pad_id, dtype=np.int64)
+        mask = np.zeros((len(texts), width), dtype=np.int64)
+        for i, e in enumerate(encodings):
+            ids[i, : len(e.ids)] = e.ids
+            mask[i, : len(e.ids)] = 1
+        return {"input_ids": ids, "attention_mask": mask}
+
+    def count(self, text: str) -> int:
+        return len(self._tok.encode(text).ids)
+
+
 class _InferChannel:
     """Независимый канал инференса: своя пара infer-request'ов и свой поток.
 
@@ -122,7 +167,7 @@ class _InferChannel:
         self,
         name: str,
         model: ov.CompiledModel,
-        tokenizer: ov.CompiledModel,
+        tokenizer: "ov.CompiledModel | HFTokenizer",
         reset_memory_every_n: int = 100,
     ) -> None:
         self.name = name
@@ -162,7 +207,8 @@ class _InferChannel:
             # release_memory() здесь НЕ вызываем: CompiledModel общая для обоих
             # каналов и для потоков подсчёта токенов, и освобождение её памяти
             # рушит чужие infer-request'ы. Пересоздаём только свои.
-            self._tok_inf = self.tokenizer.create_infer_request()
+            if not isinstance(self.tokenizer, HFTokenizer):
+                self._tok_inf = self.tokenizer.create_infer_request()
             self._model_inf = self.model.create_infer_request()
             gc.collect()
             # gc только что освободил буферы старых infer-request'ов — момент
@@ -178,13 +224,16 @@ class _InferChannel:
         with self._lock:
             self._maybe_reset_memory()
 
-            tok_inf = self.tok_inf
-            tok_inf.start_async(inputs=texts)
-            tok_inf.wait()
-            toks = {
-                x.any_name: v.data
-                for x, v in zip(self.tokenizer.outputs, tok_inf.output_tensors)
-            }
+            if isinstance(self.tokenizer, HFTokenizer):
+                toks = self.tokenizer(texts)
+            else:
+                tok_inf = self.tok_inf
+                tok_inf.start_async(inputs=texts)
+                tok_inf.wait()
+                toks = {
+                    x.any_name: v.data
+                    for x, v in zip(self.tokenizer.outputs, tok_inf.output_tensors)
+                }
 
             inputs = {k: v for k, v in toks.items() if k in self.input_names}
             if "token_type_ids" in self.input_names and "token_type_ids" not in inputs:
@@ -220,7 +269,15 @@ class OpenVINOEmbedder:
         self.model = self.core.compile_model(
             read_model(self.core, Path(model_path) / openvino), device, _cfg
         )
-        self.tokenizer = self.core.compile_model(tokenizer_path, device, _cfg)
+        self.tokenizer: ov.CompiledModel | HFTokenizer
+        if (
+            tokenizer_path.exists()
+            or not (Path(model_path) / "tokenizer.json").exists()
+        ):
+            self.tokenizer = self.core.compile_model(tokenizer_path, device, _cfg)
+        else:
+            # OpenVINO-токенизатора нет (jina: ignore_merges) — tokenizer.json.
+            self.tokenizer = HFTokenizer(Path(model_path))
 
         # Отдельные каналы: интерактивный поиск не должен ждать фоновую индексацию.
         self._channels: dict[Role, _InferChannel] = {
@@ -244,6 +301,8 @@ class OpenVINOEmbedder:
         модель, а сплиттер зовёт подсчёт синхронно из потоков парсинга —
         одновременные вызовы падают с «Infer Request is busy».
         """
+        if isinstance(self.tokenizer, HFTokenizer):
+            return self.tokenizer.count(text)
         request = self._thread_tokenizer_request()
         request.start_async(inputs=[text])
         request.wait()
@@ -275,13 +334,14 @@ class OpenVINOEmbedder:
         return found if any(found.values()) else None
 
     @cached_property
-    def pooling(self) -> Literal["cls", "mean"]:
+    def pooling(self) -> Literal["cls", "mean", "lasttoken"]:
         """Пулинг из 1_Pooling/config.json модели; без файла — CLS, как у rubert-tiny2."""
-        path = Path(self._path) / "1_Pooling" / "config.json"
-        cfg = json.loads(path.read_text()) if path.exists() else {}
+        cfg = _read_json(Path(self._path) / "1_Pooling" / "config.json")
         # Два формата: pooling_mode_mean_tokens до sentence-transformers 6, pooling_mode — с 6.
         if cfg.get("pooling_mode_mean_tokens") or cfg.get("pooling_mode") == "mean":
             return "mean"
+        if cfg.get("pooling_mode_lasttoken") or cfg.get("pooling_mode") == "lasttoken":
+            return "lasttoken"
         return "cls"
 
     def _apply_prefix(self, texts: list[str], task: Literal["query", "document"]):
@@ -333,6 +393,11 @@ class OpenVINOEmbedder:
             mask = attention_mask[..., None].astype(last_hidden_state.dtype)
             summed = (last_hidden_state * mask).sum(axis=1)
             return summed / np.clip(mask.sum(axis=1), 1e-9, None)
+        if self.pooling == "lasttoken":
+            # Последний настоящий токен (у jina — <|end_of_text|>); по маске —
+            # верно при дополнении и справа, и слева.
+            last = (attention_mask * np.arange(attention_mask.shape[1])).argmax(axis=1)
+            return last_hidden_state[np.arange(len(last)), last]
         return self.cls_pooling(last_hidden_state)
 
     @staticmethod

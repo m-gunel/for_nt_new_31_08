@@ -26,7 +26,7 @@ from tests.test_indexing_live import (  # noqa: F401
     isolated_config,
 )
 
-E5 = Path("models/multilingual-e5-small")
+FRIDA = Path("models/rubert-mini-frida")
 
 
 def test_weights_in_parts_load_like_whole_file(tmp_path):
@@ -57,22 +57,23 @@ def test_weights_in_parts_load_like_whole_file(tmp_path):
     np.testing.assert_allclose(got, want, rtol=1e-6)
 
 
-def test_e5_parts_reassemble_to_the_checked_weights():
-    """Части в репозитории — ровно тот файл, что проверяли на стенде."""
+def test_weights_are_the_checked_ones():
+    """Веса в репозитории — ровно тот файл, что проверяли на стенде."""
     import hashlib
 
-    parts = sorted((E5 / "openvino").glob("openvino_model_qint8_quantized.bin.part*"))
-    assert len(parts) == 3 and all(p.stat().st_size < 50 * 2**20 for p in parts)
-    digest = hashlib.sha256(b"".join(p.read_bytes() for p in parts)).hexdigest()
-    assert digest == "de1b89d9da41a6a4edf7a976d87fa0dc4ab54fafc754f8b9d08bbf257c16505b"
+    data = (FRIDA / "openvino/openvino_model_qint8_quantized.bin").read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    assert digest == "a54d8c4eb60db1dd3b4dc7ecf412a0b58aa0c897e18ccfb2f33bb4fa1f40e696"
 
 
 def test_pooling_and_prefixes_come_from_model_files(tmp_path):
-    e5 = OpenVINOEmbedder.__new__(OpenVINOEmbedder)
-    e5._path = str(E5)
-    assert e5.pooling == "mean"
-    assert e5.prefix == {"query": "query: ", "document": "passage: "}
-    assert e5._apply_prefix(["Отчёт ЦБ"], "document") == ["passage: отчёт цб"]
+    frida = OpenVINOEmbedder.__new__(OpenVINOEmbedder)
+    frida._path = str(FRIDA)
+    assert frida.pooling == "mean"
+    assert frida.prefix == {"query": "search_query: ", "document": "search_document: "}
+    assert frida._apply_prefix(["Отчёт ЦБ"], "document") == [
+        "search_document: отчёт цб"
+    ]
 
     # Каталог без описаний — как у rubert-tiny2_002 до дообучения: CLS и без префиксов.
     bare = OpenVINOEmbedder.__new__(OpenVINOEmbedder)
@@ -82,11 +83,11 @@ def test_pooling_and_prefixes_come_from_model_files(tmp_path):
 
 
 def test_mean_pooling_ignores_padding():
-    e5 = OpenVINOEmbedder.__new__(OpenVINOEmbedder)
-    e5._path = str(E5)
+    frida = OpenVINOEmbedder.__new__(OpenVINOEmbedder)
+    frida._path = str(FRIDA)
     hidden = np.array([[[1.0, 1.0], [3.0, 3.0], [100.0, 100.0]]])
     mask = np.array([[1, 1, 0]])
-    np.testing.assert_allclose(e5._pool(hidden, mask), [[2.0, 2.0]])
+    np.testing.assert_allclose(frida._pool(hidden, mask), [[2.0, 2.0]])
 
 
 @pytest.mark.parametrize(
@@ -108,9 +109,9 @@ def test_embed_dim_from_model_files(tmp_path, files, dim):
     assert model_embed_dim(tmp_path) == dim
 
 
-def test_config_takes_dimension_from_e5(config):
-    assert config.embed_dim == 384
-    assert config.ov_model.encode(["проверка"]).shape == (1, 384)
+def test_config_takes_dimension_from_mini_frida(config):
+    assert config.embed_dim == 312
+    assert config.ov_model.encode(["проверка"]).shape == (1, 312)
 
 
 # ---------- пересборка индекса при смене модели ----------
@@ -133,9 +134,9 @@ async def test_fresh_install_just_writes_the_label(index: Index):  # noqa: F811
 @pytest.mark.asyncio
 async def test_same_model_keeps_the_index(index: Index):  # noqa: F811
     store = index.files_store
+    assert await index.migrate_embedding_model() is False  # чистая установка — метка
     await store.add_batch(_chunk_table("/tmp/a.txt", "договор", index.cfg.embed_dim))
-    assert await index.migrate_embedding_model() is False  # метка появилась
-    assert await index.migrate_embedding_model() is False  # и совпала
+    assert await index.migrate_embedding_model() is False  # та же модель
     assert _rows(store) == 1
 
 
@@ -160,27 +161,45 @@ async def test_other_model_resets_the_index(index: Index, active):  # noqa: F811
 
 @pytest.mark.asyncio
 async def test_unlabeled_index_of_other_dimension_is_rebuilt(index: Index):  # noqa: F811
-    """Индекс 1.0.9 и раньше: метки нет, векторы rubert-tiny2 на 312 чисел."""
-    old = LanceWrapper(index.cfg.ld_db_path, 312, table_name="files")
-    await old.add_batch(_chunk_table("/tmp/a.txt", "договор", 312))
+    old = LanceWrapper(index.cfg.ld_db_path, 384, table_name="files")
+    await old.add_batch(_chunk_table("/tmp/a.txt", "договор", 384))
     index.files_store.invalidate_table_cache()
-    assert index.files_store.vector_dim() == 312
 
     assert await index.migrate_embedding_model() is True
     assert index.files_store.vector_dim() is None
-    # Таблица создаётся заново уже под новую модель.
     await index.files_store.add_batch(
         _chunk_table("/tmp/b.txt", "счёт", index.cfg.embed_dim)
     )
-    assert index.files_store.vector_dim() == index.cfg.embed_dim == 384
+    assert index.files_store.vector_dim() == index.cfg.embed_dim == 312
 
 
 @pytest.mark.asyncio
-async def test_unlabeled_index_of_same_dimension_is_trusted(index: Index):  # noqa: F811
+async def test_unlabeled_rubert_index_is_rebuilt_despite_same_dimension(index: Index):  # noqa: F811
+    """Обновление с 1.0.9: метки нет, векторы rubert-tiny2 той же размерности 312.
+
+    По размерности его не отличить от индекса mini-frida — сверка по ней оставила бы
+    старые векторы, и запросы новой моделью искали бы по ним молча вслепую.
+    """
+    store = index.files_store
+    await store.add_batch(_chunk_table("/tmp/a.txt", "договор", 312))
+    assert store.vector_dim() == index.cfg.embed_dim == 312
+
+    assert await index.migrate_embedding_model() is True
+    assert store.vector_dim() is None
+    assert json.loads(_label(index).read_text())["model"] == "rubert-mini-frida"
+
+
+@pytest.mark.asyncio
+async def test_unlabeled_index_is_trusted_for_the_legacy_model(
+    index: Index,  # noqa: F811
+    monkeypatch,
+):
+    """Если модель по-прежнему rubert-tiny2_002, индекс без метки — её, пересобирать нечего."""
+    legacy = {"model": "rubert-tiny2_002", "dim": index.cfg.embed_dim, "sha256": "x"}
+    monkeypatch.setitem(index.cfg.__dict__, "embed_model_signature", legacy)
     store = index.files_store
     await store.add_batch(_chunk_table("/tmp/a.txt", "договор", index.cfg.embed_dim))
-    assert not _label(index).exists()
 
     assert await index.migrate_embedding_model() is False
     assert _rows(store) == 1
-    assert _label(index).exists()
+    assert json.loads(_label(index).read_text()) == legacy

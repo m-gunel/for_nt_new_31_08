@@ -6,13 +6,13 @@ Files: *
 Copyright: 2026 ПАО Сбербанк
 License: proprietary
 
-Files: models/multilingual-e5-small/*
-Copyright: Liang Wang, Nan Yang и соавторы (intfloat/multilingual-e5-small)
+Files: models/rubert-mini-frida/*
+Copyright: sergeyzh (rubert-mini-frida); основа — ai-forever/FRIDA и cointegrated/rubert-tiny2
 License: MIT
 Comment:
- Модель эмбеддингов, сконвертированная в OpenVINO IR (статическое INT8);
- источник — https://huggingface.co/intfloat/multilingual-e5-small, ревизия
- 614241f622f53c4eeff9890bdc4f31cfecc418b3. Каталог вшивается в бинарь
+ Модель эмбеддингов, сконвертированная в OpenVINO IR (INT8 только для весов);
+ источник — https://huggingface.co/sergeyzh/rubert-mini-frida, ревизия
+ 32a82388a9f99c99eca74494731f7ee6e9a9fe3a. Каталог вшивается в бинарь
  PyInstaller (см. main.spec) и уезжает в пакет внутри /opt/lib-local-rag;
  описание каталога (README.md) в поставку не попадает, его отсекает фильтр
  _MODEL_EXCLUDE в main.spec.

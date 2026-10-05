@@ -1,0 +1,36 @@
+{
+  "__version__": {
+    "sentence_transformers": "2.7.0",
+    "transformers": "4.40.1",
+    "pytorch": "2.2.1+cu118"
+  },
+  "prompts": {
+    "query": "search_query: ",
+    "passage": "search_document: ",
+    "CEDRClassification": "categorize_sentiment: ",
+    "GeoreviewClassification": "categorize_entailment: ",
+    "GeoreviewClusteringP2P": "paraphrase: ",
+    "HeadlineClassification": "categorize_topic: ",
+    "InappropriatenessClassification": "categorize_topic: ",
+    "KinopoiskClassification": "categorize_sentiment: ",
+    "MassiveIntentClassification": "categorize_entailment: ",
+    "MassiveScenarioClassification": "categorize_entailment: ",
+    "RuReviewsClassification": "categorize_entailment: ",
+    "RUParaPhraserSTS": "paraphrase: ",
+    "RuSTSBenchmarkSTS": "search_query: ",
+    "STS22": "paraphrase: ",
+    "RuSciBenchGRNTIClassification": "categorize_topic: ",
+    "RuSciBenchGRNTIClusteringP2P": "categorize_topic: ",
+    "RuSciBenchOECDClassification": "categorize_topic: ",
+    "RuSciBenchOECDClusteringP2P": "categorize_topic: ",
+    "SensitiveTopicsClassification": "categorize_topic: ",
+    "TERRa": "categorize_entailment: ",
+    "Classification": "categorize: ",
+    "MultilabelClassification": "categorize: ",
+    "Clustering": "categorize: ",
+    "PairClassification": "categorize: ",
+    "STS": "paraphrase: "
+  },
+  "default_prompt_name": "Classification",
+  "similarity_fn_name": null
+}

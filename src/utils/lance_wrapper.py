@@ -426,6 +426,12 @@ class LanceWrapper:
         field = self.lancedb.open_table(self.table_name).schema.field("vector")
         return getattr(field.type, "list_size", None)
 
+    def row_count(self) -> int:
+        """Строк в таблице на диске; 0 — таблицы нет."""
+        if self.table_name not in self.lancedb.table_names():
+            return 0
+        return self.lancedb.open_table(self.table_name).count_rows()
+
     def drop(self) -> None:
         """Удалить таблицу целиком и забыть её индексы.
 

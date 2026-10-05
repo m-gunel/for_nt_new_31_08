@@ -86,6 +86,8 @@ EMAIL_SOURCE = "email"
 
 # Метка модели эмбеддингов, которой посчитан индекс (Index.migrate_embedding_model).
 EMBEDDING_MODEL_FILE = "embedding_model.json"
+# Модель всех версий до появления метки (1.0.9 и раньше): индекс без метки — её.
+LEGACY_EMBEDDING_MODEL = "rubert-tiny2_002"
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -591,9 +593,10 @@ class Index(AbstractAsyncContextManager):
         готовыми. Поэтому при смене модели данные индекса сбрасываются
         (пользовательский конфиг остаётся) и следующий проход идёт заново.
 
-        Метка модели — `embedding_model.json` рядом с LSM. Индексу версии без
-        метки верим, если размерность векторов в его таблицах совпадает: до
-        метки в продукте была одна модель. True — индекс сброшен.
+        Метка модели — `embedding_model.json` рядом с LSM. Индекс без метки
+        посчитан версией до неё (1.0.9 и раньше), а там была одна модель —
+        rubert-tiny2_002 (`LEGACY_EMBEDDING_MODEL`). По размерности такой индекс
+        не узнать: у rubert-mini-frida она та же, 312. True — индекс сброшен.
         """
         path = Path(self.cfg.lsm_root) / EMBEDDING_MODEL_FILE
         current = await asyncio.to_thread(lambda: self.cfg.embed_model_signature)
@@ -606,20 +609,28 @@ class Index(AbstractAsyncContextManager):
         if saved == current:
             return False
         if saved is None:
+            stores = (self.files_store, self.email_store)
             dims = {
                 dim
-                for store in (self.files_store, self.email_store)
+                for store in stores
                 if (dim := await asyncio.to_thread(store.vector_dim)) is not None
             }
-            if dims <= {current["dim"]}:
+            rows = 0
+            for store in stores:
+                rows += await asyncio.to_thread(store.row_count)
+            same_dim = dims <= {current["dim"]}
+            legacy = current["model"] == LEGACY_EMBEDDING_MODEL and same_dim
+            # Пустой индекс (чистая установка: таблицу заранее создаёт lifespan)
+            # пересчитывать нечего.
+            if rows == 0 or legacy:
                 await asyncio.to_thread(_write_json, path, current)
                 return False
             lg.warning(
-                "векторы индекса размерности %s, а у модели %s — %s: индекс посчитан "
-                "другой моделью, сбрасываю и индексирую заново",
+                "индекс без метки модели посчитан %s (размерность %s), а модель теперь "
+                "%s — сбрасываю и индексирую заново, пользовательский конфиг сохраняется",
+                LEGACY_EMBEDDING_MODEL,
                 sorted(dims),
                 current["model"],
-                current["dim"],
             )
         else:
             lg.warning(

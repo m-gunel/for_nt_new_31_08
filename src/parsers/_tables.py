@@ -13,8 +13,8 @@ from .doc_model import Block
 class Budget:
     """Длина в токенах: дешёвая оценка по символам, токенизатор — только у границы."""
 
-    # 1,6 символа на токен — ниже замеренных минимумов на таблицах ЦБ: 1,83 у rubert-tiny2,
-    # 1,91 у multilingual-e5-small (стенд, 05.10.2026).
+    # 1,6 символа на токен — ниже замеренных минимумов на таблицах ЦБ: 1,83 у rubert-tiny2
+    # и rubert-mini-frida (токенизатор у них общий), 1,91 у multilingual-e5-small.
     SAFE_CHARS_PER_TOKEN = 1.6
 
     def __init__(self, limit: int, count_tokens: Callable[[str], int]):

@@ -168,7 +168,7 @@ class SplitterCfg(BaseModel):
 
 class EmbeddingModelConfig(BaseModel):
     model_type: Literal["jina", "st", "fake", "ov"] = "ov"
-    model_path: str = str(base_path / "models/multilingual-e5-small")
+    model_path: str = str(base_path / "models/rubert-mini-frida")
     device: str = "cpu"
     batch_size: int = 8
     passages_promt_name: str | None = None

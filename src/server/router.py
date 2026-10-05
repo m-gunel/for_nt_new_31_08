@@ -7,9 +7,10 @@ import tempfile
 import threading
 from collections import deque
 from pathlib import Path
+from typing import Annotated
 
 import aiofiles
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, Body, HTTPException, Response
 
 from src.common import IndexingStatus
 from src.indexer import AppIndex, reconfigure_lock, restart_watcher, stop_watcher
@@ -79,16 +80,51 @@ async def status_check(index: AppIndex) -> IndexingStatus:
     return await index.status()
 
 
+# Пример тела для «Try it out» в /docs. Без него Swagger собирает тело из
+# схемы и заполняет каждый фильтр заглушкой «string»: такой запрос отвергается
+# (folder не абсолютный путь) или молча ничего не находит (ext «string»).
+# Первым — запрос без фильтров: все они необязательны.
+_SEARCH_EXAMPLES = {
+    "no_filters": {
+        "summary": "Без фильтров",
+        "value": {
+            "query": "что такое википедия",
+            "limit": 10,
+            "query_type": "hybrid",
+            "sources": ["files"],
+        },
+    },
+    "with_filters": {
+        "summary": "С фильтрами — подставьте свои значения, лишние удалите",
+        "value": {
+            "query": "отпуск",
+            "limit": 10,
+            "filters": {
+                "ext": ["docx", "pdf"],
+                "folder": "~/Документы",
+                "modified_from": "2024-01-01",
+                "modified_to": "2024-12-31",
+                "author": "Иванов",
+            },
+        },
+    },
+}
+
+
 @router.post(
     "/search",
     description=(
         "Поиск документов: limit — документов на источник, у каждого до трёх "
         "лучших фрагментов. Файлы, в имени которых есть код из запроса "
-        "(«ЦБ_21», «5348-У»), идут первыми. filters — отбор по расширению, "
-        "папке, датам и автору"
+        "(«ЦБ_21», «5348-У»), идут первыми. filters — необязательный отбор "
+        "по расширению, папке, датам и автору: без него и при пустых полях "
+        "ищется весь индекс"
     ),
 )
-async def search(request: SearchRequest, index: AppIndex) -> SearchResponse:
+async def search(
+    request: Annotated[SearchRequest, Body(openapi_examples=_SEARCH_EXAMPLES)],
+    index: AppIndex,
+) -> SearchResponse:
     # Индексатор берёт по limit глубокий пул чанков, документы из него
     # собирает и обрезает до limit уже SearchResponse. pinned — документы,
     # найденные по коду из имени файла: индексатор их находит и дочитывает,

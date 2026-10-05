@@ -424,14 +424,14 @@ class SearchFilters(BaseModel):
     отбора пула (prefilter): иначе документы под фильтром вытеснялись бы из
     пула прочими, и выдача фильтра оказывалась бы пустой или короче limit.
     Условия складываются через AND. Даты — включительно с обеих сторон;
-    у строки без даты условие по дате не выполняется.
+    у строки без даты условие по дате не выполняется. Пустое поле («», [])
+    — то же, что его нет: фильтра по нему нет.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     ext: list[str] | None = Field(
         None,
-        min_length=1,
         description='Расширения файлов без точки, регистр не важен: ["docx", "pdf"]',
     )
     folder: str | None = Field(
@@ -462,6 +462,19 @@ class SearchFilters(BaseModel):
         description="Подстрока автора или последнего редактора, регистр не важен",
     )
 
+    @field_validator("*", mode="before")
+    @classmethod
+    def _blank_is_absent(cls, value):
+        """Незаполненное поле формы клиент шлёт пустым, а не убирает: это «не
+        фильтровать», а не ошибка. Пустой author к тому же совпал бы с любым
+        автором, но не с документом без автора и молча резал бы выдачу."""
+        if isinstance(value, str) and not value.strip():
+            return None
+        if isinstance(value, list):
+            value = [v for v in value if not (isinstance(v, str) and not v.strip())]
+            return value or None
+        return value
+
     @field_validator("ext")
     @classmethod
     def _normalize_ext(cls, value: list[str] | None) -> list[str] | None:
@@ -488,12 +501,8 @@ class SearchFilters(BaseModel):
 
     @field_validator("author")
     @classmethod
-    def _author_not_blank(cls, value: str | None) -> str | None:
-        if value is not None and not (value := value.strip()):
-            # Пустая подстрока совпала бы с любым автором, но не с документом
-            # без автора — «фильтр ни о чём», который молча режет выдачу.
-            raise ValueError("author не должен быть пустым")
-        return value
+    def _strip_author(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
 
     @model_validator(mode="after")
     def _ranges_in_order(self) -> "SearchFilters":

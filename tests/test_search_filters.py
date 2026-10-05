@@ -19,6 +19,7 @@ from src.common import CARD_IDX, CARD_KIND
 from src.common.doc_meta import doc_meta_schema
 from src.indexer.indexer import VECTOR_NPROBES, Index
 from src.server.model import SearchFilters, SearchRequest
+from src.server.router import _SEARCH_EXAMPLES
 from src.server.router import search as search_endpoint
 from tests.mcp_fixture import bridge_factory, call_text, stub  # noqa: F401
 from tests.test_indexing_live import index, isolated_config  # noqa: F401
@@ -83,12 +84,33 @@ def test_filters_combine_with_and():
 @pytest.mark.parametrize(
     "filters",
     [
+        {},
         {"ext": []},
+        {"ext": ["", "  "]},
+        {"folder": ""},
+        {"author": "   "},
+        {"modified_from": "", "modified_to": "", "created_from": "", "created_to": ""},
+        {"ext": [], "folder": " ", "author": "", "modified_from": None},
+    ],
+)
+def test_blank_filters_mean_no_filter(filters):
+    """Незаполненные поля формы — «не фильтровать», а не ошибка 422."""
+    request = SearchRequest(query="x", filters=filters)
+    assert request.filters.where() is None
+
+
+def test_blank_items_are_dropped_from_ext():
+    assert SearchFilters(ext=["pdf", ""]).where() == "meta.ext IN ('pdf')"
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
         {"ext": ["docx,pdf"]},
         {"ext": ["d'x"]},
         {"ext": ["."]},
         {"folder": "docs/отчёты"},
-        {"author": "   "},
+        {"folder": "string"},  # заглушка Swagger — не путь
         {"modified_from": "2024-02-01", "modified_to": "2024-01-31"},
         {"created_from": "2024-02-01", "created_to": "2024-01-31"},
         {"modified_to": "3000-01-01"},  # за пределом timestamp[ns] индекса
@@ -99,6 +121,15 @@ def test_filters_combine_with_and():
 def test_bad_filters_are_rejected(filters):
     with pytest.raises(ValidationError):
         SearchRequest(query="x", filters=filters)
+
+
+def test_swagger_examples_are_valid_and_the_first_has_no_filters():
+    """«Try it out» в /docs подставляет первый пример: он должен сразу искать,
+    а не падать на заглушках «string» в фильтрах."""
+    first, *rest = _SEARCH_EXAMPLES.values()
+    assert "filters" not in first["value"]
+    for example in (first, *rest):
+        SearchRequest(**example["value"])
 
 
 # --------------------------------------- where в каждом запросе к таблице ----

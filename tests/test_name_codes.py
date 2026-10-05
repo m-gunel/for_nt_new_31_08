@@ -314,6 +314,7 @@ async def test_search_without_pinned_list_does_not_look_for_codes():
             _Table.searches += 1
             builder = SimpleNamespace()
             for name in (
+                "refine_factor",
                 "nprobes",
                 "distance_type",
                 "vector",

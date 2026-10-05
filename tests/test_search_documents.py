@@ -23,6 +23,7 @@ from src.indexer.indexer import (
     SEARCH_POOL_MAX,
     SEARCH_POOL_MIN,
     VECTOR_NPROBES,
+    VECTOR_REFINE_FACTOR,
     Index,
     search_pool,
 )
@@ -272,13 +273,17 @@ async def test_every_query_type_asks_pool_once(query_type, limit):
     assert len(table.searches) == 1, "копии больше не требуют запроса с запасом"
     kwargs, builder = table.searches[0]
     assert ("limit", (search_pool(limit),)) in builder.calls
+    refine = ("refine_factor", (VECTOR_REFINE_FACTOR,))
     if query_type == "hybrid":
         assert kwargs["fts_columns"] == "text"
         assert ("nprobes", (VECTOR_NPROBES,)) in builder.calls
+        assert refine in builder.calls, "без refine порядок задают PQ-коды"
     elif query_type == "vector":
         assert ("nprobes", (VECTOR_NPROBES,)) in builder.calls
+        assert refine in builder.calls, "без refine порядок задают PQ-коды"
     else:
         assert kwargs["fts_columns"] == "text"
+        assert refine not in builder.calls
 
 
 @pytest.mark.asyncio
@@ -292,6 +297,7 @@ async def test_hybrid_fallback_to_vector_uses_the_same_pool():
     assert vector_kwargs["query_type"] == "vector"
     assert ("limit", (search_pool(30),)) in vector.calls
     assert ("nprobes", (VECTOR_NPROBES,)) in vector.calls
+    assert ("refine_factor", (VECTOR_REFINE_FACTOR,)) in vector.calls
 
 
 @pytest.mark.asyncio
@@ -408,3 +414,32 @@ async def test_live_card_near_by_vector_is_not_a_match(index: Index, query_type)
     items = SearchResponse.from_dataframes([frame], limit=5).results
     assert len(items) == 5
     assert all(i.match == [] for i in items), [i.match for i in items]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query_type", ["hybrid", "text"])
+async def test_live_quoted_phrase_does_not_break_fts(index: Index, query_type):  # noqa: F811
+    """Запрос целиком в кавычках — не синтаксис фразы.
+
+    Строку LanceDB разбирал как фразу, а FTS-индекс без позиций: поиск падал,
+    гибрид молча уходил в чистый вектор (в его кадре нет _score), text
+    отдавал 500.
+    """
+    rows = [
+        (
+            "/docs/риск.txt",
+            "text",
+            "Требования к системе управления операционным риском",
+        ),
+        ("/docs/меню.txt", "text", "Борщ, котлеты, компот"),
+    ]
+    store = index.cfg.lance.files
+    await store.add_batch(_rows_table(rows, index.cfg.ov_model.encode))
+    store.create_fts(force=True)
+
+    (frame,) = await index.search(
+        '"управления операционным риском"', top_k=2, query_type=query_type
+    )
+    assert frame.filter(pl.col("_score").is_not_null())["path"].to_list() == [
+        "/docs/риск.txt"
+    ], "FTS нашёл фразу словами"

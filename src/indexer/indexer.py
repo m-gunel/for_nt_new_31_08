@@ -16,6 +16,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from lancedb.query import MatchQuery
 from lancedb.rerankers import RRFReranker
 
 from src.common import (
@@ -124,7 +125,16 @@ SEARCH_POOL_MAX = 500
 # Сколько разделов IVF-индекса просматривает векторный поиск. Одно значение
 # для чистого вектора и для векторного канала гибрида: иначе гибрид находил бы
 # по смыслу меньше, чем query_type=vector на том же индексе.
-VECTOR_NPROBES = 32
+VECTOR_NPROBES = 64
+
+# Во сколько раз больше кандидатов, чем просили, пересчитывается по полным
+# векторам. Без refine порядок задают PQ-коды (39 подвекторов по 8 бит), и
+# из 50 чанков пула точный поиск совпадал лишь на 0,689. Замер на стенде
+# (40 тыс. строк, 1982 запроса, против точного перебора): вектор nDCG@10
+# −0,024 и Hit@1 −0,042, гибрид −0,011 / −0,022. Число разделов почти ни при
+# чём (все 200 без refine — +0,001); refine 10 при nprobes 64 снимает ≈97%
+# потери ценой ≈3 мс на запрос.
+VECTOR_REFINE_FACTOR = 10
 
 
 def search_pool(limit: int) -> int:
@@ -1464,6 +1474,12 @@ class Index(AbstractAsyncContextManager):
             for source in dict.fromkeys(sources)
         ]
         pool = search_pool(top_k)
+        # Запрос в FTS — готовым MatchQuery, а не строкой. Строку LanceDB
+        # разбирает как синтаксис запроса: целиком в кавычках она становится
+        # фразой, а индекс построен без позиций (src/common/fts.py), и поиск
+        # падает — гибрид молча уходил в чистый вектор, text отдавал 500.
+        # На остальных запросах выдача та же (стенд: топ-50 совпал в 200 из 200).
+        fts_query = MatchQuery(query, "text")
 
         def _filtered(builder):
             # Без фильтра .where не зовём вовсе: пустое условие LanceDB
@@ -1471,16 +1487,18 @@ class Index(AbstractAsyncContextManager):
             return builder if where is None else builder.where(where, prefilter=True)
 
         def _probed(builder):
-            """Разделы IVF для векторного поиска и векторного канала гибрида."""
+            """Разделы IVF и refine для векторного поиска и векторного канала гибрида."""
+            builder = builder.refine_factor(VECTOR_REFINE_FACTOR)
             if where is None:
                 return builder.nprobes(VECTOR_NPROBES)
             # nprobes(n) ставит и минимум, и МАКСИМУМ разделов: с узким
             # фильтром (автор, папка) строки под ним лежат в немногих
-            # разделах, и если среди 32 ближайших к запросу их нет, векторный
-            # канал отдаёт пусто — хотя prefilter обещает выдачу из всего, что
-            # под фильтр подходит. maximum_nprobes(0) разрешает LanceDB
-            # досматривать разделы, пока пул не наберётся. Замер (70 тыс.
-            # строк, 256 разделов, фильтр на 20 строк): 0 из 20 → 20 из 20.
+            # разделах, и если среди VECTOR_NPROBES ближайших к запросу их
+            # нет, векторный канал отдаёт пусто — хотя prefilter обещает
+            # выдачу из всего, что под фильтр подходит. maximum_nprobes(0)
+            # разрешает LanceDB досматривать разделы, пока пул не наберётся.
+            # Замер (70 тыс. строк, 256 разделов, фильтр на 20 строк): 0 из 20
+            # → 20 из 20.
             return builder.minimum_nprobes(VECTOR_NPROBES).maximum_nprobes(0)
 
         def _vector_search(table):
@@ -1494,7 +1512,6 @@ class Index(AbstractAsyncContextManager):
                         )
                     )
                 )
-                # .refine_factor(20)
                 .distance_type("cosine")  # type: ignore
                 .limit(pool)
                 .to_polars()
@@ -1523,7 +1540,7 @@ class Index(AbstractAsyncContextManager):
                         # Фильтр и nprobes гибрида LanceDB передаёт каналам.
                         .distance_type("cosine")  # type: ignore
                         .vector(vec)
-                        .text(query)
+                        .text(fts_query)
                         # Тот же RRF, что по умолчанию, но с оценками каналов:
                         # _score не пуст только у строк, найденных FTS. По нему
                         # выдача отличает карточку, совпавшую с запросом
@@ -1566,7 +1583,7 @@ class Index(AbstractAsyncContextManager):
                     return (
                         _filtered(
                             table.search(
-                                query,
+                                fts_query,
                                 query_type="fts",
                                 # Как в гибриде: только текст чанка.
                                 fts_columns="text",

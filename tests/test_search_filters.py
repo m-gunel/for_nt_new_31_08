@@ -17,7 +17,7 @@ from pydantic import ValidationError
 
 from src.common import CARD_IDX, CARD_KIND
 from src.common.doc_meta import doc_meta_schema
-from src.indexer.indexer import VECTOR_NPROBES, Index
+from src.indexer.indexer import VECTOR_NPROBES, VECTOR_REFINE_FACTOR, Index
 from src.server.model import SearchFilters, SearchRequest
 from src.server.router import _SEARCH_EXAMPLES
 from src.server.router import search as search_endpoint
@@ -462,12 +462,20 @@ async def test_narrow_filter_is_not_lost_in_unprobed_ivf_partitions(
 
 @pytest.mark.asyncio
 async def test_filter_lifts_the_ivf_probe_ceiling_only_with_filter():
-    """Без фильтра — прежние 32 раздела: поиск по всей таблице их и так находит."""
+    """Без фильтра — прежний предел разделов: поиск по всей таблице их и так находит.
+
+    refine — в обеих ветках: под фильтром порядок тоже задают полные векторы.
+    """
+    refine = ("refine_factor", (VECTOR_REFINE_FACTOR,))
     for where, expected, absent in (
-        (None, [("nprobes", (VECTOR_NPROBES,))], "maximum_nprobes"),
+        (None, [("nprobes", (VECTOR_NPROBES,)), refine], "maximum_nprobes"),
         (
             WHERE,
-            [("minimum_nprobes", (VECTOR_NPROBES,)), ("maximum_nprobes", (0,))],
+            [
+                ("minimum_nprobes", (VECTOR_NPROBES,)),
+                ("maximum_nprobes", (0,)),
+                refine,
+            ],
             "nprobes",
         ),
     ):

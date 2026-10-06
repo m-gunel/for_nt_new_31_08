@@ -73,6 +73,8 @@ async def app_life(app: FastAPI):
     lg.info("прогрев модели OpenVINO: компиляция и два канала инференса")
     await cfg.ov_model.async_encode(["test"], role="search")
     await cfg.ov_model.async_encode(["test"], role="index")
+    if cfg.reranker is not None:
+        await cfg.reranker.async_score("test", ["test"])
     lg.info("прогрев завершён за %.1f c", monotonic() - started)
     async with serve_indexer():
         yield

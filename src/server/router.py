@@ -26,6 +26,7 @@ from src.server.model import (
     SearchResponse,
     UserConfig,
 )
+from src.server.rerank import rerank_response
 from src.thunderbird.lazy_iter_mbox import _decode_filename
 from src.utils import AppConfig, get_logger
 from src.utils.filename import clean_filename
@@ -130,16 +131,33 @@ async def search(
     # найденные по коду из имени файла: индексатор их находит и дочитывает,
     # SearchResponse ставит первыми. Фильтры по метаданным уходят в LanceDB
     # условием where и действуют на всё это сразу.
+    #
+    # Переранжирование (эксперимент, reranker_model_cfg.enabled): только для
+    # гибрида — режимы vector и text остаются диагностикой отдельных каналов.
+    # Индексатор берёт reranker_k документов, кросс-энкодер их переставляет,
+    # выдача обрезается до limit (src/server/rerank.py).
+    cfg = getattr(index, "cfg", None)
+    reranker = (
+        getattr(cfg, "reranker", None) if request.query_type == "hybrid" else None
+    )
+    depth = (
+        max(request.limit, cfg.reranker_k) if reranker is not None else request.limit
+    )
     pinned: list[str] = []
     results = await index.search(
         request.query,
-        top_k=request.limit,
+        top_k=depth,
         query_type=request.query_type,
         sources=request.sources,
         pinned=pinned,
         where=request.filters.where() if request.filters else None,
     )
-    return SearchResponse.from_dataframes(results, limit=request.limit, pinned=pinned)
+    response = SearchResponse.from_dataframes(results, limit=depth, pinned=pinned)
+    if reranker is None:
+        return response
+    return await rerank_response(
+        response, request.query, reranker, cfg.reranker_model_cfg.alpha, request.limit
+    )
 
 
 @router.get("/config")

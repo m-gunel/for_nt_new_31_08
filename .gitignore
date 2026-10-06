@@ -36,3 +36,5 @@ debian/files
 debian/*.substvars
 debian/.debhelper/
 debian/lib-local-rag/
+# Эксперимент с реранкером (utils/reranker_model.py): модель собирается на месте.
+models/reranker*/

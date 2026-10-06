@@ -1,4 +1,4 @@
-.PHONY: build deb dist_mcp dist_extras docker_build openvino spec tests
+.PHONY: build deb dist_mcp dist_extras docker_build openvino spec tests reranker-model
 # Дефис обязателен: .secret создаёт Jenkins и разработчик, в чистом клоне его
 # нет. Без дефиса make отказывается выполнять ЛЮБУЮ цель — включая tests, ruff
 # и dist_mcp, которым токен не нужен вовсе.
@@ -142,6 +142,17 @@ openvino:
 	uv sync --active --native-tls --group torch
 	uv run utils/convert_openvino_tokenizer.py
 	uv run utils/convert_openvino.py
+
+# Эксперимент: кросс-энкодер для переранжирования гибридной выдачи (выключен по умолчанию,
+# reranker_model_cfg.enabled). Скачать с Hugging Face, сконвертировать в OpenVINO, сверить с
+# исходной моделью: utils/reranker_model.py → models/reranker/. Пакеты конвертации — из зеркала
+# на один запуск (uv run --with), uv.lock не меняется; transformers 5 — ради ModernBERT (arga).
+# Другая модель или режим: RERANKER_ARGS="--model arga --mode fp16".
+SYS_CA = /etc/ssl/certs/ca-certificates.crt
+RERANKER_WITH = --group torch --with nncf --with huggingface-hub --with "transformers>=5.5"
+reranker-model:
+	$(if $(wildcard $(SYS_CA)),SSL_CERT_FILE=$(SYS_CA) REQUESTS_CA_BUNDLE=$(SYS_CA)) \
+	uv run --frozen $(RERANKER_WITH) python utils/reranker_model.py $(RERANKER_ARGS)
 
 export_zip:
 	git archive --format=zip --output repo.zip HEAD

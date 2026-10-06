@@ -29,9 +29,15 @@ _MODEL_EXCLUDE = {
 
 
 def _model_datas(root="models"):
-    """Пары (файл, каталог назначения) для всего каталога модели, кроме мусора."""
+    """Пары (файл, каталог назначения) для всего каталога модели, кроме мусора.
+
+    models/reranker — эксперимент с переранжированием (utils/reranker_model.py,
+    по умолчанию выключено): в поставку не идёт, пока эксперимент не принят.
+    """
     out = []
     for path in sorted(Path(root).rglob("*")):
+        if path.relative_to(root).parts[0].startswith("reranker"):
+            continue
         if path.is_file() and path.name not in _MODEL_EXCLUDE:
             out.append((str(path), str(path.parent)))
     return out

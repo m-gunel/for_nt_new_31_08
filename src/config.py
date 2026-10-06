@@ -174,8 +174,18 @@ class EmbeddingModelConfig(BaseModel):
 
 
 class RarankerModelConfig(BaseModel):
-    model_name: str = "jinaai/jina-reranker-v2-base-multilingual"
-    device: str = "cpu"
+    """Переранжирование гибридной выдачи кросс-энкодером (эксперимент, выключено).
+
+    Модель собирает `make reranker-model` (utils/reranker_model.py) в model_path:
+    IR кросс-энкодера и токенизатор пары OpenVINO. alpha — вес реранкера в
+    слиянии рангов с гибридом (1 — чистый реранк), src/server/rerank.py.
+    """
+
+    enabled: bool = False
+    model_path: str = str(base_path / "models/reranker")
+    alpha: float = 0.3
+    batch_size: int = 8
+    device: str = "CPU"
 
 
 class Config(BaseSettings):
@@ -186,8 +196,9 @@ class Config(BaseSettings):
     reranker_model_cfg: RarankerModelConfig = Field(default_factory=RarankerModelConfig)
     # Полнотекстовый индекс; индекс с другими параметрами пересобирается при старте.
     fts_cfg: FtsConfig = Field(default_factory=FtsConfig)
-    reranker_k: int = 30
-    reranker_cutoff: float = 0.1
+    # Сколько документов гибрида переставляет реранкер (если он включён).
+    reranker_k: int = 20
+    reranker_cutoff: float = 0.1  # не используется; оставлен ради старых конфигов
     ld_db_path: str = LANCE_URL
     lsm_root: str = str(_root)
     lsm_path: str = LSM_PATH
@@ -338,11 +349,18 @@ class Config(BaseSettings):
         ).to(self.embed_model_cfg.device)
         return model
 
-    # @cached_property
-    # def reranker(self):
-    #     from src.jina_reranker import JinaReranker
+    @cached_property
+    def reranker(self):
+        """Кросс-энкодер переранжирования или None, если он выключен."""
+        cfg = self.reranker_model_cfg
+        if not cfg.enabled:
+            return None
+        from .utils.openvino_reranker import OpenVINOReranker
 
-    #     return JinaReranker(**self.reranker_model_cfg.model_dump())
+        lg.info("реранкер: %s", cfg.model_path)
+        return OpenVINOReranker(
+            cfg.model_path, device=cfg.device.upper(), batch_size=cfg.batch_size
+        )
 
     @cached_property
     def embedder(self):

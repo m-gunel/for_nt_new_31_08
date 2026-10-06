@@ -50,6 +50,21 @@ def test_pure_rerank_follows_the_model_and_keeps_pinned_first():
     assert _paths(order) == ["/d/1.txt", "/d/3.txt", "/d/4.txt", "/d/2.txt", "/d/0.txt"]
 
 
+def test_keep_top_leaves_the_hybrid_first_place_alone():
+    """keep=1: первое место гибрида остаётся, модель переставляет остальные."""
+    items = _response(4).results
+    order = fuse(items, [0.0, 1.0, 2.0, 3.0], alpha=1.0, keep=1)
+    assert _paths(order) == ["/d/0.txt", "/d/3.txt", "/d/2.txt", "/d/1.txt"]
+
+
+def test_keep_top_counts_after_pinned():
+    """Закреплённый по коду из имени — первым, следом — первый документ гибрида."""
+    items = _response(4, pinned=("/d/2.txt",)).results
+    model = {"/d/0.txt": 0.0, "/d/1.txt": 1.0, "/d/2.txt": 9.0, "/d/3.txt": 5.0}
+    order = fuse(items, [model[i.absolute_path] for i in items], alpha=1.0, keep=1)
+    assert _paths(order) == ["/d/2.txt", "/d/0.txt", "/d/3.txt", "/d/1.txt"]
+
+
 def test_zero_weight_keeps_the_hybrid_order():
     items = _response(5).results
     assert _paths(fuse(items, [5.0, 4.0, 3.0, 9.0, 1.0], alpha=0.0)) == _paths(items)
@@ -94,7 +109,7 @@ def test_passage_of_a_card_only_document_is_its_card():
     assert passage(item).startswith("Документ: 0")
 
 
-def _index(frames, reranker=None, k=20, alpha=1.0):
+def _index(frames, reranker=None, k=20, alpha=1.0, keep=0):
     calls = []
 
     async def search(query, top_k, **kw):
@@ -105,7 +120,7 @@ def _index(frames, reranker=None, k=20, alpha=1.0):
         reranker=reranker,
         reranker_k=k,
         reranker_model_cfg=RarankerModelConfig(
-            enabled=reranker is not None, alpha=alpha
+            enabled=reranker is not None, alpha=alpha, keep_top=keep
         ),
     )
     return SimpleNamespace(search=search, cfg=cfg), calls
@@ -120,6 +135,16 @@ async def test_search_reranks_a_deeper_pool_down_to_limit():
     assert calls == [20], "индексатор отдаёт reranker_k документов"
     assert len(reranker.calls[0][1]) == 20
     assert _paths(out.results) == [f"/d/{i}.txt" for i in range(19, 9, -1)]
+
+
+@pytest.mark.asyncio
+async def test_search_keeps_the_hybrid_first_place_by_default():
+    frames = [_frame([(f"/d/{i}.txt", 1.0 - i / 100) for i in range(20)])]
+    index, _ = _index(frames, _Reranker(), keep=RarankerModelConfig().keep_top)
+    out = await search_endpoint(SearchRequest(query="вклад", limit=10), index)
+    assert _paths(out.results) == ["/d/0.txt"] + [
+        f"/d/{i}.txt" for i in range(19, 10, -1)
+    ]
 
 
 @pytest.mark.asyncio
@@ -146,3 +171,4 @@ async def test_disabled_reranker_changes_nothing():
 
 def test_reranker_is_off_by_default():
     assert RarankerModelConfig().enabled is False
+    assert RarankerModelConfig().keep_top == 1

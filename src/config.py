@@ -178,12 +178,14 @@ class RarankerModelConfig(BaseModel):
 
     Модель собирает `make reranker-model` (utils/reranker_model.py) в model_path:
     IR кросс-энкодера и токенизатор пары OpenVINO. alpha — вес реранкера в
-    слиянии рангов с гибридом (1 — чистый реранк), src/server/rerank.py.
+    слиянии рангов с гибридом (1 — чистый реранк), keep_top — сколько первых
+    документов гибрида не переставлять (src/server/rerank.py).
     """
 
     enabled: bool = False
     model_path: str = str(base_path / "models/reranker")
     alpha: float = 0.3
+    keep_top: int = 1
     batch_size: int = 8
     device: str = "CPU"
 

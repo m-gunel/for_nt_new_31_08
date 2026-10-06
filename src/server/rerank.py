@@ -7,6 +7,11 @@
 α — вес реранкера (1 — чистый реранк). Слияние рангов, а не только реранкер: на документах с
 номерами актов и пунктов совпадение слов BM25 бывает точнее модели.
 
+keep — сколько первых документов гибрида (после закреплённых) не переставлять. По умолчанию 1:
+среди однотипных документов (отчёты МСФО разных банков и лет) модель путает банк и период, и с
+переставленным первым местом Hit@1 там падал на 0,075; с keep=1 прирост nDCG@10 тот же (стенд,
+1982 запроса: +0,011), а первый результат — прежний.
+
 Пара для модели — запрос и лучший фрагмент документа со строкой «Документ: <имя>» сверху, как
 строка индекса; у документа без фрагментов (нашёлся одной карточкой) — текст карточки.
 """
@@ -28,10 +33,12 @@ def passage(item) -> str:
     return document_card_text({**meta, "original_name": item.title})
 
 
-def fuse(items: Sequence, scores: Sequence[float], alpha: float) -> list:
-    """Новый порядок: pinned первыми, остальные — по взвешенному RRF рангов."""
+def fuse(items: Sequence, scores: Sequence[float], alpha: float, keep: int = 0) -> list:
+    """Новый порядок: pinned и первые keep документов гибрида — на своих местах, остальные —
+    по взвешенному RRF рангов."""
     pinned = [i for i, item in enumerate(items) if "name_code" in item.match]
     rest = [i for i, item in enumerate(items) if "name_code" not in item.match]
+    pinned, rest = pinned + rest[:keep], rest[keep:]
     by_model = sorted(rest, key=lambda i: scores[i], reverse=True)
     model_rank = {i: r for r, i in enumerate(by_model, 1)}
     hybrid_rank = {i: r for r, i in enumerate(rest, 1)}
@@ -44,7 +51,9 @@ def fuse(items: Sequence, scores: Sequence[float], alpha: float) -> list:
     return [items[i] for i in pinned + fused]
 
 
-async def rerank_response(response, query: str, reranker, alpha: float, limit: int):
+async def rerank_response(
+    response, query: str, reranker, alpha: float, limit: int, keep: int = 0
+):
     """Переставить документы ответа и обрезать до limit. Сбой модели — прежний порядок."""
     items = list(response.results)
     try:
@@ -56,7 +65,7 @@ async def rerank_response(response, query: str, reranker, alpha: float, limit: i
     else:
         for item, value in zip(items, scores):
             item.rerank_score = value
-        ordered = fuse(items, scores, alpha)
+        ordered = fuse(items, scores, alpha, keep)
     # limit — документов на источник, как у SearchResponse.from_dataframes: файлы
     # и почта обрезаются каждый до своего limit.
     taken: dict[bool, int] = {}

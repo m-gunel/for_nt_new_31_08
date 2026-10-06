@@ -155,8 +155,9 @@ async def search(
     response = SearchResponse.from_dataframes(results, limit=depth, pinned=pinned)
     if reranker is None:
         return response
+    rcfg = cfg.reranker_model_cfg
     return await rerank_response(
-        response, request.query, reranker, cfg.reranker_model_cfg.alpha, request.limit
+        response, request.query, reranker, rcfg.alpha, request.limit, rcfg.keep_top
     )
 
 

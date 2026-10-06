@@ -33,7 +33,11 @@ class OpenVINOReranker:
         batch_size: int = 8,
     ):
         core = ov.Core()
-        self.model = core.compile_model(Path(model_path) / ir_file, device, _cfg)
+        # Один stream: у реранкера один канал, и пары одного запроса считаются одним
+        # infer-request'ом. С двумя streams эмбеддера (_cfg) каждому достаётся половина
+        # потоков, и запрос считается вдвое дольше (стенд: 3,1 с против 1,7 с на 20 пар).
+        model_cfg = {**_cfg, op.num_streams(): 1}
+        self.model = core.compile_model(Path(model_path) / ir_file, device, model_cfg)
         # Токенизатор — в FP32: ядро Unigram-токенизатора XLM-R не принимает
         # FP16-тензоры, которые плагин ARM (Apple M1) подставляет по умолчанию.
         tok_cfg = {**_cfg, op.hint.inference_precision(): ov.Type.f32}

@@ -84,13 +84,13 @@ async def test_search_survives_missing_fts_index(index: Index, query_type):  # n
     store = _table_without_fts(index)
     flat = _lancedb_searches_without_fts(store.table)
 
-    frames = await index.search("договор поставки", top_k=5, query_type=query_type)
+    frame = await index.search("договор поставки", top_k=5, query_type=query_type)
 
     if query_type == "text" and not flat:
-        assert frames == [None], "текстовый поиск без индекса — пустая выдача"
+        assert frame is None, "текстовый поиск без индекса — пустая выдача"
     else:
-        assert len(frames) == 1 and frames[0] is not None, frames
-        assert DOC in frames[0]["path"].to_list()
+        assert frame is not None
+        assert DOC in frame["path"].to_list()
 
 
 @pytest.mark.asyncio
@@ -111,19 +111,19 @@ async def test_search_degrades_when_lancedb_reports_missing_fts(
 
     monkeypatch.setattr(table, "search", search)
 
-    frames = await index.search("договор поставки", top_k=5, query_type=query_type)
+    frame = await index.search("договор поставки", top_k=5, query_type=query_type)
 
     if query_type == "hybrid":
-        assert frames[0] is not None and DOC in frames[0]["path"].to_list()
+        assert frame is not None and DOC in frame["path"].to_list()
     else:
-        assert frames == [None]
+        assert frame is None
 
 
 @pytest.mark.asyncio
 async def test_search_on_empty_storage_returns_nothing(index: Index):  # noqa: F811
     """Таблицы ещё нет вовсе: поиск не должен её создавать и не должен падать."""
-    frames = await index.search("что угодно", top_k=5)
-    assert frames == []
+    frame = await index.search("что угодно", top_k=5)
+    assert frame is None
     assert not index.cfg.lance.files.has_table, "поиск не должен создавать таблицу"
 
 

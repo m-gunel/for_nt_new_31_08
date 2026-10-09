@@ -1,38 +1,29 @@
 """Остановка и перезапуск фоновых задач индексатора.
 
-Проход живёт в одной из трёх задач (self.task, rescan_task, emails_task),
-почтовый этап — внутри любой из них. Проверки — на настоящем Index во
-временном хранилище; ручки роутера зовутся напрямую, watcher подменён.
+Проход живёт в одной из двух задач (self.task, rescan_task). Проверки — на
+настоящем Index во временном хранилище; ручки роутера зовутся напрямую,
+watcher подменён.
 """
 
 import asyncio
-import json
-import logging
 import os
-import threading
 import time
 from contextlib import suppress
-from pathlib import Path
 
 import pytest
 import pytest_asyncio
 from pytest import fixture
 
-import src.indexer.scanners.email_scanner as email_scanner_module
 import src.indexer.scanners.files_scanner as files_scanner_module
-import src.parsers as parsers_module
-from src.config import Config, EmailConfig
+from src.config import Config
 from src.indexer.indexer import Index, _await_stopped
-from src.indexer.scanners.email_scanner import FolderState
 from src.server.model import UserConfig
 from src.server.router import (
-    activate_indexing,
     deactivate_indexing,
     reset_indexing,
     update_config,
 )
 from src.utils.lsm_adapter import to_thread as lsm_to_thread
-from tests.mbox_fixture import default_inbox_messages, make_plain_email, make_profile
 
 _TICK = 0.01
 
@@ -47,21 +38,10 @@ async def _wait_until(predicate, timeout: float = 10.0) -> bool:
     return bool(predicate())
 
 
-async def _failed_task(exc: Exception) -> asyncio.Task:
-    """Фоновая задача, упавшая до того, как её стали останавливать."""
-
-    async def boom():
-        raise exc
-
-    task = asyncio.create_task(boom())
-    await asyncio.wait({task})
-    return task
-
-
 async def _fail_passes(index: Index) -> asyncio.Task:
     """Проход падает так же, как в бою: scan_all логирует ошибку и пробрасывает."""
 
-    async def boom(emails_only: bool = False):
+    async def boom():
         raise RuntimeError("Infer Request is busy")
 
     index._scan_all = boom  # type: ignore[method-assign]
@@ -82,32 +62,18 @@ async def _lsm_keys(index: Index, prefix: str) -> list[str]:
 
 @fixture
 def cfg(config: Config, tmp_path, monkeypatch):
-    """Хранилище и user_conf.yml — во временном каталоге, почта выключена."""
+    """Хранилище и user_conf.yml — во временном каталоге."""
     monkeypatch.setattr(config, "data_directory", str(tmp_path / "ragsearch"))
     monkeypatch.setattr(config, "lsm_root", str(tmp_path / "storage"))
     monkeypatch.setattr(config, "lsm_path", str(tmp_path / "storage" / "lsm.ldb"))
     monkeypatch.setattr(config, "ld_db_path", str(tmp_path / "storage" / "lance"))
     monkeypatch.setattr(config, "index_refresh_delay", 0.05)
-    monkeypatch.setattr(config, "email", EmailConfig(enabled=False))
     monkeypatch.setattr(config.file_scan_cfg, "paths", [])
     for cached in ("lance", "user_conf_path", "data_directory_path"):
         config.__dict__.pop(cached, None)
     yield config
     for cached in ("lance", "user_conf_path", "data_directory_path"):
         config.__dict__.pop(cached, None)
-
-
-@fixture
-def mail_root(tmp_path):
-    return make_profile(tmp_path / "tb", {"INBOX": default_inbox_messages()})
-
-
-@fixture
-def email_cfg(cfg: Config, mail_root, monkeypatch):
-    monkeypatch.setattr(
-        cfg, "email", EmailConfig(enabled=True, path_to_email_folder=str(mail_root))
-    )
-    return cfg
 
 
 @fixture
@@ -137,12 +103,6 @@ async def index(cfg: Config):
         yield idx
 
 
-@pytest_asyncio.fixture
-async def email_index(email_cfg: Config):
-    async for idx in _serve(email_cfg):
-        yield idx
-
-
 # --- T008: остановка не поднимает ошибку упавшей задачи ---------------------
 
 
@@ -158,15 +118,6 @@ async def test_stop_index_survives_failed_pass(index: Index):
 
     await index.stop_index()
     await index.stop_index()
-
-
-@pytest.mark.asyncio
-async def test_stop_emails_polling_survives_failed_task(index: Index):
-    index.emails_task = await _failed_task(RuntimeError("запись в Lance"))
-
-    await index.stop_emails_polling()
-
-    assert index.emails_task is None
 
 
 @pytest.mark.asyncio
@@ -206,26 +157,6 @@ async def test_control_endpoints_work_after_failed_pass(
 
 
 @pytest.mark.asyncio
-async def test_activate_works_after_failed_email_polling(
-    email_index: Index, no_watcher
-):
-    """/activate поднимает поллинг заново, даже если прежний упал."""
-
-    async def nothing(emails_only: bool = False):
-        return None
-
-    email_index._scan_all = nothing  # type: ignore[method-assign]
-    dead = await _failed_task(RuntimeError("поллинг упал"))
-    email_index.emails_task = dead
-
-    result = await activate_indexing(email_index)
-
-    assert result.active is True
-    assert email_index.emails_task is not dead
-    assert not email_index.emails_task.done(), "поллинг почты не поднят"
-
-
-@pytest.mark.asyncio
 async def test_lifespan_exit_survives_failed_pass(cfg: Config, monkeypatch):
     """Остановка демона не вылетает исключением упавшего прохода."""
     monkeypatch.setattr(cfg, "autostart_indexing", False)
@@ -234,34 +165,7 @@ async def test_lifespan_exit_survives_failed_pass(cfg: Config, monkeypatch):
         await _fail_passes(index)
 
 
-# --- T032: поллинг почты переживает сбой прохода ----------------------------
-
-
-@pytest.mark.asyncio
-async def test_email_polling_survives_failed_pass(email_index: Index, monkeypatch):
-    """Сбой почтового прохода не убивает поллинг: следующий цикл пробует снова.
-
-    Поднять задачу заново некому, а упавшая ломала бы остановку (T008).
-    """
-    monkeypatch.setattr(email_index.cfg, "email_poll_interval", _TICK)
-    calls: list[bool] = []
-
-    async def flaky(emails_only: bool = False) -> None:
-        calls.append(emails_only)
-        if len(calls) == 1:
-            raise RuntimeError("запись в Lance не удалась")
-
-    email_index.scan_all = flaky  # type: ignore[method-assign]
-
-    await email_index.start_emails_polling(immediate=True)
-
-    assert await _wait_until(lambda: len(calls) >= 2), (
-        "после упавшего прохода поллинг не сделал следующий"
-    )
-    assert not email_index.emails_task.done()
-
-
-# --- T013: остановка гасит и идущий проход, и почтовый этап -----------------
+# --- T013: остановка гасит идущий проход ------------------------------------
 
 
 @pytest.mark.asyncio
@@ -315,7 +219,7 @@ async def test_folder_change_keeps_periodic_rescan_alive(
     """stop_index() гасит и периодический проход, а start_reindex() поднимает его."""
     monkeypatch.setattr(cfg, "full_rescan_interval", 3600.0)
 
-    async def nothing(emails_only: bool = False):
+    async def nothing():
         return None
 
     index._scan_all = nothing  # type: ignore[method-assign]
@@ -330,219 +234,30 @@ async def test_folder_change_keeps_periodic_rescan_alive(
     )
 
 
-@pytest.mark.parametrize("stage", ["collect", "write"])
-@pytest.mark.asyncio
-async def test_email_disable_stops_email_stage_of_running_pass(
-    email_cfg: Config, email_index: Index, no_watcher, monkeypatch, stage: str
-):
-    """Выключение почты обрывает почтовый этап идущего полного прохода.
-
-    Иначе этап дописывает письма в пересозданную таблицу (они находятся при
-    sources=["email"]), а позиции папок — в сброшенное состояние, и при
-    повторном включении mbox пропускается как неизменённый. Сам проход при
-    этом не отменяется.
-    """
-    reached = threading.Event()
-    if stage == "collect":
-        real_iter = email_scanner_module.iter_emails_as_metadata
-
-        def slow_iter(*args, **kwargs):
-            for item in real_iter(*args, **kwargs):
-                reached.set()
-                time.sleep(0.2)
-                yield item
-
-        monkeypatch.setattr(email_scanner_module, "iter_emails_as_metadata", slow_iter)
-    else:
-        real_chunks = parsers_module._process_email_chunks
-
-        async def slow_chunks(*args, **kwargs):
-            reached.set()
-            await asyncio.sleep(0.3)
-            async for chunk in real_chunks(*args, **kwargs):
-                yield chunk
-
-        monkeypatch.setattr(parsers_module, "_process_email_chunks", slow_chunks)
-
-    email_index.task = asyncio.create_task(email_index.scan_all())
-    assert await _wait_until(reached.is_set), "почтовый этап не начался"
-
-    await update_config(
-        UserConfig.model_validate({"email": {"enabled": False}}), email_cfg, email_index
-    )
-    await asyncio.wait({email_index.task})
-
-    assert not email_index.task.cancelled(), "оборван весь проход, а не почтовый этап"
-    assert email_index.email_store.count_matching("true") == 0, "письма дописаны"
-    assert await _lsm_keys(email_index, "email_") == []
-    assert email_index.emails_scanner.folder_state["INBOX"] == FolderState(), (
-        "позиция папки записана в сброшенное состояние"
-    )
-    assert (await email_index.status()).is_indexing is False
-
-
-# --- T058: выключение почты снимает отложенную пересборку её таблицы --------
+# --- T095: закрытие индекса гасит фоновые задачи ---------------------------
 
 
 @pytest.mark.asyncio
-async def test_drop_email_index_clears_refresh_mark(
-    email_index: Index, monkeypatch, caplog
-):
-    """Отложенная пересборка не падает раз в index_refresh_delay на удалённой таблице."""
-    monkeypatch.setattr(email_index.cfg, "index_refresh_delay", 0.2)
-    _ = email_index.email_store.table  # таблица есть, как во время прохода
-    await email_index.ensure_index(email_index.email_store)
-
-    with caplog.at_level(logging.ERROR):
-        await email_index.drop_email_index()
-        await asyncio.sleep(0.6)
-
-    assert email_index.email_store.table_name not in email_index._dirty_stores
-    failures = [r for r in caplog.records if "failed to refresh" in r.getMessage()]
-    assert failures == [], "пересборка ходит в удалённую почтовую таблицу"
-
-
-# --- T059: смена почтового корня закрывает прежний сканер сразу -------------
-
-
-@pytest.mark.asyncio
-async def test_root_change_does_not_resurrect_old_offsets(
-    email_cfg: Config, tmp_path, monkeypatch
-):
-    """Прежний сканер не переписывает offsets.json на остановке демона.
-
-    Иначе выключенная почта после рестарта и повторного включения стартует с
-    позиций старого корня, и письма до них не индексируются.
-    """
-    other_root = make_profile(
-        tmp_path / "tb2",
-        {"INBOX": [make_plain_email("Другой ящик", "тело", msg_id="o@t")]},
-    )
-    index = Index(email_cfg)
+async def test_closing_index_stops_index_refresh(cfg: Config, monkeypatch):
+    """После закрытия индекса пересборка не ходит в закрытые LSM и LanceDB."""
+    monkeypatch.setattr(cfg, "index_refresh_delay", 30.0)
+    index = Index(cfg)
     async with index:
-        index.emails_scanner.folder_state["INBOX"] = FolderState(
-            offset=2295, size=3068, mtime=1
-        )
-        monkeypatch.setattr(
-            email_cfg,
-            "email",
-            EmailConfig(enabled=True, path_to_email_folder=str(other_root)),
-        )
-        await index._ensure_emails_scanner()
-        # Выключение почты: offsets.json снят, позиции сброшены.
-        await index.drop_email_index()
-
-    state = json.loads((Path(email_cfg.lsm_root) / "offsets.json").read_text())
-    assert state["folders"]["INBOX"]["offset"] == 0, (
-        f"на остановке воскрешено состояние прежнего корня: {state}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_root_change_stops_email_stage_of_old_scanner(
-    email_index: Index, email_cfg: Config, tmp_path, monkeypatch
-):
-    """Прежний сканер закрывается только после того, как его этап оборван."""
-    started = asyncio.Event()
-
-    async def nothing(*args, **kwargs):
-        return None
-
-    async def endless_email_pass(collect, scanner, store):
-        if store is email_index.email_store:
-            started.set()
-            await asyncio.Event().wait()
-
-    monkeypatch.setattr(email_index, "reconcile_deleted", nothing)
-    monkeypatch.setattr(email_index, "_run_pass", endless_email_pass)
-    email_index.task = asyncio.create_task(email_index.scan_all())
-    await asyncio.wait_for(started.wait(), 5)
-    other_root = make_profile(tmp_path / "tb2", {"INBOX": default_inbox_messages()})
-    monkeypatch.setattr(
-        email_cfg, "email", EmailConfig(enabled=True, path_to_email_folder=str(other_root))
-    )
-
-    scanner = await email_index._ensure_emails_scanner()
-
-    assert scanner is not None and scanner.path == other_root
-    await asyncio.wait_for(email_index.task, 5)
-
-
-@pytest.mark.asyncio
-async def test_concurrent_root_change_creates_one_scanner(
-    email_index: Index, email_cfg: Config, tmp_path, monkeypatch
-):
-    """Роутер и поллинг, сменившие корень одновременно, получают один сканер."""
-    started = asyncio.Event()
-
-    async def nothing(*args, **kwargs):
-        return None
-
-    async def endless_email_pass(collect, scanner, store):
-        if store is email_index.email_store:
-            started.set()
-            await asyncio.Event().wait()
-
-    monkeypatch.setattr(email_index, "reconcile_deleted", nothing)
-    monkeypatch.setattr(email_index, "_run_pass", endless_email_pass)
-    email_index.task = asyncio.create_task(email_index.scan_all())
-    await asyncio.wait_for(started.wait(), 5)
-    other_root = make_profile(tmp_path / "tb2", {"INBOX": default_inbox_messages()})
-    monkeypatch.setattr(
-        email_cfg,
-        "email",
-        EmailConfig(enabled=True, path_to_email_folder=str(other_root)),
-    )
-
-    created = []
-    create = email_index._create_emails_scanner
-
-    def counting_create():
-        created.append(create())
-        return created[-1]
-
-    monkeypatch.setattr(email_index, "_create_emails_scanner", counting_create)
-
-    first, second = await asyncio.gather(
-        email_index._ensure_emails_scanner(), email_index._ensure_emails_scanner()
-    )
-
-    assert len(created) == 1, "второй вызов создал лишний сканер"
-    assert first is second is email_index.emails_scanner
-    assert first.path == other_root
-    await asyncio.wait_for(email_index.task, 5)
-
-
-# --- T095: закрытие индекса гасит все фоновые задачи ------------------------
-
-
-@pytest.mark.asyncio
-async def test_closing_index_stops_email_polling_and_index_refresh(
-    email_cfg: Config, monkeypatch
-):
-    """После закрытия индекса поллинг и пересборка не ходят в закрытые LSM и LanceDB."""
-    monkeypatch.setattr(email_cfg, "index_refresh_delay", 30.0)
-    index = Index(email_cfg)
-    async with index:
-        await index.start_emails_polling()
         await index.ensure_index()
-        polling, refresh = index.emails_task, index._index_task
+        refresh = index._index_task
     try:
-        assert polling.done(), "поллинг почты пережил закрытие индекса"
         assert refresh.done(), "отложенная пересборка пережила закрытие индекса"
     finally:
-        for task in (polling, refresh):
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+        refresh.cancel()
+        with suppress(asyncio.CancelledError):
+            await refresh
 
 
 @pytest.mark.asyncio
 async def test_await_stopped_keeps_cancel_of_waiter():
-    """Отмена того, кто ждёт остановки этапа, не теряется.
+    """Отмена того, кто ждёт остановки задачи, не теряется.
 
-    Поллинг почты ждёт свёртки почтового этапа при смене корня; если в это
-    время пришёл stop_emails_polling, поллинг обязан завершиться.
+    Иначе ожидающий, отменённый на время свёртки задачи, продолжил бы работу.
     """
     winding_down = asyncio.Event()
 
@@ -558,11 +273,11 @@ async def test_await_stopped_keeps_cancel_of_waiter():
     await asyncio.sleep(0)
     inner.cancel()
 
-    async def polling():
-        await _await_stopped(inner, "почтовый этап")
+    async def waiter():
+        await _await_stopped(inner, "этап")
         return "продолжил"
 
-    outer = asyncio.create_task(polling())
+    outer = asyncio.create_task(waiter())
     await winding_down.wait()
     outer.cancel()
     with pytest.raises(asyncio.CancelledError):

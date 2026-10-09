@@ -18,10 +18,18 @@ import pytest
 from src.indexer.indexer import Index, _is_missing_fts_index, search_pool
 from src.server.model import UserConfig
 from src.server.router import update_config
+
 # Стенд MCP-моста: заглушка сайдкара и мост подпроцессом.
 from tests.mcp_fixture import bridge_factory, call_text, stub  # noqa: F401
+
 # Фикстуры вокруг POST /config и заглушка индекса — из соседнего набора.
-from tests.test_config_reload import RecordingIndex, _nt_body, cfg, journal  # noqa: F401
+from tests.test_config_reload import (  # noqa: F401
+    RecordingIndex,
+    _nt_body,
+    cfg,
+    journal,
+)
+
 # `_hit` и фикстура моста — из контракта моста, а не копией: копии молча
 # разъехались бы при смене схемы SearchResponse.
 from tests.test_mcp_tools_contract import SEARCH, STATUS, _hit, bridge  # noqa: F401
@@ -141,7 +149,9 @@ def test_search_hits_report_ongoing_indexing(stub, bridge):  # noqa: F811
     нет, иначе агент оговаривался бы на каждом ответе.
     """
     stub.set("POST", SEARCH, {"results": [_hit("/docs/договор.docx")], "total": 1})
-    stub.set("GET", STATUS, {"is_indexing": True, "type": "index", "files_to_index": 42})
+    stub.set(
+        "GET", STATUS, {"is_indexing": True, "type": "index", "files_to_index": 42}
+    )
 
     response = bridge.call("local_search", {"query": "договор"})
 
@@ -222,7 +232,9 @@ def test_unrelated_error_is_not_taken_for_missing_fts_index():
     assert not _is_missing_fts_index(IndexError("list index out of range"))
 
 
-_VECTOR_FRAME = pl.DataFrame({"path": ["/tmp/договор.txt"], "text": ["договор поставки"]})
+_VECTOR_FRAME = pl.DataFrame(
+    {"path": ["/tmp/договор.txt"], "text": ["договор поставки"]}
+)
 
 
 class _QueryBuilder:
@@ -263,6 +275,7 @@ class _FakeLanceTable:
     def search(self, *args, **kwargs):
         query_type = kwargs.get("query_type")
         if query_type == "hybrid":
+
             def _boom():
                 raise self.hybrid_error
 
@@ -277,7 +290,7 @@ class _FakeLanceTable:
 
 
 def _index_with_table(table) -> SimpleNamespace:
-    """Минимум, который нужен Index.search: модель эмбеддингов и хранилища."""
+    """Минимум, который нужен Index.search: модель эмбеддингов и хранилище."""
 
     async def async_encode(texts, role=None):
         return [[0.0] * 8]
@@ -286,7 +299,6 @@ def _index_with_table(table) -> SimpleNamespace:
     return SimpleNamespace(
         cfg=SimpleNamespace(ov_model=SimpleNamespace(async_encode=async_encode)),
         files_store=store,
-        email_store=store,
     )
 
 

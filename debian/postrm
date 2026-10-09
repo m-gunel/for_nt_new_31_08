@@ -99,7 +99,8 @@ purge_user_data() {
                 *@*) purge_home "$uid" "/home/${name#*@}@${name%%@*}" "$name" ;;
             esac
         fi
-        # Временные выдачи POST /get_file_path.
+        # Временные выдачи прежних версий (POST /get_file_path): в них письма
+        # и вложения.
         find /tmp -maxdepth 1 -name 'rag_file_*' -user "$uid" \
             -exec rm -rf {} + 2>/dev/null || true
     done

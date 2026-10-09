@@ -5,17 +5,8 @@
 случайным куском текста.
 """
 
-import aiofiles
-import pytest
-
 from src.common import CARD_IDX, CARD_KIND, document_card_text
-from src.parsers import _process_email_chunks, file_chunks, read_document_text
-from src.thunderbird.lazy_iter_mbox import iter_emails_as_metadata
-from tests.mbox_fixture import (
-    make_email_with_attachment,
-    make_profile,
-    minimal_docx,
-)
+from src.parsers import file_chunks, read_document_text
 
 
 def test_card_text_lists_nonempty_properties_in_order():
@@ -128,40 +119,3 @@ def test_no_card_for_document_without_chunks(tmp_path):
 def test_full_text_has_no_card(tmp_path):
     path = _txt(tmp_path / "заметка.txt", "Заметка о встрече по бюджету отдела.")
     assert read_document_text(path) == "Заметка о встрече по бюджету отдела."
-
-
-@pytest.mark.asyncio
-async def test_email_attachment_gets_card_body_does_not(tmp_path):
-    msg = make_email_with_attachment(
-        "Отчёт за квартал",
-        "Коллеги, во вложении отчёт за квартал.",
-        msg_id="card-1@fixture",
-        filename="Отчёт ЦБ_21.docx",
-        payload=minimal_docx("во вложении квартальные цифры по марже банка"),
-        maintype="application",
-        subtype="vnd.openxmlformats-officedocument.wordprocessingml.document",
-    )
-    root = make_profile(tmp_path / "tb-profile", {"INBOX": [msg]})
-    [meta] = [
-        m
-        for _start, m in iter_emails_as_metadata(
-            str(root / "INBOX"), prefix="email_INBOX:"
-        )
-        if m is not None
-    ]
-
-    async def fail_cb(meta, *, permanent):
-        raise AssertionError(f"письмо не разобрано: {permanent=}")
-
-    async with aiofiles.open(root / "INBOX", "rb") as f:
-        rows = [c async for c in _process_email_chunks({"INBOX": f}, meta, fail_cb)]
-
-    body = [r for r in rows if r["path"].endswith(":body")]
-    attachment = [r for r in rows if r["path"].endswith(":Отчёт ЦБ_21.docx")]
-    assert body and attachment and len(body) + len(attachment) == len(rows)
-    assert all(r.get("kind") != CARD_KIND for r in body)
-    assert [r["kind"] for r in attachment][-1] == CARD_KIND
-    assert sum(r["kind"] == CARD_KIND for r in attachment) == 1
-    card = attachment[-1]
-    assert card["text"].startswith("Документ: Отчёт ЦБ_21")
-    assert card["file_meta"] == meta

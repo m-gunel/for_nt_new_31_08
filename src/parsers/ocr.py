@@ -231,7 +231,7 @@ def recognize(file: BinaryIO, pages: list[int]) -> dict[int, str]:
         return {}
     path = getattr(file, "name", None)
     if not isinstance(path, str) or not Path(path).is_file():
-        _warn_once("memory", "OCR пропускает PDF без файла на диске (вложения писем)")
+        _warn_once("memory", "OCR пропускает PDF без файла на диске")
         return {}
     sha = _sha256(file)
     cached = _load(sha)

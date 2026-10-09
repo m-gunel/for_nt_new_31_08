@@ -36,13 +36,11 @@ def test_config_import_does_not_build_server():
 
 def test_user_config_models_are_one_class():
     """Роутер, конфиг и тесты видят один и тот же класс, а не копии."""
-    import src.config as config_module
     from src.common import user_config
     from src.server import model
 
     assert model.UserConfig is user_config.UserConfig
     assert model.SberchatConfig is user_config.SberchatConfig
-    assert model.EmailConfig is user_config.EmailConfig is config_module.EmailConfig
 
 
 @pytest.mark.parametrize(

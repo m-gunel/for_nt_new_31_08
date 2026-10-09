@@ -76,7 +76,7 @@ def test_search_response_has_place_and_document_and_no_prefix():
             },
         ]
     )
-    item = SearchResponse.from_dataframes([frame]).results[0]
+    item = SearchResponse.from_dataframe(frame).results[0]
     chunk = item.chunks[0]
     assert (
         chunk.content == "Текст фрагмента"
@@ -112,7 +112,7 @@ def test_old_rows_have_no_place_and_keep_text():
             }
         ]
     )
-    item = SearchResponse.from_dataframes([frame]).results[0]
+    item = SearchResponse.from_dataframe(frame).results[0]
     assert item.chunks[0].content == "Документ: другой файл\nтекст"
     assert item.chunks[0].page_start is None and item.chunks[0].section is None
 

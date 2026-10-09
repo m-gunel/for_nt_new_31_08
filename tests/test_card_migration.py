@@ -124,13 +124,11 @@ async def test_first_indexing_pass_migrates_cards_once(index: Index, monkeypatch
     monkeypatch.setattr(index, "migrate_document_cards", counted)
     monkeypatch.setattr(index, "reconcile_deleted", nothing)
     monkeypatch.setattr(index, "_run_pass", nothing)
-    monkeypatch.setattr(index, "start_emails_polling", nothing)
 
     await index._scan_all()
     assert set(_cards(index)) == set(OLD_DOCS)
     await index._scan_all()
-    await index._scan_all(emails_only=True)
-    assert calls == [1], "сверка карточек — раз на процесс, только в файловом проходе"
+    assert calls == [1], "сверка карточек — раз на процесс"
 
 
 @pytest.mark.asyncio

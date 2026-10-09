@@ -78,9 +78,9 @@ def test_delete_prefix_leaves_no_open_cursor(table: LSMTable[str]):
     for i in range(50):
         table.set(f"/doc{i:03d}", "v")
     for i in range(50):
-        table.set(f"email_INBOX:{i}", "v")
+        table.set(f"/old/doc{i:03d}", "v")
 
-    table.delete_prefix("email_")
+    table.delete_prefix("/old/")
 
     assert [k for k, _ in table.items()] == [f"/doc{i:03d}" for i in range(50)]
     table.close()
@@ -90,8 +90,8 @@ def test_parallel_access_survives_and_stays_consistent(tmp_path):
     """Одновременная работа нескольких потоков не роняет процесс.
 
     Связка как в POST /config: полный обход таблицы (сверка удалённых файлов)
-    параллельно с записями, точечными чтениями и удалением по префиксу (сброс
-    почтового индекса).
+    параллельно с записями, точечными чтениями и удалением по префиксу (папку
+    убрали из индексируемых).
     """
     result = _run_isolated(f"""
         import threading
@@ -106,7 +106,7 @@ def test_parallel_access_survives_and_stays_consistent(tmp_path):
         for i in range(2000):
             table.set(f"/home/user/doc_{{i:05d}}.pdf", "x")
         for i in range(2000):
-            table.set(f"email_INBOX:{{i}}", "y")
+            table.set(f"/home/user/old/doc_{{i:05d}}.pdf", "y")
 
         stop = threading.Event()
         errors = []
@@ -136,7 +136,7 @@ def test_parallel_access_survives_and_stays_consistent(tmp_path):
             table.set("/home/user/doc_00001.pdf", "z")
 
         def wipe_prefix():
-            table.delete_prefix("email_")
+            table.delete_prefix("/home/user/old/")
 
         threads = [
             threading.Thread(target=guard(fn))
@@ -152,7 +152,7 @@ def test_parallel_access_survives_and_stays_consistent(tmp_path):
         assert not errors, errors[:3]
         # Таблица осталась работоспособной, а не «выжила молча».
         assert table.get("/home/user/doc_00002.pdf") == "x"
-        assert not [k for k, _ in table.items() if k.startswith("email_")]
+        assert not [k for k, _ in table.items() if k.startswith("/home/user/old/")]
         table.close()
         print("OK")
     """)

@@ -15,7 +15,7 @@ import pytest
 import pytest_asyncio as pa_fixture
 from pytest import fixture
 
-from src.config import Config, EmailConfig
+from src.config import Config
 from src.indexer.indexer import Index, _is_missing_fts_index
 from src.indexer.watcher.watcher import Watcher
 from src.server.router import update_config
@@ -43,14 +43,13 @@ def corpus(tmp_path):
 
 @fixture
 def nt_config(config: Config, tmp_path, corpus, monkeypatch):
-    """Конфиг стенда: своё хранилище, почта выключена, корпус под рукой."""
+    """Конфиг стенда: своё хранилище, корпус под рукой."""
     storage = tmp_path / "storage"
     monkeypatch.setattr(config, "lsm_root", str(storage))
     monkeypatch.setattr(config, "lsm_path", str(storage / "lsm.ldb"))
     monkeypatch.setattr(config, "ld_db_path", str(storage / "lance"))
     monkeypatch.setattr(config, "data_directory", str(tmp_path / "ragsearch"))
     monkeypatch.setattr(config, "index_refresh_delay", 0.05)
-    monkeypatch.setattr(config, "email", EmailConfig(enabled=False))
     monkeypatch.setattr(config.file_scan_cfg, "paths", [str(corpus)])
     for cached in ("lance", "user_conf_path", "data_directory_path"):
         config.__dict__.pop(cached, None)
@@ -68,7 +67,6 @@ async def nt_index(nt_config: Config):
         finally:
             if idx._index_task is not None:
                 idx._index_task.cancel()
-            await idx.stop_emails_polling()
 
 
 async def _search(index: Index, query: str = "договор отчёт"):
@@ -147,12 +145,10 @@ async def test_search_works_before_indexes_are_built(nt_index: Index):
     await nt_index.process_stream(nt_index.files_scanner.iter(endless=False))
     assert await nt_index.files_store.count_rows() > 0, "строки должны быть"
 
-    result = await _search(nt_index)
+    frame = await _search(nt_index)
 
-    assert len(result) == 1 and result[0] is not None, (
-        "поиск обязан отвечать до пересборки индексов"
-    )
-    names = [Path(p).name for p in result[0]["path"].to_list()]
+    assert frame is not None, "поиск обязан отвечать до пересборки индексов"
+    names = [Path(p).name for p in frame["path"].to_list()]
     assert any(n.startswith("документ_") for n in names), (
         f"в выдаче должны быть документы корпуса: {names}"
     )

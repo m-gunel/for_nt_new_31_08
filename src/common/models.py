@@ -4,20 +4,10 @@ from pydantic import BaseModel, Field
 
 
 class IndexingStatus(BaseModel):
-    files_to_index: int = Field(
-        ...,
-        description=(
-            "Всего элементов в очереди на индексацию: файлы + письма. "
-            "Разбивка — в queued_files и queued_emails"
-        ),
-    )
+    files_to_index: int = Field(..., description="Всего файлов в очереди на индексацию")
     queued_files: int = Field(
         0,
         description="Кол-во файлов в очереди на индексацию",
-    )
-    queued_emails: int = Field(
-        0,
-        description="Кол-во писем в очереди на индексацию",
     )
     files_indexed: int = Field(
         0,

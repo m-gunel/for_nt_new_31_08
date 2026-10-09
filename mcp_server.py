@@ -767,33 +767,6 @@ def _optional_enum(args, name, default, allowed):
     return value
 
 
-def _require_bool(args, name):
-    value = args.get(name)
-    if not isinstance(value, bool):
-        raise InvalidParams("параметр '%s' обязателен и должен быть true или false" % name)
-    return value
-
-
-def _optional_sources(args):
-    value = args.get("sources")
-    if value is None:
-        return ["files"]
-    if not isinstance(value, list) or not value:
-        raise InvalidParams("параметр 'sources' должен быть непустым списком")
-    allowed = ("files", "email")
-    value = [v.strip().lower() if isinstance(v, str) else v for v in value]
-    for item in value:
-        if item not in allowed:
-            raise InvalidParams(
-                "недопустимый источник %r в 'sources'. Возможные: %s"
-                % (item, ", ".join(allowed))
-            )
-    if len(set(value)) != len(value):
-        # Повтор дал бы двойной top_k из одной таблицы — сайдкар это отвергает.
-        raise InvalidParams("источники в 'sources' не должны повторяться")
-    return list(value)
-
-
 _EXT_RE = re.compile(r"[0-9a-z]+")
 # ASCII: strptime в _optional_date, в отличие от date.fromisoformat, принимает
 # и не-ASCII цифры («２０２４»), отсечь их может только шаблон.
@@ -1045,10 +1018,9 @@ def _search_entry(item, number):
     path = item.get("absolute_path") or item.get("id") or "?"
     item_type = item.get("type", "file")
     title = item.get("title") or path
-    note = "" if item_type == "file" else "  ← не файл на диске, читать нечем"
     lines = [
-        "%d. %s (тип=%s, путь=%s%s)%s"
-        % (number, title, item_type, path, _format_score(item.get("score")), note)
+        "%d. %s (тип=%s, путь=%s%s)"
+        % (number, title, item_type, path, _format_score(item.get("score")))
     ]
     match = [m for m in (item.get("match") or []) if isinstance(m, str)]
     marks = [label for key, label in _MATCH_LABELS if key in match]
@@ -1149,20 +1121,16 @@ def _layout_search(results):
 
 
 def _tool_search(args):
-    _reject_unknown(
-        args, ("query", "limit", "query_type", "sources") + _SEARCH_FILTER_ARGS
-    )
+    _reject_unknown(args, ("query", "limit", "query_type") + _SEARCH_FILTER_ARGS)
     query = _require_str(args, "query")
     limit = _optional_int(args, "limit", 10, 1, 50)
     query_type = _optional_enum(args, "query_type", "hybrid", ("hybrid", "vector", "text"))
-    sources = _optional_sources(args)
     filters = _search_filters(args)
 
     payload = {
         "query": query,
         "limit": limit,
         "query_type": query_type,
-        "sources": sources,
     }
     # Без фильтров поля нет вовсе: старые демоны и контрактные тесты ждут тело
     # без него.
@@ -1248,14 +1216,12 @@ def _tool_index_status(args):
     else:
         state = "идёт" if is_indexing else "не идёт"
     text = (
-        "Индексация: %s\nФаза: %s\nВ очереди всего: %s (файлов: %s, писем: %s)\n"
+        "Индексация: %s\nФаза: %s\nВ очереди файлов: %s\n"
         "Собрано на этапе preindex: %s"
         % (
             state,
             status.get("type", "?"),
             status.get("files_to_index", "?"),
-            status.get("queued_files", "?"),
-            status.get("queued_emails", "?"),
             status.get("total_files", "?"),
         )
     )
@@ -1514,10 +1480,6 @@ def _read_text(path, ext):
 def _tool_read_file(args):
     _reject_unknown(args, ("absolute_path",))
     raw_path = _require_str(args, "absolute_path")
-    if raw_path.startswith("email_"):
-        raise ToolError(
-            "это ключ письма из выдачи поиска, а не путь на диске — прочитать нечем"
-        )
     # Путь, как его хранит индекс: ~ раскрыт, «..» снят, ссылки не раскрыты.
     # Он же уходит демону: свои HOME и cwd раскрыли бы raw_path иначе.
     path = os.path.abspath(os.path.expanduser(raw_path))
@@ -1743,20 +1705,6 @@ def _tool_remove_path(args):
     return text, {"path": path, "removed": True}
 
 
-def _tool_set_email(args):
-    _reject_unknown(args, ("enabled",))
-    enabled = _require_bool(args, "enabled")
-    # Частичный апдейт поддержан сайдкаром: список папок этим запросом не
-    # затрагивается. Рестарт демона не нужен — сканер поднимается лениво.
-    _http_json("POST", "/api/v1/config", {"email": {"enabled": enabled}})
-    actual = _http_json("GET", "/api/v1/config").get("email", {}).get("enabled")
-    return (
-        "Почтовая индексация %s (email.enabled=%s)"
-        % ("включена" if enabled else "выключена", actual),
-        {"email_enabled": actual},
-    )
-
-
 def _tool_trigger_rescan(args):
     _reject_unknown(args, ())
     status = _http_json("GET", "/api/v1/status")
@@ -1894,15 +1842,6 @@ READ_TOOLS = [
                         "text — только точные слова"
                     ),
                 },
-                "sources": {
-                    "type": "array",
-                    "items": {"type": "string", "enum": ["files", "email"]},
-                    "default": ["files"],
-                    "description": (
-                        "files — файлы на диске (по умолчанию); email — письма, "
-                        "работает только если включена почтовая индексация"
-                    ),
-                },
                 "ext": {
                     "type": ["string", "array"],
                     "items": {"type": "string"},
@@ -2028,20 +1967,6 @@ WRITE_TOOLS = [
         "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
     },
     {
-        "name": "local_set_email",
-        "description": (
-            "Включает или выключает индексацию почты. Выключение снимает письма "
-            "с индекса. Рестарт демона не нужен."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {"enabled": {"type": "boolean"}},
-            "required": ["enabled"],
-            "additionalProperties": False,
-        },
-        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
-    },
-    {
         "name": "local_trigger_rescan",
         "description": (
             "Форсирует переобход всех индексируемых папок без потери индекса. "
@@ -2059,7 +1984,6 @@ _HANDLERS = {
     "local_list_paths": _tool_list_paths,
     "local_add_path": _tool_add_path,
     "local_remove_path": _tool_remove_path,
-    "local_set_email": _tool_set_email,
     "local_trigger_rescan": _tool_trigger_rescan,
 }
 _WRITE_TOOL_NAMES = {tool["name"] for tool in WRITE_TOOLS}

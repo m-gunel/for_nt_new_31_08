@@ -15,16 +15,6 @@ file_scan_cfg: # список директорий для сканировани
 embed_model_cfg:
   model_path: models/rubert-tiny2_002
 
-# user_home: /home/work/<логин>@sigma.sbrf.ru  # переопределить домашний каталог
-email_poll_interval: 60
-email:
-  enabled: false # управляем индексацией почты
-  index_last_n_days: 30
-# Пороги размера для почты. Порог письма должен быть выше порога вложения:
-# вложение лежит в письме в base64 и занимает примерно на треть больше.
-email_scan_cfg:
-  max_message_size: 50331648 # 48 МиБ
-  max_attachment_size: 31457280 # 30 МиБ
 app_logging_level: INFO
 # Полнотекстовый индекс (BM25), умолчания — в src/common/fts.py. Индекс с другими
 # параметрами пересобирается при старте демона (секунды, эмбеддинги не пересчитываются).

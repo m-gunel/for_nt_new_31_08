@@ -1,7 +1,7 @@
 """Выдача поиска — документы, а не чанки.
 
-limit в /search — число документов на источник, иначе длинный документ
-занимал бы места соседей. Индексатор берёт из таблицы пул чанков на канал
+limit в /search — число документов, иначе длинный документ занимал бы места
+соседей. Индексатор берёт из таблицы пул чанков на канал
 (`search_pool`), SearchResponse собирает из него документы: порядок — по
 лучшей строке, до трёх фрагментов на документ, карточка документа — не
 фрагмент, а отметка "card" в `match`.
@@ -63,7 +63,7 @@ def test_limit_counts_documents_even_if_pool_starts_with_one_document():
     rows = [("/docs/длинный.pdf", 1.0 - i * 0.001) for i in range(30)]
     rows += [(f"/docs/д{i:02}.txt", 0.5 - i * 0.01) for i in range(15)]
 
-    response = SearchResponse.from_dataframes([_frame(rows)], limit=10)
+    response = SearchResponse.from_dataframe(_frame(rows), limit=10)
 
     paths = [i.absolute_path for i in response.results]
     assert paths == ["/docs/длинный.pdf", *(f"/docs/д{i:02}.txt" for i in range(9))]
@@ -74,7 +74,7 @@ def test_document_keeps_at_most_three_best_fragments():
     rows = [("/docs/a.pdf", s) for s in (0.3, 0.9, 0.5, 0.7, 0.8)]
     rows.append(("/docs/b.pdf", 0.6))
 
-    items = SearchResponse.from_dataframes([_frame(rows)], limit=10).results
+    items = SearchResponse.from_dataframe(_frame(rows), limit=10).results
 
     assert MAX_FRAGMENTS_PER_DOC == 3
     assert [c.score for c in items[0].chunks] == pytest.approx([0.9, 0.8, 0.7])
@@ -91,7 +91,7 @@ def test_card_is_a_match_not_a_fragment():
         ("/docs/c.pdf", 0.5),
     ]
 
-    items = SearchResponse.from_dataframes([_frame(rows)], limit=10).results
+    items = SearchResponse.from_dataframe(_frame(rows), limit=10).results
 
     assert [i.absolute_path for i in items] == [
         "/docs/b.pdf",
@@ -109,8 +109,8 @@ def test_card_is_a_match_not_a_fragment():
 
 
 def test_document_found_only_by_card_has_title_and_no_fragments():
-    items = SearchResponse.from_dataframes(
-        [_frame([("/docs/ЦБ_21.pdf", 0.9, CARD_KIND), ("/docs/a.pdf", 0.5)])],
+    items = SearchResponse.from_dataframe(
+        _frame([("/docs/ЦБ_21.pdf", 0.9, CARD_KIND), ("/docs/a.pdf", 0.5)]),
         limit=10,
     ).results
 
@@ -128,7 +128,7 @@ def test_card_does_not_take_a_slot_of_its_own():
         ("/docs/c.pdf", 0.6),
     ]
 
-    items = SearchResponse.from_dataframes([_frame(rows)], limit=2).results
+    items = SearchResponse.from_dataframe(_frame(rows), limit=2).results
 
     assert [i.absolute_path for i in items] == ["/docs/a.pdf", "/docs/b.pdf"]
 
@@ -143,7 +143,7 @@ def test_rows_beyond_limit_still_complete_selected_documents():
         ("/docs/b.pdf", 0.5, CARD_KIND),
     ]
 
-    items = SearchResponse.from_dataframes([_frame(rows)], limit=2).results
+    items = SearchResponse.from_dataframe(_frame(rows), limit=2).results
 
     assert [i.absolute_path for i in items] == ["/docs/a.pdf", "/docs/b.pdf"]
     assert len(items[0].chunks) == 2
@@ -161,7 +161,7 @@ def test_copies_collapse_into_one_document_with_card():
         ("/w/план.pdf", 0.6, "text", "3"),
     ]
 
-    response = SearchResponse.from_dataframes([_frame(rows)], limit=2)
+    response = SearchResponse.from_dataframe(_frame(rows), limit=2)
 
     assert [(i.absolute_path, i.duplicates, i.match) for i in response.results] == [
         ("/x/отчёт.pdf", ["/y/отчёт.pdf"], ["card"]),
@@ -174,22 +174,9 @@ def test_copies_collapse_into_one_document_with_card():
 def test_total_is_number_of_returned_documents():
     rows = [(f"/docs/{i}.txt", 1.0 - i / 100) for i in range(7) for _ in range(4)]
 
-    assert SearchResponse.from_dataframes([_frame(rows)], limit=5).total == 5
-    assert SearchResponse.from_dataframes([_frame(rows)]).total == 7  # без limit — все
-    assert SearchResponse.from_dataframes([None], limit=5).total == 0
-
-
-def test_each_source_gets_its_own_document_limit():
-    files = _frame([(f"/docs/{i}.txt", 0.9 - i / 100) for i in range(12)])
-    emails = _frame([(f"email_INBOX:{i}:{i}:body", 0.95 - i / 100) for i in range(12)])
-
-    response = SearchResponse.from_dataframes([files, emails], limit=10)
-
-    types = [i.type for i in response.results]
-    assert types.count("file") == 10 and types.count("email") == 10
-    assert response.total == 20
-    scores = [i.score for i in response.results]
-    assert scores == sorted(scores, reverse=True)
+    assert SearchResponse.from_dataframe(_frame(rows), limit=5).total == 5
+    assert SearchResponse.from_dataframe(_frame(rows)).total == 7  # без limit — все
+    assert SearchResponse.from_dataframe(None, limit=5).total == 0
 
 
 def test_pool_follows_limit_with_floor_and_ceiling():
@@ -238,17 +225,15 @@ class _Table:
         return builder
 
 
-def _index(files_table, email_table=None) -> SimpleNamespace:
+def _index(files_table) -> SimpleNamespace:
     async def async_encode(texts, role=None):
         return [[0.0] * 8]
 
-    def store(table, name):
-        return SimpleNamespace(table=table, has_table=True, table_name=name)
-
     return SimpleNamespace(
         cfg=SimpleNamespace(ov_model=SimpleNamespace(async_encode=async_encode)),
-        files_store=store(files_table, "files"),
-        email_store=store(email_table or files_table, "files_email"),
+        files_store=SimpleNamespace(
+            table=files_table, has_table=True, table_name="files"
+        ),
     )
 
 
@@ -256,15 +241,15 @@ def _index(files_table, email_table=None) -> SimpleNamespace:
 @pytest.mark.parametrize("query_type", ["hybrid", "vector", "text"])
 @pytest.mark.parametrize("limit", [1, 10, 37])
 async def test_every_query_type_asks_pool_once(query_type, limit):
-    """Один запрос на источник, пул по limit; копии повторного запроса не вызывают."""
+    """Один запрос к таблице, пул по limit; копии повторного запроса не вызывают."""
     copies = _frame([("/x/a.txt", 0.9, "text", "1"), ("/y/a.txt", 0.8, "text", "1")])
     table = _Table(copies)
 
-    frames = await Index.search(
+    frame = await Index.search(
         _index(table), "договор", top_k=limit, query_type=query_type
     )
 
-    assert frames == [copies]
+    assert frame is copies
     assert len(table.searches) == 1, "копии больше не требуют запроса с запасом"
     kwargs, builder = table.searches[0]
     assert ("limit", (search_pool(limit),)) in builder.calls
@@ -293,21 +278,6 @@ async def test_hybrid_fallback_to_vector_uses_the_same_pool():
     assert ("limit", (search_pool(30),)) in vector.calls
     assert ("nprobes", (VECTOR_NPROBES,)) in vector.calls
     assert ("refine_factor", (VECTOR_REFINE_FACTOR,)) in vector.calls
-
-
-@pytest.mark.asyncio
-async def test_email_source_gets_its_own_pool():
-    files, emails = _Table(_frame([("/docs/a.txt", 0.9)])), _Table(None)
-
-    frames = await Index.search(
-        _index(files, emails), "совещание", top_k=20, sources=["files", "email"]
-    )
-
-    assert len(frames) == 2
-    for table in (files, emails):
-        ((kwargs, builder),) = table.searches
-        assert kwargs["fts_columns"] == "text"
-        assert ("limit", (search_pool(20),)) in builder.calls
 
 
 def _rows_table(rows: list[tuple[str, str, str]], embed) -> pa.Table:
@@ -349,7 +319,7 @@ async def test_live_search_returns_documents_and_card_match(index: Index):  # no
     await store.add_batch(_rows_table(rows, index.cfg.ov_model.encode))
     store.create_fts(force=True)
 
-    items = SearchResponse.from_dataframes(
+    items = SearchResponse.from_dataframe(
         await index.search("кредитный риск банка", top_k=4, query_type="vector"),
         limit=4,
     ).results
@@ -357,7 +327,7 @@ async def test_live_search_returns_documents_and_card_match(index: Index):  # no
     assert all(len(i.chunks) <= MAX_FRAGMENTS_PER_DOC for i in items)
     assert all(c.kind != CARD_KIND for i in items for c in i.chunks)
 
-    (item,) = SearchResponse.from_dataframes(
+    (item,) = SearchResponse.from_dataframe(
         await index.search("Центробанк", top_k=4, query_type="text"), limit=4
     ).results
     assert (item.absolute_path, item.match, item.chunks) == (
@@ -366,7 +336,7 @@ async def test_live_search_returns_documents_and_card_match(index: Index):  # no
         [],
     )
 
-    items = SearchResponse.from_dataframes(
+    items = SearchResponse.from_dataframe(
         await index.search("Центробанк", top_k=4, query_type="hybrid"), limit=4
     ).results
     found = {i.absolute_path: i for i in items}
@@ -397,13 +367,13 @@ async def test_live_card_near_by_vector_is_not_a_match(index: Index, query_type)
     await store.add_batch(_rows_table(rows, index.cfg.ov_model.encode))
     store.create_fts(force=True)
 
-    frame = pl.concat(
-        await index.search("что приготовить к обеду", top_k=5, query_type=query_type)
+    frame = await index.search(
+        "что приготовить к обеду", top_k=5, query_type=query_type
     )
     assert frame.filter(pl.col("kind") == CARD_KIND).height > 0, (
         "карточки в пуле есть — по вектору"
     )
-    items = SearchResponse.from_dataframes([frame], limit=5).results
+    items = SearchResponse.from_dataframe(frame, limit=5).results
     assert len(items) == 5
     assert all(i.match == [] for i in items), [i.match for i in items]
 
@@ -428,7 +398,7 @@ async def test_live_quoted_phrase_does_not_break_fts(index: Index, query_type): 
     await store.add_batch(_rows_table(rows, index.cfg.ov_model.encode))
     store.create_fts(force=True)
 
-    (frame,) = await index.search(
+    frame = await index.search(
         '"управления операционным риском"', top_k=2, query_type=query_type
     )
     assert frame.filter(pl.col("_score").is_not_null())["path"].to_list() == [
@@ -450,10 +420,10 @@ async def test_search_does_not_wait_for_busy_default_pool():
     busy = [loop.run_in_executor(None, release.wait, 30) for _ in range(2)]
     try:
         table = _Table(_frame([("/docs/a.txt", 0.9)]))
-        frames = await asyncio.wait_for(
+        frame = await asyncio.wait_for(
             Index.search(_index(table), "договор", top_k=3), 5
         )
-        assert len(frames) == 1 and len(table.searches) == 1
+        assert frame is not None and len(table.searches) == 1
     finally:
         release.set()
         await asyncio.gather(*busy)

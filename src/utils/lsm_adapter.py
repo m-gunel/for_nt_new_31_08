@@ -256,7 +256,7 @@ class LSMTable[T](AbstractContextManager):
         состояние. Генератор вычитывается до конца, чтобы курсор закрылся до
         транзакции в delete_prefix: пару «курсор + транзакция» на одном хендле
         assert_db_state не допускает. Обход всех ключей терпим: delete_prefix
-        зовут только при смене папок и выключении почты.
+        зовут только при смене папок.
         """
         with self._lock:
             return [key for key in self.lsm.keys() if key.startswith(b_prefix)]  # type: ignore
@@ -324,6 +324,11 @@ class LSMTable[T](AbstractContextManager):
             self.lsm = self.connect()
 
 
+def lsm_file(root: str | Path, name: str) -> Path:
+    """Файл LSM-таблицы `name` (атрибута LSMCollection) в каталоге данных."""
+    return Path(root) / f"{name}.lsm"
+
+
 class TableDescriptor[T]:
     def __init__(
         self,
@@ -347,7 +352,7 @@ class TableDescriptor[T]:
 
             root = get_config().lsm_root
             instance.cached_tables[self.name] = table = LSMTable(
-                path=Path(root) / f"{self.name}.lsm",
+                path=lsm_file(root, self.name),
                 encoder=self.encoder,
                 decoder=self.decoder,
             )

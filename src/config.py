@@ -1,5 +1,4 @@
 import contextlib
-import datetime
 import os
 import shutil
 import sys
@@ -24,7 +23,6 @@ from pydantic_settings import (
 )
 
 from src.common.fts import FtsConfig
-from src.common.user_config import EmailConfig
 from src.utils import get_logger
 
 if getattr(sys, "frozen", False):
@@ -92,7 +90,7 @@ def reset_storage_if_requested(cfg: "Config") -> None:
 def protect_storage(cfg: "Config") -> None:
     """Закрыть каталоги данных от других пользователей (0700).
 
-    В индексе, очередях и кэше OCR — полный текст документов и писем, в
+    В индексе, очередях и кэше OCR — полный текст документов, в
     user_conf.yml — список папок. chmod на каждом старте закрывает и каталоги,
     созданные раньше по umask. Отказ не роняет демон.
     """
@@ -179,20 +177,6 @@ class FileScanConfig(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
-class EmailScanConfig(BaseModel):
-    """Пороги размера для почты — ограничение памяти демона.
-
-    Письмо разбирается целиком в памяти, поэтому пик задаёт порог письма, и
-    снижать порог вложения есть смысл только вместе с ним. `FileScanConfig.max_size`
-    к почте не применяется. Порог письма должен быть выше порога вложения:
-    в base64 вложение 30 МиБ занимает ~41 МиБ, и иначе письмо отсекалось бы
-    раньше, чем дойдёт до вложений.
-    """
-
-    max_message_size: int = 48 * 1024 * 1024
-    max_attachment_size: int = 30 * 1024 * 1024
-
-
 class SplitterCfg(BaseModel):
     chunk_size: int = 500
     chunk_overlap: int = 100
@@ -218,7 +202,6 @@ class RarankerModelConfig(BaseModel):
 
 class Config(BaseSettings):
     file_scan_cfg: FileScanConfig = Field(default_factory=FileScanConfig)
-    email_scan_cfg: EmailScanConfig = Field(default_factory=EmailScanConfig)
     embed_splitter_cfg: SplitterCfg = Field(default_factory=SplitterCfg)
     embed_model_cfg: EmbeddingModelConfig = Field(default_factory=EmbeddingModelConfig)
     # Не используется, как и reranker_k/reranker_cutoff: реранкера в продукте нет.
@@ -232,7 +215,6 @@ class Config(BaseSettings):
     lsm_root: str = str(_root)
     lsm_path: str = LSM_PATH
     ld_files_table: str = "files"
-    ld_email_table: str = "files_email"
     # Каталог user_conf.yml (настройки из POST /config); «~» раскрывается в
     # data_directory_path.
     data_directory: str = str(_user_root)
@@ -242,7 +224,6 @@ class Config(BaseSettings):
     parquet_record_batch_size: int = 500
     excel_config: ExcelParserConfig = Field(default_factory=ExcelParserConfig)
     ocr_cfg: OcrConfig = Field(default_factory=OcrConfig)
-    user_home: str | None = None
     logging_level: Literal[
         "CRITICAL",
         "FATAL",
@@ -291,12 +272,9 @@ class Config(BaseSettings):
         extra="ignore",
         cli_parse_args=False,
         # Без префикса в конфиг попадает любая переменная окружения, совпавшая
-        # с именем поля: EMAIL из оболочки роняет старт, USER_HOME и
-        # DATA_DIRECTORY подменяют пути.
+        # с именем поля: DATA_DIRECTORY из оболочки подменил бы путь.
         env_prefix="RAG_",
     )
-    email_poll_interval: int = 60 * 5
-    email: EmailConfig | None = None
 
     @cached_property
     def data_directory_path(self):
@@ -408,27 +386,16 @@ class Config(BaseSettings):
 
     @cached_property
     def lance(self):
-        """Оба хранилища. Один cached_property на два, чтобы сброс кэша не мог
-        обнулить одно и оставить другое."""
+        """Таблицы индекса (см. LanceTables)."""
         lg.debug("loading lancedb")
         from .utils.lance_wrapper import LanceTables, LanceWrapper, new_lance_session
 
-        # Одна сессия на обе таблицы: бюджет кэшей фиксирован, и сессия на
-        # таблицу удвоила бы расход памяти.
-        session = new_lance_session()
         return LanceTables(
             files=LanceWrapper(
                 ld_db_path=self.ld_db_path,
                 embed_dim=self.embed_dim,
                 table_name=self.ld_files_table,
-                session=session,
-                fts=self.fts_cfg,
-            ),
-            email=LanceWrapper(
-                ld_db_path=self.ld_db_path,
-                embed_dim=self.embed_dim,
-                table_name=self.ld_email_table,
-                session=session,
+                session=new_lance_session(),
                 fts=self.fts_cfg,
             ),
         )
@@ -502,67 +469,9 @@ class Config(BaseSettings):
             with open(p) as f:
                 return UserConfig.model_validate(yaml.load(f, Loader=yaml.CLoader))
         except Exception:
-            # Битый user_conf.yml не должен ронять API, обход файлов и почту:
+            # Битый user_conf.yml не должен ронять API и обход файлов:
             # откатываемся к конфигу из YAML/env, настройки можно перезаписать.
             lg.exception("user_conf.yml повреждён (%s), берём конфиг по умолчанию", p)
-            return None
-
-    @property
-    def email_config(self):
-        if self.user_config and self.user_config.email:
-            return self.user_config.email
-        else:
-            return self.email
-
-    @property
-    def email_enabled(self):
-        if self.email_config:
-            return self.email_config.enabled
-        return False
-
-    @property
-    def email_root(self) -> Path | None:
-        """Каталог с mbox-файлами почты.
-
-        Явный путь из конфига (`email.path_to_email_folder`) приоритетнее
-        автопоиска: он позволяет работать без Thunderbird (тесты, macOS) и
-        не зависит от структуры профиля.
-        """
-        from src.thunderbird.find_files import find_email_root
-
-        email_cfg = self.email_config
-        if email_cfg and email_cfg.path_to_email_folder:
-            p = Path(email_cfg.path_to_email_folder).expanduser()
-            if p.is_dir():
-                return p
-            lg.warning(
-                "path_to_email_folder=%s задан, но каталога нет — "
-                "почта не индексируется",
-                p,
-            )
-            return None
-        return find_email_root(Path(self.user_home) if self.user_home else None)
-
-    @property
-    def email_files(self) -> list[tuple[Path, str]]:
-        from src.thunderbird.find_files import list_email_folders
-
-        root = self.email_root
-        if root is None:
-            lg.warning("email root not found — email indexing failed")
-            return []
-        folders = list_email_folders(root)
-        return [(root / prefix, prefix) for prefix in folders]
-
-    @property
-    def email_begin_date(self):
-        # is not None, а не истинность: окно снимает только null (0 и
-        # отрицательные EmailConfig приводит к окну по умолчанию).
-        if self.email_config and self.email_config.index_last_n_days is not None:
-            return datetime.datetime.now() - datetime.timedelta(
-                self.email_config.index_last_n_days
-            )
-        else:
             return None
 
     @property
@@ -578,10 +487,7 @@ class Config(BaseSettings):
                 return cfg.model_copy(update={"folders": default_folders})
             return cfg
         else:
-            return UserConfig(
-                folders=default_folders,
-                email=self.email_config or EmailConfig(),
-            )
+            return UserConfig(folders=default_folders)
 
     def update_user_config(self, config: BaseModel):
         """Атомарно записать user_conf.yml (временный файл + os.replace).

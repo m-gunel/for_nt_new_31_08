@@ -316,7 +316,7 @@ async def test_live_document_read_in_by_code_is_filtered_too(index: Index):  # n
         ({"ext": ["docx"]}, []),
     ):
         pinned: list[str] = []
-        (frame,) = await index.search(
+        frame = await index.search(
             "Годовой отчёт obs_286",
             top_k=3,
             query_type="text",
@@ -444,7 +444,7 @@ async def test_narrow_filter_is_not_lost_in_unprobed_ivf_partitions(
                 table=table, has_table=True, table_name="files"
             ),
         )
-        (frame,) = await Index.search(
+        frame = await Index.search(
             rag, "договор", top_k=10, query_type=query_type, where="author = 'Иванов'"
         )
         found.append(frame.height)

@@ -2,7 +2,6 @@ from .doc_meta import (
     CARD_IDX,
     CARD_KIND,
     DOC_PREFIX,
-    EMAIL_PREFIX,
     Chunk,
     ChunkWithMeta,
     DocumentMetadata,
@@ -10,7 +9,6 @@ from .doc_meta import (
     chunk_with_meta_schema,
     doc_prefix,
     document_card_text,
-    is_email_path,
     norm_words,
     strip_doc_prefix,
 )
@@ -20,7 +18,6 @@ __all__ = [
     "CARD_IDX",
     "CARD_KIND",
     "DOC_PREFIX",
-    "EMAIL_PREFIX",
     "Chunk",
     "ChunkWithMeta",
     "DocumentMetadata",
@@ -29,7 +26,6 @@ __all__ = [
     "chunk_with_meta_schema",
     "doc_prefix",
     "document_card_text",
-    "is_email_path",
     "norm_words",
     "strip_doc_prefix",
 ]

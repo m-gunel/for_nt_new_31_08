@@ -1,27 +1,19 @@
-"""scripts/sberos_check.py: дом демона, порт, прокси и приватность отчёта.
+"""scripts/sberos_check.py: дом демона, порт, прокси, контракт API и приватность отчёта.
 
 Скрипт лежит в scripts/ и пакетом не является, поэтому грузится по пути.
-Дома подменены на tmp: настоящие ~/.files-search, ~/.ragsearch и
-~/.thunderbird тест не читает. user_conf.yml пишется так же, как его пишет
-демон (Config.update_user_config: yaml.dump(UserConfig.model_dump())).
+Дома подменены на tmp: настоящий ~/.files-search тест не читает.
 """
 
-import base64
 import importlib.util
 import json
 import os
 import subprocess
 import sys
 import urllib.request
-from email import message_from_bytes
 from pathlib import Path
 
 import pytest
-import yaml
 
-from src.server.model import EmailConfig, UserConfig
-from src.thunderbird.find_files import find_email_root
-from src.thunderbird.get_body import process_message
 from tests.mcp_fixture import StubSidecar
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -69,26 +61,6 @@ def _publish(home, port=None, pid=None):
     return root
 
 
-def _user_conf(home, **email):
-    """user_conf.yml так, как его пишет демон."""
-    path = home / ".ragsearch" / "user_conf.yml"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conf = UserConfig(folders=["/home/u/docs"], email=EmailConfig(**email))
-    path.write_text(yaml.dump(conf.model_dump()), encoding="utf-8")
-    return path
-
-
-def _mailbox(root, *names):
-    """Папки Thunderbird: mbox + .msf, по одному письму в каждой."""
-    root.mkdir(parents=True, exist_ok=True)
-    for name in names:
-        (root / name).write_bytes(
-            b"From - Mon Jan 1 00:00:00 2024\nSubject: x\n\nbody\n"
-        )
-        (root / (name + ".msf")).write_bytes(b"")
-    return root
-
-
 def _run_main(monkeypatch, tmp_path, *argv, package_dir=None):
     """main() целиком: отчёт — в tmp, а не рядом со скриптом.
 
@@ -127,12 +99,7 @@ def test_default_run_reads_everything_from_daemon_home(
 ):
     """Запуск по README без флагов: служба живёт в доме из passwd."""
     _, pwdir = homes
-    root = _publish(pwdir, int(sidecar.url.rsplit(":", 1)[1]), os.getpid())
-    state = {"version": 2, "folders": {"INBOX": {"offset": 0, "size": 1, "mtime": 0}}}
-    (root / "offsets.json").write_text(json.dumps(state), encoding="utf-8")
-    _user_conf(pwdir, enabled=True)
-    tb = pwdir / ".thunderbird" / "p.default" / "ImapMail" / "imap.sberbank.ru"
-    _mailbox(tb, "INBOX")
+    _publish(pwdir, int(sidecar.url.rsplit(":", 1)[1]), os.getpid())
     package = tmp_path / "opt"
     package.mkdir()
 
@@ -140,14 +107,36 @@ def test_default_run_reads_everything_from_daemon_home(
 
     sections = report["sections"]
     assert report["daemon_home"] == "passwd"
+    assert set(sections) == {"inotify", "runtime", "resources", "frozen_lance"}
     assert sections["runtime"]["verdict"] == "PASS", sections["runtime"]
     assert ("GET", "/api/v1/health") in [
         (r["method"], r["path"]) for r in sidecar.requests
     ]
-    assert sections["profile"]["details"]["chosen_host"] == "imap.sberbank.ru"
-    assert sections["offsets"]["verdict"] == "PASS", sections["offsets"]
-    assert sections["offsets"]["details"]["user_conf"]["email_enabled"] is True
     assert sections["frozen_lance"]["details"]["dist_dir"] == str(package)
+
+
+def test_runtime_uses_current_api_contract(sidecar):
+    """search — без устаревшего sources; других ручек, кроме четырёх, не зовёт."""
+    sidecar.set("GET", "/api/v1/status", {"is_indexing": False, "files_to_index": 0})
+    sidecar.set("GET", "/api/v1/config", {"folders": ["/home/u/a", "/home/u/b"]})
+    hit = {"id": "f1", "type": "file", "title": "t", "chunks": []}
+    sidecar.set("POST", "/api/v1/search", {"results": [hit], "total": 1})
+    report = {"sections": {}}
+
+    chk.check_runtime(report, int(sidecar.url.rsplit(":", 1)[1]))
+
+    assert {r["path"] for r in sidecar.requests} == {
+        "/api/v1/health",
+        "/api/v1/status",
+        "/api/v1/config",
+        "/api/v1/search",
+    }
+    assert sidecar.bodies("POST", "/api/v1/search") == [
+        {"query": "тест", "limit": 5, "query_type": "hybrid"}
+    ]
+    details = report["sections"]["runtime"]["details"]
+    assert details["config"] == {"status": 200, "folders_count": 2}
+    assert details["search"] == {"status": 200, "total": 1, "result_types": {"file": 1}}
 
 
 @pytest.mark.parametrize(
@@ -216,101 +205,24 @@ def test_daemon_cmdline(cmdline, expected):
     assert chk.is_daemon_cmdline(cmdline) is expected
 
 
-def test_mail_root_host_order_matches_daemon(tmp_path, monkeypatch):
-    """Два аккаунта без корпоративного: скрипт и демон берут один корень."""
-    imap = tmp_path / ".thunderbird" / "p.default" / "ImapMail"
-    for host in ("a.example", "b.example"):
-        _mailbox(imap / host, "INBOX")
-    # Порядок readdir не алфавитный (ext4, APFS) — задаём его явно. Список
-    # каждый раз новый: обе стороны очищают dirnames, чтобы не спускаться.
-    monkeypatch.setattr(
-        os, "walk", lambda top: iter([(str(imap), ["b.example", "a.example"], [])])
-    )
-    report = {"sections": {}}
-    chosen = chk.check_profile(report, str(tmp_path / ".thunderbird"))
-    assert chosen == str(find_email_root(tmp_path))
-    assert report["sections"]["profile"]["details"]["chosen_host"] == "a.example"
+# T036: в «безопасный для пересылки» отчёт не попадают логин и пути.
 
 
-def test_explicit_email_folder_wins_like_config_email_root(
-    homes, monkeypatch, tmp_path
-):
+@pytest.mark.parametrize("exists", [True, False])
+def test_dist_path_in_report_hides_login(homes, monkeypatch, tmp_path, exists):
     _, pwdir = homes
     _publish(pwdir, pid=os.getpid())
-    mail = _mailbox(tmp_path / "mbox", "INBOX")
-    _user_conf(pwdir, path_to_email_folder=str(mail))
-    _mailbox(pwdir / ".thunderbird" / "p.default" / "ImapMail" / "x.example", "Other")
+    dist = pwdir / "lib-local-rag" / "main"
+    if exists:
+        dist.mkdir(parents=True)
     monkeypatch.setattr(chk, "check_runtime", lambda report, port: None)
 
-    details = _run_main(monkeypatch, tmp_path)["sections"]["profile"]["details"]
+    report = _run_main(monkeypatch, tmp_path, "--dist", str(dist))
 
-    assert details["email_root_source"] == "path_to_email_folder"
-    assert "chosen_host" not in details
-    assert [f["name"] for f in details["folders"]] == ["INBOX"]
-
-
-def test_tilde_in_email_folder_is_daemon_home():
-    assert chk.expand_home("~/mail", "/home/DOM@user") == "/home/DOM@user/mail"
-    assert chk.expand_home("~", "/home/DOM@user") == "/home/DOM@user"
-    assert chk.expand_home("/srv/mail", "/home/DOM@user") == "/srv/mail"
-
-
-@pytest.mark.parametrize(
-    "value",
-    [
-        "",
-        "/home/u/mail",
-        "~/mail",
-        "/home/DOMAIN@LOGIN/.thunderbird/abc.default/ImapMail/imap.sberbank.ru",
-        "/home/u/My Mail",
-        "/home/u/it's",
-        "/home/u/a: b",
-        "/home/u/Почта",
-        # Длинное значение yaml.dump переносит на следующие строки.
-        "/home/u/" + "very long folder name with spaces " * 4,
-        "/home/u/Документы/Почта/Архив писем за прошлый год",
-    ],
-)
-def test_parse_user_conf_reads_path_to_email_folder(tmp_path, value):
-    path = _user_conf(tmp_path, path_to_email_folder=value)
-    assert chk.parse_user_conf(str(path))["path_to_email_folder"] == value
-
-
-# T036: в «безопасный для пересылки» отчёт не попадают имена папок и логин.
-
-
-def test_offsets_section_masks_folder_names_from_user_conf(tmp_path):
-    offsets = {
-        "&BBoEOwQ4BDUEPQRCBEs-": 20,
-        "INBOX": 10,
-        "INBOX.sbd/Proekt-Romashka": 30,
-    }
-    conf_path = _user_conf(
-        tmp_path, offsets=offsets, path_to_email_folder="/home/DOMAIN@LOGIN/mail"
-    )
-    report = {"sections": {}}
-    chk.check_offsets(
-        report,
-        None,
-        str(tmp_path / ".files-search"),
-        chk.parse_user_conf(str(conf_path)),
-    )
-    text = json.dumps(report, ensure_ascii=False)
-    for secret in ("&BBoEOwQ4BDUEPQRCBEs-", "Proekt-Romashka", "DOMAIN@LOGIN"):
-        assert secret not in text
-    details = report["sections"]["offsets"]["details"]
-    assert details["user_conf"]["offsets"]["INBOX"] == 10
-    assert details["user_conf"]["path_to_email_folder_set"] is True
-    assert details["checked"] == 3
-
-
-def test_profile_fail_note_hides_login(homes):
-    _, pwdir = homes
-    report = {"sections": {}}
-    assert chk.check_profile(report, str(pwdir / ".thunderbird")) is None
-    note = report["sections"]["profile"]["details"]["note"]
-    assert "~/.thunderbird" in note
-    assert str(pwdir) not in note
+    assert str(pwdir) not in json.dumps(report, ensure_ascii=False)
+    lance = report["sections"]["frozen_lance"]["details"]
+    shown = lance["dist_dir"] if exists else lance["note"]
+    assert "~/lib-local-rag/main" in shown
 
 
 # T057: к демону — мимо системного прокси.
@@ -333,52 +245,3 @@ def test_http_json_bypasses_proxy_from_env(sidecar, monkeypatch):
         proxy.close()
     assert result == (200, {"status": "ok"})
     assert proxy.requests == []
-
-
-# T086: отчёт не врёт про папки, дубли и «Архив».
-
-
-def test_folders_count_from_daemon_written_user_conf(tmp_path):
-    """yaml.dump пишет элементы списка с начала строки: «- /a»."""
-    path = tmp_path / "user_conf.yml"
-    conf = UserConfig(folders=["/a", "/b", "/c"])
-    path.write_text(yaml.dump(conf.model_dump()), encoding="utf-8")
-    assert chk.parse_user_conf(str(path))["folders_count"] == 3
-
-
-def test_folders_count_with_indented_list(tmp_path):
-    path = tmp_path / "user_conf.yml"
-    path.write_text(
-        "folders:\n  - /a\n  - /b\nemail:\n  enabled: true\n", encoding="utf-8"
-    )
-    conf = chk.parse_user_conf(str(path))
-    assert (conf["folders_count"], conf["email_enabled"]) == (2, True)
-
-
-def test_archive_folder_is_known_by_its_real_mutf7_name():
-    name = "&BBAEQARFBDgEMg-"
-    # mUTF-7: base64 от UTF-16BE между «&» и «-».
-    assert base64.b64decode(name[1:-1] + "==").decode("utf-16-be") == "Архив"
-    assert chk.mask_folder(name) == "Архив (mUTF-7)"
-
-
-def test_duplicates_note_matches_single_version_indexing(tmp_path):
-    """Из multipart/alternative демон индексирует одну версию, не две."""
-    message = (
-        b"Subject: x\n"
-        b"MIME-Version: 1.0\n"
-        b'Content-Type: multipart/alternative; boundary="b"\n\n'
-        b"--b\nContent-Type: text/plain\n\nplain\n"
-        b"--b\nContent-Type: text/html\n\n<p>html</p>\n--b--\n"
-    )
-    assert len(list(process_message(message_from_bytes(message)))) == 1
-    root = tmp_path / "mail"
-    root.mkdir()
-    (root / "INBOX").write_bytes(b"From - Mon Jan 1 00:00:00 2024\n" + message)
-    (root / "INBOX.msf").write_bytes(b"")
-    report = {"sections": {}}
-    chk.check_mbox_scan(report, str(root))
-    details = report["sections"]["duplicates"]["details"]
-    assert details["multipart_alternative"] == 1
-    assert "дважды" not in details["note"]
-    assert "одна версия" in details["note"]

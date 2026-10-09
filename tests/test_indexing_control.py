@@ -5,9 +5,6 @@
 изолированном хранилище.
 """
 
-import asyncio
-from contextlib import suppress
-
 import pytest
 
 from src.config import Config
@@ -30,7 +27,6 @@ class ControlIndex:
 
     def __init__(self, active: bool = True):
         self.calls: list = []
-        self.emails_scanner = None
         self.active = active
 
     async def activate(self) -> bool:
@@ -57,15 +53,6 @@ class ControlIndex:
 
     async def delete_prefix(self, prefix):
         self.calls.append(("delete_prefix", prefix))
-
-    async def drop_email_index(self):
-        self.calls.append("drop_email_index")
-
-    async def start_emails_polling(self, immediate=False):
-        self.calls.append(("start_emails_polling", immediate))
-
-    async def stop_emails_polling(self):
-        self.calls.append("stop_emails_polling")
 
 
 @pytest.fixture
@@ -131,7 +118,6 @@ async def test_deactivate_stops_scanning_and_keeps_index(patched_watcher):
     assert "stop_watcher" in patched_watcher
     # §5.2: индексы НЕ удаляются — ни дропа таблиц, ни сброса состояния.
     assert "reset_index" not in idx.calls
-    assert "drop_email_index" not in idx.calls
 
 
 @pytest.mark.asyncio
@@ -248,52 +234,12 @@ async def test_deactivate_makes_status_honest(index: Index):  # noqa: F811
 
 
 @pytest.mark.asyncio
-async def test_activate_does_not_restart_live_email_polling(
-    index: Index,  # noqa: F811
-    monkeypatch,
-):
-    """Повторная активация не обрывает идущий почтовый проход.
-
-    start_emails_polling внутри себя зовёт stop_emails_polling, поэтому
-    безусловный вызов отменял бы задачу прямо посреди чтения mbox.
-    """
-    calls: list = []
-
-    async def spy(immediate: bool = False):
-        calls.append(immediate)
-
-    async def never_ending():
-        await asyncio.Event().wait()
-
-    monkeypatch.setattr(index, "start_emails_polling", spy)
-    index.emails_task = asyncio.create_task(never_ending())
-    try:
-        await index.activate()
-        assert calls == [], "живой поллинг почты перезапущен"
-    finally:
-        index.emails_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await index.emails_task
-        index.emails_task = None
-        await index.deactivate()
-
-
-@pytest.mark.asyncio
 async def test_preempted_full_pass_is_replayed(index: Index):  # noqa: F811
-    """Полный проход, вытесненный почтовым, не теряется, а доигрывается."""
+    """Полный проход, запрошенный во время идущего, не теряется, а доигрывается."""
     await index._scan_lock.acquire()
     try:
-        await index.scan_all()  # файловый проход упирается в занятый лок
+        await index.scan_all()  # упирается в занятый лок
         assert index._rescan_requested is True
-    finally:
-        index._scan_lock.release()
-
-    # Почтовый проход флага не ставит: его повторит поллинг.
-    index._rescan_requested = False
-    await index._scan_lock.acquire()
-    try:
-        await index.scan_all(emails_only=True)
-        assert index._rescan_requested is False
     finally:
         index._scan_lock.release()
 

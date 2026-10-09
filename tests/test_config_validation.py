@@ -1,4 +1,4 @@
-"""POST/GET /config: пустой список папок, окно почты, неизвестные ключи.
+"""POST/GET /config: пустой список папок, неизвестные ключи.
 
 Плюс каталог пользовательского конфига с «~» и размерность эмбеддинга.
 
@@ -7,7 +7,6 @@
 lifespan (модель и индексатор не поднимаются).
 """
 
-import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,7 +16,7 @@ from fastapi.testclient import TestClient
 
 from src.config import Config
 from src.indexer.utils import _get_index
-from src.server.model import EmailConfig, UserConfig
+from src.server.model import UserConfig
 from src.server.router import get_config, router, update_config
 from src.utils.config_mixin import _get_config
 
@@ -137,7 +136,6 @@ async def test_add_folder_over_stored_null_keeps_index(
     [
         {"folder": ["/tmp"]},
         {"paths": ["/tmp"]},
-        {"email": {"enabeld": True}},
         {"sberchat": {"enable": True}},
     ],
 )
@@ -167,9 +165,10 @@ def test_client_bodies_still_accepted(
     monkeypatch.setattr(cfg.file_scan_cfg, "paths", [str(docs)])
     bodies = [
         {"folders": [str(docs)]},
+        # Старые клиенты и скрипты НТ шлют секцию email: она принимается и
+        # игнорируется.
         {"email": {"enabled": True}},
         {"email": {"enabled": False}},
-        # Пример из README.
         {"folders": [str(docs)], "email": {"enabled": True, "index_last_n_days": 90}},
         {
             "folders": [str(docs)],
@@ -199,72 +198,6 @@ def test_client_bodies_still_accepted(
     round_trip = client.get("/api/v1/config").json()
     resp = client.post("/api/v1/config", json=round_trip)
     assert resp.status_code == 200, resp.text
-
-
-# --- окно почты -------------------------------------------------------------
-
-
-@pytest.mark.parametrize("days", [0, -5])
-def test_email_window_below_one_day_rejected(
-    client,
-    cfg,  # noqa: F811
-    journal,  # noqa: F811
-    days,
-):
-    """0 и отрицательное в POST /config — 422: весь ящик или ни одного письма."""
-    resp = client.post(
-        "/api/v1/config", json={"email": {"enabled": True, "index_last_n_days": days}}
-    )
-
-    assert resp.status_code == 422, resp.text
-    assert cfg.user_config is None
-    assert journal == []
-
-
-def test_email_window_null_still_means_whole_mailbox(
-    client,
-    cfg,  # noqa: F811
-):
-    """Документированный null по-прежнему снимает окно."""
-    resp = client.post(
-        "/api/v1/config", json={"email": {"enabled": False, "index_last_n_days": None}}
-    )
-
-    assert resp.status_code == 200, resp.text
-    assert cfg.user_config.email.index_last_n_days is None
-    assert cfg.email_begin_date is None
-
-
-@pytest.mark.parametrize("stored", [0, -5])
-def test_stored_window_below_one_day_reads_as_default(stored):
-    """0 и отрицательное из старого user_conf.yml или YAML читаются как 30.
-
-    Отвергать их при чтении нельзя: битым счёлся бы весь user_conf.yml вместе
-    со списком папок.
-    """
-    email = EmailConfig.model_validate({"index_last_n_days": stored})
-    assert email.index_last_n_days == 30
-    user = UserConfig.model_validate({"email": {"index_last_n_days": stored}})
-    assert user.email.index_last_n_days == 30
-
-
-@pytest.mark.parametrize("stored", [0, -5])
-def test_email_begin_date_never_unbounded_or_future(
-    cfg,  # noqa: F811
-    monkeypatch,
-    stored,
-):
-    monkeypatch.setattr(
-        cfg,
-        "email",
-        EmailConfig.model_validate({"enabled": True, "index_last_n_days": stored}),
-    )
-
-    begin = cfg.email_begin_date
-
-    assert begin is not None, "окно снято — индексировался бы весь ящик"
-    expected = datetime.datetime.now() - datetime.timedelta(30)
-    assert abs((begin - expected).total_seconds()) < 60
 
 
 # --- «~» в data_directory ---------------------------------------------------

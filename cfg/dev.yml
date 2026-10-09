@@ -9,10 +9,4 @@ file_scan_cfg:
 embed_model_cfg:
   model_path: models/rubert-tiny2_002
 
-email_poll_interval: 60
-email:
-  # Выключена, чтобы тесты не лезли в настоящий ~/.thunderbird; кому нужна почта,
-  # включают её сами с синтетическим профилем.
-  enabled: false
-  index_last_n_days: 30
 app_logging_level: DEBUG

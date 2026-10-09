@@ -39,6 +39,9 @@ sudo dpkg -i lib-local-rag_1.0.10_amd64.deb
 - **С 1.0.8 на 1.0.9** сброс не нужен: карточки документов дописываются в
   индекс при старте. В 1.0.9 limit поиска — число документов, а не чанков.
 - **С 1.0.9 на 1.0.10** сброс не нужен: индекс тот же, меняется только поиск.
+- **Почта не индексируется.** Данные почты прежних версий (таблицу
+  `files_email`, очередь `emails/`, `offsets.json`, ключи писем в LSM) демон
+  при старте удаляет сам — в них тексты писем.
 
 ## Шаг 2. Прочитать итог установки
 
@@ -373,10 +376,10 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
   | /usr/lib/lib-local-rag/mcp/mcp_launcher.sh
 ```
 
-В stdout придёт JSON со списком из **восьми** инструментов: чтение —
+В stdout придёт JSON со списком из **семи** инструментов: чтение —
 `local_search`, `local_index_status`, `local_read_file`; управление
 индексацией (для агента) — `local_list_paths`, `local_add_path`,
-`local_remove_path`, `local_set_email`, `local_trigger_rescan`. Управляющие
+`local_remove_path`, `local_trigger_rescan`. Управляющие
 скрываются переменной `LQRAG_ALLOW_WRITE=0`. Диагностика моста пишется в
 **stderr**.
 

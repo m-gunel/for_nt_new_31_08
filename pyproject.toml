@@ -109,7 +109,7 @@ exclude = ["scripts/nt"]
 # Маркер объявляем явно: без этого pytest ругается на неизвестный маркер, а
 # `make tests` держится на `-m "not integration"`.
 markers = [
-    "integration: требует внешнего окружения (профиль Thunderbird, запущенный демон)",
+    "integration: требует внешнего окружения (запущенный демон)",
 ]
 
 [tool.pytest_env]

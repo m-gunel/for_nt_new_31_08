@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 
 from mcp_server import MAX_CHUNK_CHARS, MAX_OUTPUT_CHARS, MIN_CHUNK_CHARS
-from tests.mbox_fixture import minimal_docx, minimal_pptx, minimal_xlsx
 from tests.mcp_fixture import bridge_factory, call_text, stub  # noqa: F401
+from tests.office_fixture import minimal_docx, minimal_pptx, minimal_xlsx
 
 CONFIG = "/api/v1/config"
 SEARCH = "/api/v1/search"
@@ -42,17 +42,9 @@ def write_bridge(stub, bridge_factory):  # noqa: F811
 
 def test_search_passes_arguments_verbatim(stub, bridge):  # noqa: F811
     stub.set("POST", SEARCH, {"results": [_hit("/docs/a.docx")], "total": 1})
-    bridge.call(
-        "local_search",
-        {"query": "договор", "limit": 3, "query_type": "text", "sources": ["files", "email"]},
-    )
+    bridge.call("local_search", {"query": "договор", "limit": 3, "query_type": "text"})
     assert stub.bodies("POST", SEARCH) == [
-        {
-            "query": "договор",
-            "limit": 3,
-            "query_type": "text",
-            "sources": ["files", "email"],
-        }
+        {"query": "договор", "limit": 3, "query_type": "text"}
     ]
 
 
@@ -61,10 +53,9 @@ def test_search_defaults_are_explicit(stub, bridge):  # noqa: F811
     stub.set("POST", SEARCH, {"results": [], "total": 0})
     stub.set("GET", STATUS, {"is_indexing": False, "type": "idle", "files_to_index": 0})
     bridge.call("local_search", {"query": "что-нибудь"})
-    body = stub.bodies("POST", SEARCH)[0]
-    assert body["limit"] == 10
-    assert body["query_type"] == "hybrid"
-    assert body["sources"] == ["files"]
+    assert stub.bodies("POST", SEARCH) == [
+        {"query": "что-нибудь", "limit": 10, "query_type": "hybrid"}
+    ]
 
 
 def test_search_returns_text_and_structured_content(stub, bridge):  # noqa: F811
@@ -232,7 +223,9 @@ def test_many_copies_do_not_eat_the_budget(stub, bridge):  # noqa: F811
 def test_empty_result_during_indexing_is_not_a_denial(stub, bridge):  # noqa: F811
     """Главная защита от ложного «такого документа нет»."""
     stub.set("POST", SEARCH, {"results": [], "total": 0})
-    stub.set("GET", STATUS, {"is_indexing": True, "type": "index", "files_to_index": 42})
+    stub.set(
+        "GET", STATUS, {"is_indexing": True, "type": "index", "files_to_index": 42}
+    )
     response = bridge.call("local_search", {"query": "договор"})
     text = call_text(response)
     assert "индексация ещё идёт" in text
@@ -254,20 +247,6 @@ def test_empty_result_with_unknown_status_stays_honest(stub, bridge):  # noqa: F
     assert "проверить не удалось" in text
 
 
-def test_email_hits_are_marked_as_unreadable(stub, bridge):  # noqa: F811
-    """Ключ письма — не путь на диске, и агент не должен нести его в чтение."""
-    letter = {
-        "id": "email_INBOX:10:20:body",
-        "title": "Тема письма",
-        "type": "email",
-        "score": 0.5,
-        "absolute_path": "email_INBOX:10:20:body",
-        "chunks": [{"content": "текст письма", "score": 0.5}],
-    }
-    stub.set("POST", SEARCH, {"results": [letter], "total": 1})
-    assert "не файл на диске" in call_text(bridge.call("local_search", {"query": "письмо"}))
-
-
 @pytest.mark.parametrize(
     "arguments, expected",
     [
@@ -276,10 +255,8 @@ def test_email_hits_are_marked_as_unreadable(stub, bridge):  # noqa: F811
         ({"query": "x", "limit": 900}, "limit"),
         ({"query": "x", "limit": "10"}, "limit"),
         ({"query": "x", "query_type": "магия"}, "query_type"),
-        ({"query": "x", "sources": []}, "sources"),
-        ({"query": "x", "sources": ["files", "files"]}, "повторяться"),
-        ({"query": "x", "sources": ["диск"]}, "sources"),
         ({"query": "x", "top_k": 5}, "неизвестные параметры"),
+        ({"query": "x", "sources": ["files"]}, "неизвестные параметры"),
     ],
 )
 def test_bad_arguments_are_rejected(stub, bridge, arguments, expected):  # noqa: F811
@@ -287,7 +264,9 @@ def test_bad_arguments_are_rejected(stub, bridge, arguments, expected):  # noqa:
     error = bridge.call("local_search", arguments)["error"]
     assert error["code"] == -32602
     assert expected in error["message"]
-    assert stub.bodies("POST", SEARCH) == [], "невалидный вызов не должен доходить до API"
+    assert stub.bodies("POST", SEARCH) == [], (
+        "невалидный вызов не должен доходить до API"
+    )
 
 
 def test_api_error_becomes_tool_error(stub, bridge):  # noqa: F811
@@ -333,7 +312,6 @@ def test_index_status_reports_phase(stub, bridge):  # noqa: F811
             "type": "preindex",
             "files_to_index": 7,
             "queued_files": 7,
-            "queued_emails": 0,
             "total_files": 100,
         },
     )
@@ -343,12 +321,22 @@ def test_index_status_reports_phase(stub, bridge):  # noqa: F811
     assert response["result"]["structuredContent"]["files_to_index"] == 7
 
 
+def test_index_status_reports_file_queue(stub, bridge):  # noqa: F811
+    stub.set(
+        "GET",
+        STATUS,
+        {"is_indexing": True, "type": "index", "files_to_index": 7, "total_files": 9},
+    )
+    text = call_text(bridge.call("local_index_status"))
+    assert "В очереди файлов: 7\n" in text
+
+
 @pytest.fixture
 def sandbox(tmp_path, stub):  # noqa: F811
     """Индексируемая папка, как её видит мост через GET /config."""
     root = (tmp_path / "indexed").resolve()
     root.mkdir()
-    stub.set("GET", CONFIG, {"folders": [str(root)], "email": {"enabled": False}})
+    stub.set("GET", CONFIG, {"folders": [str(root)]})
     return root
 
 
@@ -403,7 +391,9 @@ def test_read_file_refuses_traversal(sandbox, tmp_path, bridge):
 def test_read_file_refuses_secret_extensions(sandbox, bridge):
     """.env лежит в индексируемой папке, но выдавать его наружу нельзя."""
     (sandbox / "prod.env").write_text("TOKEN=123", encoding="utf-8")
-    response = bridge.call("local_read_file", {"absolute_path": str(sandbox / "prod.env")})
+    response = bridge.call(
+        "local_read_file", {"absolute_path": str(sandbox / "prod.env")}
+    )
     assert response["result"]["isError"] is True
     assert "TOKEN=123" not in call_text(response)
 
@@ -450,14 +440,6 @@ def test_read_file_fails_closed_without_the_sidecar(tmp_path, bridge_factory):  
     assert response["result"]["isError"] is True
     assert "чтение запрещено" in call_text(response)
     assert "содержимое" not in call_text(response)
-
-
-def test_read_file_refuses_email_keys(sandbox, bridge):
-    response = bridge.call(
-        "local_read_file", {"absolute_path": "email_INBOX:10:20:body"}
-    )
-    assert response["result"]["isError"] is True
-    assert "ключ письма" in call_text(response)
 
 
 def test_read_file_reports_missing_file(sandbox, bridge):
@@ -515,7 +497,7 @@ def test_read_file_truncates_huge_xlsx(sandbox, bridge):
     assert "строка 1049" not in text
 
 
-def test_read_file_prefers_daemon_parsers_for_office(sandbox, bridge, stub):
+def test_read_file_prefers_daemon_parsers_for_office(sandbox, bridge, stub):  # noqa: F811
     """Офисные форматы мост читает в первую очередь парсерами демона:
     у него в бинаре pymupdf и конвертер Р7, которых у моста нет."""
     book = sandbox / "таблица.xlsx"
@@ -540,7 +522,7 @@ def test_read_file_sends_the_checked_path_to_the_daemon(stub, bridge_factory, tm
     docs.mkdir(parents=True)
     book = docs / "таблица.xlsx"
     book.write_bytes(minimal_xlsx([("Отчёт", [["итог", 402]])]))
-    stub.set("GET", CONFIG, {"folders": [str(docs)], "email": {"enabled": False}})
+    stub.set("GET", CONFIG, {"folders": [str(docs)]})
     stub.set(
         "POST",
         "/api/v1/read_file",
@@ -552,7 +534,7 @@ def test_read_file_sends_the_checked_path_to_the_daemon(stub, bridge_factory, tm
     assert stub.bodies("POST", "/api/v1/read_file") == [{"absolute_path": str(book)}]
 
 
-def test_read_file_propagates_daemon_verdicts(sandbox, bridge, stub):
+def test_read_file_propagates_daemon_verdicts(sandbox, bridge, stub):  # noqa: F811
     """Ответ демона по существу файла (413 — больше лимита чтения) мост
     показывает агенту, а не подменяет локальным разбором того же файла."""
     book = sandbox / "таблица.xlsx"
@@ -596,7 +578,9 @@ def test_read_file_propagates_daemon_not_found(sandbox, bridge, stub, name):  # 
 
 
 def test_read_file_reports_slow_daemon_instead_of_local_fallback(
-    sandbox, stub, bridge_factory  # noqa: F811
+    sandbox,
+    stub,  # noqa: F811
+    bridge_factory,  # noqa: F811
 ):
     """Таймаут живого демона — не «демон недоступен»: для .xls локальный разбор
     выдал бы ложный совет обновить пакет."""
@@ -609,7 +593,9 @@ def test_read_file_reports_slow_daemon_instead_of_local_fallback(
 
     stub.set("POST", "/api/v1/read_file", _slow)
     bridge = bridge_factory(stub.url, LQRAG_TIMEOUT="1")
-    response = bridge.call("local_read_file", {"absolute_path": str(legacy)}, timeout=20)
+    response = bridge.call(
+        "local_read_file", {"absolute_path": str(legacy)}, timeout=20
+    )
     assert response["result"]["isError"] is True
     text = call_text(response)
     assert "сбой связи с сайдкаром" in text
@@ -671,7 +657,9 @@ def test_add_path_is_idempotent(stub, write_bridge, tmp_path):  # noqa: F811
     stub.set("POST", CONFIG, None)
     text = call_text(write_bridge.call("local_add_path", {"path": str(folder)}))
     assert "уже индексируется" in text
-    assert stub.bodies("POST", CONFIG) == [], "повторное добавление не должно писать конфиг"
+    assert stub.bodies("POST", CONFIG) == [], (
+        "повторное добавление не должно писать конфиг"
+    )
 
 
 def test_remove_path_keeps_the_rest(stub, write_bridge, tmp_path):  # noqa: F811
@@ -707,21 +695,6 @@ def test_removing_unknown_path_is_refused(stub, write_bridge, tmp_path):  # noqa
     assert stub.bodies("POST", CONFIG) == []
 
 
-def test_set_email_sends_a_partial_update(stub, write_bridge):  # noqa: F811
-    """В теле только email: список папок этим запросом затирать нельзя."""
-    stub.set("GET", CONFIG, {"folders": ["/tmp"], "email": {"enabled": True}})
-    stub.set("POST", CONFIG, None)
-    write_bridge.call("local_set_email", {"enabled": True})
-    assert stub.bodies("POST", CONFIG) == [{"email": {"enabled": True}}]
-
-
-def test_set_email_requires_a_boolean(stub, write_bridge):  # noqa: F811
-    stub.set("POST", CONFIG, None)
-    error = write_bridge.call("local_set_email", {"enabled": "да"})["error"]
-    assert error["code"] == -32602
-    assert stub.bodies("POST", CONFIG) == []
-
-
 def test_rescan_reposts_the_same_folders(stub, write_bridge):  # noqa: F811
     stub.set("GET", STATUS, {"is_indexing": False, "type": "idle", "files_to_index": 0})
     stub.set("GET", CONFIG, {"folders": ["/a", "/b"]})
@@ -733,7 +706,9 @@ def test_rescan_reposts_the_same_folders(stub, write_bridge):  # noqa: F811
 
 def test_rescan_is_refused_while_indexing(stub, write_bridge):  # noqa: F811
     """Переиндексация поверх идущей отклоняется: сценарий падений hunt_crash.py."""
-    stub.set("GET", STATUS, {"is_indexing": True, "type": "index", "files_to_index": 500})
+    stub.set(
+        "GET", STATUS, {"is_indexing": True, "type": "index", "files_to_index": 500}
+    )
     stub.set("GET", CONFIG, {"folders": ["/a"]})
     stub.set("POST", CONFIG, None)
     response = write_bridge.call("local_trigger_rescan")

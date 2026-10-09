@@ -79,22 +79,8 @@ def test_is_code():
 
 
 def test_doc_name_prefers_original_name():
-    assert doc_name("email_INBOX:1:2:вложение", {"original_name": "ЦБ_21.pdf"}) == (
-        "цб 21"
-    )
+    assert doc_name("/docs/копия", {"original_name": "ЦБ_21.pdf"}) == "цб 21"
     assert doc_name("/docs/Отчёт 5348-У.docx", None) == "отчет 5348 у"
-
-
-@pytest.mark.parametrize(
-    "subject, name",
-    [
-        ("Ф.0409 за 01.10.2026 по 5348-У", "ф 0409 за 01 10 2026 по 5348 у"),
-        ("Приказ 12/ЦБ_21 от 01.10.2026", "приказ 12 цб 21 от 01 10 2026"),
-    ],
-)
-def test_doc_name_keeps_email_subject_whole(subject, name):
-    """Тема письма — не путь: точки в датах и «/» её не режут."""
-    assert doc_name("email_INBOX:1:2:body", {"original_name": subject}) == name
 
 
 @pytest.mark.parametrize(
@@ -169,12 +155,6 @@ def test_code_matches_whole_words_of_the_name():
         "/a/ЦБ_21 положение.pdf",
     ]
     assert names.hits(table, query_codes("obs_286")) == []
-
-
-def test_code_after_date_in_email_subject_finds_the_letter():
-    path = "email_INBOX:1:2:body"
-    table = _CardTable({path: "Ф.0409 за 01.10.2026 по 5348-У"})
-    assert NameIndex().hits(table, query_codes("найди письмо 5348-У")) == [path]
 
 
 def test_code_shared_by_more_than_three_files_is_ignored():
@@ -258,8 +238,8 @@ def _pool_and_pinned_tail(score_col: str = "_relevance_score") -> pl.DataFrame:
 
 def test_pinned_document_from_deep_in_the_pool_goes_first():
     frame = _frame([(f"/docs/{i:02d}.txt", 1.0 - i / 100) for i in range(30)])
-    items = SearchResponse.from_dataframes(
-        [frame], limit=5, pinned=["/docs/27.txt"]
+    items = SearchResponse.from_dataframe(
+        frame, limit=5, pinned=["/docs/27.txt"]
     ).results
     assert [i.absolute_path for i in items] == [
         "/docs/27.txt",
@@ -275,8 +255,8 @@ def test_pinned_document_from_deep_in_the_pool_goes_first():
 
 def test_pinned_order_pool_score_then_documents_read_outside_the_pool():
     for score_col in ("_relevance_score", "_distance"):
-        items = SearchResponse.from_dataframes(
-            [_pool_and_pinned_tail(score_col)],
+        items = SearchResponse.from_dataframe(
+            _pool_and_pinned_tail(score_col),
             limit=4,
             pinned=["/z.txt", "/docs/09.txt", "/docs/05.txt"],
         ).results
@@ -298,8 +278,8 @@ def test_pinned_order_pool_score_then_documents_read_outside_the_pool():
 
 def test_without_pinned_rows_read_outside_the_pool_do_not_outrank_it():
     """Вектор: оценка — минус расстояние, а у дочитанных строк её нет вовсе."""
-    items = SearchResponse.from_dataframes(
-        [_pool_and_pinned_tail("_distance")], limit=20
+    items = SearchResponse.from_dataframe(
+        _pool_and_pinned_tail("_distance"), limit=20
     ).results
     assert items[-1].absolute_path == "/z.txt"
 
@@ -309,8 +289,8 @@ def test_pinned_copy_pins_the_path_kept_in_the_results():
         [("/a/копия.txt", 0.9, "text", "s1"), ("/b/ЦБ_21.txt", 0.8, "text", "s1")]
         + [(f"/docs/{i}.txt", 0.95 - i / 100) for i in range(3)]
     )
-    items = SearchResponse.from_dataframes(
-        [frame], limit=2, pinned=["/b/ЦБ_21.txt"]
+    items = SearchResponse.from_dataframe(
+        frame, limit=2, pinned=["/b/ЦБ_21.txt"]
     ).results
     assert items[0].absolute_path == "/a/копия.txt"
     assert items[0].duplicates == ["/b/ЦБ_21.txt"]
@@ -319,8 +299,8 @@ def test_pinned_copy_pins_the_path_kept_in_the_results():
 
 def test_more_pinned_than_limit_keeps_the_best_pinned():
     frame = _frame([(f"/docs/{i}.txt", 1.0 - i / 10) for i in range(5)])
-    items = SearchResponse.from_dataframes(
-        [frame], limit=1, pinned=["/docs/4.txt", "/docs/3.txt"]
+    items = SearchResponse.from_dataframe(
+        frame, limit=1, pinned=["/docs/4.txt", "/docs/3.txt"]
     ).results
     assert [i.absolute_path for i in items] == ["/docs/3.txt"]
 
@@ -355,9 +335,8 @@ async def test_search_without_pinned_list_does_not_look_for_codes():
     fake = SimpleNamespace(
         cfg=SimpleNamespace(ov_model=SimpleNamespace(async_encode=async_encode)),
         files_store=store,
-        email_store=store,
     )
-    assert await Index.search(fake, "Найди файл ЦБ_21") == [None]
+    assert await Index.search(fake, "Найди файл ЦБ_21") is None
     assert _Table.searches == 1, "ни словаря имён, ни дочитывания"
 
 
@@ -402,9 +381,9 @@ async def test_live_code_of_many_files_and_years_change_nothing(index: Index):  
 
     for query in ("форма v2", "отчёт 2024", "отчёт 2024 15"):
         pinned: list[str] = []
-        frames = await index.search(query, top_k=5, pinned=pinned)
+        frame = await index.search(query, top_k=5, pinned=pinned)
         assert pinned == [], query
-        plain = SearchResponse.from_dataframes(frames, limit=5).results
+        plain = SearchResponse.from_dataframe(frame, limit=5).results
         assert [i.model_dump() for i in await _search(index, query)] == [
             i.model_dump() for i in plain
         ]
@@ -423,11 +402,11 @@ async def test_live_document_outside_the_pool_is_read_in(index: Index):  # noqa:
     await _add(index, rows)
 
     pinned: list[str] = []
-    frames = await index.search(
+    frame = await index.search(
         "резервы obs_286", top_k=3, query_type="text", pinned=pinned
     )
     assert pinned == [path]
-    (frame,) = frames
+    assert frame is not None
     assert (
         frame.filter(pl.col("_score").is_not_null())["path"]
         .str.contains("obs_286")
@@ -443,7 +422,7 @@ async def test_live_document_outside_the_pool_is_read_in(index: Index):  # noqa:
         or read_in["vector"].null_count() == read_in.height
     ), "вектор дочитанным строкам не нужен"
 
-    items = SearchResponse.from_dataframes(frames, limit=3, pinned=pinned).results
+    items = SearchResponse.from_dataframe(frame, limit=3, pinned=pinned).results
     assert len(items) == 3
     assert items[0].absolute_path == path
     # Карточка дочитана, а не найдена: запрос с ней не совпал.
@@ -489,14 +468,14 @@ async def test_live_pinned_document_found_only_by_its_card_gets_fragments(
     await _add(index, rows)
 
     pinned: list[str] = []
-    frames = await index.search(
+    frame = await index.search(
         "журнал наблюдений obs_286", top_k=3, query_type="text", pinned=pinned
     )
     assert pinned == [path]
-    pooled = frames[0].filter(pl.col("_score").is_not_null() & (pl.col("path") == path))
+    pooled = frame.filter(pl.col("_score").is_not_null() & (pl.col("path") == path))
     assert pooled["kind"].to_list() == [CARD_KIND], "в пуле от документа — карточка"
 
-    (item, *_) = SearchResponse.from_dataframes(frames, limit=3, pinned=pinned).results
+    (item, *_) = SearchResponse.from_dataframe(frame, limit=3, pinned=pinned).results
     assert (item.absolute_path, item.match) == (path, ["name_code", "card"])
     assert [c.content for c in item.chunks] == [
         f"Мушкетёры, глава {i}" for i in range(PINNED_CHUNKS)

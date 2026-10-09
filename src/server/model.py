@@ -1,7 +1,7 @@
 import os
 import re
 from collections import defaultdict
-from collections.abc import Collection, Sequence
+from collections.abc import Collection
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -12,12 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from src.common import CARD_KIND, strip_doc_prefix
 
 # Реэкспорт: роутер и тесты берут модели настроек отсюда.
-from src.common.user_config import (  # noqa: F401
-    EMAIL_WINDOW_DAYS,
-    EmailConfig,
-    SberchatConfig,
-    UserConfig,
-)
+from src.common.user_config import SberchatConfig, UserConfig  # noqa: F401
 from src.utils.lance_wrapper import sql_quote
 
 
@@ -67,7 +62,7 @@ class Chunk(BaseModel):
         )
     )
     # Место фрагмента в документе. Необязательные: у строк, записанных до
-    # появления полей, и в выдаче почты их нет.
+    # появления полей, их нет.
     kind: str | None = Field(
         None, description="text / table / table_row / notes / ocr / card"
     )
@@ -152,19 +147,6 @@ class _Hit:
         """Ключ порядка выдачи: найденные по коду из имени — первыми."""
         return (self.pinned, self.pooled, self.score)
 
-    def merge(self, other: "_Hit") -> None:
-        """Добавить строки того же пути из выдачи другого источника."""
-        self.pooled, self.score = max(
-            (self.pooled, self.score), (other.pooled, other.score)
-        )
-        self.pinned = self.pinned or other.pinned
-        self.rows = sorted(self.rows + other.rows, key=_row_rank, reverse=True)[
-            :MAX_FRAGMENTS_PER_DOC
-        ]
-        self.card = self.card or other.card
-        self.title = self.title or other.title
-        self.document = self.document or other.document
-
     def take_meta(self, row: dict[str, Any]) -> None:
         # meta nullable (src/common/doc_meta.py): у старых и мигрированных строк
         # meta=None, и одна такая строка уронила бы весь /search в 500.
@@ -184,7 +166,7 @@ def _distinct_docs(
     duplicates: dict[str, set[str]],
     pinned: Collection[str] = (),
 ) -> list[_Hit]:
-    """Документы выдачи одного источника: не больше limit, в порядке лучшей строки.
+    """Документы выдачи: не больше limit, в порядке лучшей строки.
 
     Копии файла (тот же sha256 под другим путём) мест не занимают: их пути
     уходят в `duplicates` первого встреченного пути. Карточка (kind="card")
@@ -234,7 +216,7 @@ class BaseSearchResponseItem(BaseModel):
     id: str
     title: str
     chunks: list[Chunk]
-    type: Literal["file", "application", "email", "email_attachment"]
+    type: Literal["file", "application"]
     score: float | None = Field(
         description=(
             "Оценка лучшей строки документа. Порядок выдачи: сначала "
@@ -266,105 +248,62 @@ class SearchResponseItemFile(BaseSearchResponseItem):
     absolute_path: str
 
 
-class SearchResponseItemEmail(BaseSearchResponseItem):
-    type: Literal["email"] = "email"  # type: ignore
-    absolute_path: str
-
-
-class SearchResponseItemEmailAttachment(BaseSearchResponseItem):
-    type: Literal["email_attachment"] = "email_attachment"  # type: ignore
-    absolute_path: str
-
-
-SearchResponseItem = Annotated[
-    SearchResponseItemFile
-    | SearchResponseItemEmail
-    | SearchResponseItemEmailAttachment,
-    Field(discriminator="type"),
-]
-
-
 class SearchResponse(BaseModel):
-    results: list[SearchResponseItem]
+    results: list[SearchResponseItemFile]
     total: int
 
     @classmethod
-    def from_dataframe(cls, df: pl.DataFrame | None):
-        return cls.from_dataframes([df])
-
-    @classmethod
-    def from_dataframes(
+    def from_dataframe(
         cls,
-        frames: Sequence[pl.DataFrame | None],
+        df: pl.DataFrame | None,
         limit: int | None = None,
         pinned: Collection[str] = (),
     ):
-        """Собрать ответ из выдач нескольких источников.
+        """Собрать ответ из кадра выдачи (Index.search).
 
-        Построчно, а не через `pl.concat`: схемы расходятся, если по одной
-        таблице гибридный поиск деградировал до векторного — в одной
-        `_relevance_score`, в другой `_distance`.
-
-        limit — документов на источник (None — все из пула), у документа до
-        MAX_FRAGMENTS_PER_DOC лучших фрагментов. pinned — пути, найденные по
+        None — поиск невозможен (например, FTS-индекс ещё не построен): ответ
+        пустой, а не 500. limit — документов (None — все из пула), у документа
+        до MAX_FRAGMENTS_PER_DOC лучших фрагментов. pinned — пути, найденные по
         коду из имени файла (Index.search): идут первыми и несут "name_code" в
         `match`. Порядок задан явно, а не подменой оценок: score остаётся
         настоящей оценкой поиска, у дочитанных вне пула — null.
         """
-        hits: dict[str, _Hit] = {}
+        if df is None:
+            return cls(results=[], total=0)
         duplicates: dict[str, set[str]] = defaultdict(set)
-        pinned = set(pinned)  # проверяется на каждой строке пула
-        # None приходит, когда поиск невозможен (например, FTS-индекс ещё не
-        # построен) — отдаём пустой ответ, а не падаем.
-        for df in frames:
-            if df is None:
-                continue
-            for hit in _distinct_docs(df, limit, duplicates, pinned):
-                if (seen := hits.get(hit.path)) is None:
-                    hits[hit.path] = hit
-                else:
-                    # Один путь в двух кадрах — один документ, а не два
-                    # элемента выдачи.
-                    seen.merge(hit)
-
-        results = []
-        for hit in sorted(hits.values(), key=lambda h: h.rank, reverse=True):
-            file_path = hit.path
-            chunks = [
-                Chunk(
-                    # Строка «Документ: <имя>» нужна индексу, а не читателю:
-                    # имя файла уже в заголовке результата.
-                    content=strip_doc_prefix(
-                        row["text"], (row.get("meta") or {}).get("original_name")
-                    ),
-                    score=_row_score(row) if _has_score(row) else None,
-                    **{k: row.get(k) for k in _CHUNK_PLACE},
-                )
-                for row in hit.rows
-            ]
-            results.append(
-                (
-                    SearchResponseItemFile
-                    if not file_path.startswith("email_")
-                    else SearchResponseItemEmail
-                    if file_path.endswith(":body")
-                    else SearchResponseItemEmailAttachment
-                )(
-                    id=str(file_path),
-                    title=hit.title or Path(file_path).name,
-                    chunks=chunks,
-                    absolute_path=file_path,
-                    score=hit.score if hit.pooled else None,
-                    document=hit.document,
-                    duplicates=sorted(duplicates.get(file_path, ())),
-                    match=[
-                        mark
-                        for mark, on in (("name_code", hit.pinned), ("card", hit.card))
-                        if on
-                    ],
-                )
-            )
+        hits = _distinct_docs(df, limit, duplicates, set(pinned))
+        results = [
+            _result_item(hit, duplicates)
+            for hit in sorted(hits, key=lambda h: h.rank, reverse=True)
+        ]
         return cls(results=results, total=len(results))
+
+
+def _result_item(hit: _Hit, duplicates: dict[str, set[str]]) -> SearchResponseItemFile:
+    chunks = [
+        Chunk(
+            # Строка «Документ: <имя>» нужна индексу, а не читателю: имя файла
+            # уже в заголовке результата.
+            content=strip_doc_prefix(
+                row["text"], (row.get("meta") or {}).get("original_name")
+            ),
+            score=_row_score(row) if _has_score(row) else None,
+            **{k: row.get(k) for k in _CHUNK_PLACE},
+        )
+        for row in hit.rows
+    ]
+    return SearchResponseItemFile(
+        id=hit.path,
+        title=hit.title or Path(hit.path).name,
+        chunks=chunks,
+        absolute_path=hit.path,
+        score=hit.score if hit.pooled else None,
+        document=hit.document,
+        duplicates=sorted(duplicates.get(hit.path, ())),
+        match=[
+            mark for mark, on in (("name_code", hit.pinned), ("card", hit.card)) if on
+        ],
+    )
 
 
 # Расширение в фильтре: только латиница и цифры, как у разбираемых форматов.
@@ -534,15 +473,13 @@ class SearchRequest(BaseModel):
     query: str
     # Пул чанков растёт с limit (search_pool в src/indexer/indexer.py). Потолок
     # нужен: огромная выдача собиралась бы в pydantic прямо в event loop.
-    limit: int = Field(
-        10, ge=1, le=1000, description="Сколько документов вернуть на источник"
-    )
+    limit: int = Field(10, ge=1, le=1000, description="Сколько документов вернуть")
     query_type: Literal["hybrid", "vector", "text"] = "hybrid"
-    # Только файлы по умолчанию: письма ищутся своим top_k в своей таблице,
-    # и смешанная выдача — явный выбор клиента.
+    # Принимается ради старых клиентов: почты в индексе нет, "email" даёт пусто.
     sources: list[Literal["files", "email"]] = Field(
         default_factory=lambda: ["files"],
-        description="Источники поиска; каждый получает свой limit документов",
+        description='Устарело: ищутся только файлы, ["email"] даёт пустой ответ',
+        json_schema_extra={"deprecated": True},
     )
     filters: SearchFilters | None = Field(
         None,
@@ -569,22 +506,13 @@ class SearchRequest(BaseModel):
         if not value:
             raise ValueError("нужен хотя бы один источник")
         if len(set(value)) != len(value):
-            # Повтор дал бы двойной top_k из одной таблицы.
             raise ValueError("источники не должны повторяться")
         return value
 
 
 # Тело POST /config строже базовых моделей из src/common/user_config.py: те же
-# классы читают user_conf.yml и секцию email YAML-конфига, где лишний ключ не
-# должен обнулять настройки или ронять старт, а в запросе опечатка давала бы
-# 200 без изменений.
-class EmailConfigUpdate(EmailConfig):
-    model_config = ConfigDict(extra="forbid")
-
-    # Окно — от одного дня; без ограничения — явный null.
-    index_last_n_days: int | None = Field(EMAIL_WINDOW_DAYS, ge=1)
-
-
+# классы читают user_conf.yml, где лишний ключ не должен обнулять настройки, а в
+# запросе опечатка давала бы 200 без изменений.
 class SberchatConfigUpdate(SberchatConfig):
     model_config = ConfigDict(extra="forbid")
 
@@ -592,7 +520,14 @@ class SberchatConfigUpdate(SberchatConfig):
 class UserConfigUpdate(UserConfig):
     model_config = ConfigDict(extra="forbid")
 
-    email: EmailConfigUpdate = Field(default_factory=EmailConfigUpdate)
+    # Принимается ради старых клиентов и скриптов НТ, которые шлют конфиг
+    # целиком: почты больше нет, значение не сохраняется.
+    email: dict[str, Any] | None = Field(
+        None,
+        exclude=True,
+        description="Устарело: почты больше нет, поле игнорируется",
+        json_schema_extra={"deprecated": True},
+    )
     sberchat: SberchatConfigUpdate = Field(default_factory=SberchatConfigUpdate)
 
 
@@ -607,14 +542,6 @@ class IndexingControlResponse(BaseModel):
         )
     )
     detail: str = Field(description="Что произошло, человекочитаемо")
-
-
-class RequestFilePath(BaseModel):
-    absolute_path: str = Field(description="Исходный путь файла")
-
-
-class ResponseFilePath(BaseModel):
-    absolute_temp_path: str = Field(description="Новый путь файла в tmp директории")
 
 
 class ReadFileRequest(BaseModel):

@@ -24,3 +24,18 @@ def config():
     cfg = Config()
     set_config(cfg)
     return cfg
+
+
+@fixture
+def user_conf_config(config, tmp_path, monkeypatch):
+    """Сессионный Config с user_conf.yml во временном каталоге."""
+    monkeypatch.setattr(config, "data_directory", str(tmp_path / "ragsearch"))
+    _forget_user_conf_paths(config)
+    yield config
+    _forget_user_conf_paths(config)
+
+
+def _forget_user_conf_paths(cfg: Config) -> None:
+    # Пути кэшируют cached_property: без сброса тест читал бы чужой каталог.
+    cfg.__dict__.pop("user_conf_path", None)
+    cfg.__dict__.pop("data_directory_path", None)

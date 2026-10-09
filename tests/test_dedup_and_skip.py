@@ -50,10 +50,10 @@ async def test_three_copies_give_one_result_with_two_duplicates(index: Index):  
     store = index.cfg.lance.files
     await store.add_batch(_table(rows, index.cfg.ov_model.encode))
 
-    frames = await index.search(
+    frame = await index.search(
         "квартальный отчёт банка о прибыли", top_k=3, query_type="vector"
     )
-    items = SearchResponse.from_dataframes(frames, limit=3).results
+    items = SearchResponse.from_dataframe(frame, limit=3).results
     paths = [i.absolute_path for i in items]
     report_items = [i for i in items if i.absolute_path in COPIES]
     assert len(report_items) == 1, "три копии — один результат"
@@ -69,12 +69,12 @@ async def test_three_copies_give_one_result_with_two_duplicates(index: Index):  
     }
 
     store.delete_sync(f"path = '{COPIES[2]}'")  # одну копию удалили с диска
-    frames = await index.search(
+    frame = await index.search(
         "квартальный отчёт банка о прибыли", top_k=3, query_type="vector"
     )
     item = next(
         i
-        for i in SearchResponse.from_dataframes(frames, limit=3).results
+        for i in SearchResponse.from_dataframe(frame, limit=3).results
         if i.absolute_path in COPIES
     )
     assert len(item.duplicates) == 1 and COPIES[2] not in [
@@ -101,7 +101,7 @@ def test_without_copies_response_is_unchanged():
     frame = _frame(
         [("/x/a.txt", 0.9, "1"), ("/y/b.txt", 0.8, "2"), ("/x/a.txt", 0.7, "1")]
     )
-    response = SearchResponse.from_dataframes([frame], limit=3)
+    response = SearchResponse.from_dataframe(frame, limit=3)
     assert [i.absolute_path for i in response.results] == ["/x/a.txt", "/y/b.txt"]
     assert all(i.duplicates == [] for i in response.results)
     assert [len(i.chunks) for i in response.results] == [2, 1]
@@ -116,7 +116,7 @@ def test_copies_do_not_take_slots():
             ("/w/c.txt", 0.7, "3"),
         ]
     )
-    items = SearchResponse.from_dataframes([frame], limit=2).results
+    items = SearchResponse.from_dataframe(frame, limit=2).results
     assert [(i.absolute_path, i.duplicates) for i in items] == [
         ("/x/a.txt", ["/z/a.txt"]),
         ("/y/b.txt", []),
@@ -171,10 +171,8 @@ def test_utf8_with_few_broken_bytes_stays_utf8(data):
 
 
 def test_request_parameters_ignore_case():
-    request = SearchRequest(
-        query="отчёт", query_type="Hybrid", sources=["Files", " EMAIL "]
-    )
-    assert (request.query_type, request.sources) == ("hybrid", ["files", "email"])
+    request = SearchRequest(query="отчёт", query_type="Hybrid", sources=[" Files "])
+    assert (request.query_type, request.sources) == ("hybrid", ["files"])
 
 
 def test_folder_exclusion_ignores_case():

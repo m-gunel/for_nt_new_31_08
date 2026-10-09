@@ -40,8 +40,6 @@ CONFIG_PATH=cfg/mcp.yml RAG_PORT=8000 .venv/bin/python main.py &
   плагин дробит пул на streams по числу ядер и отдаёт каждому по одному потоку — индексация
   замедляется в разы. Число каналов задаётся явно: `DEFAULT_INFERENCE_STREAMS = 2`
   (`RAG_OV_NUM_STREAMS`) — ровно по числу каналов инференса, search и index.
-- `email.enabled: false` в `config/mcp.yml` — включение делает индекс огромным и активирует гонку
-  за OpenVINO Infer Request.
 - Индексируемые папки задаются в `cfg/mcp.yml` (`file_scan_cfg.paths`) и через
   `POST /api/v1/config`. Держите компактный набор: под наблюдение inotify попадает каждый
   вложенный подкаталог, и домашний каталог целиком упирается в `fs.inotify.max_user_watches`.
@@ -65,22 +63,22 @@ CONFIG_PATH=cfg/mcp.yml RAG_PORT=8000 .venv/bin/python main.py &
 
 ## Ядро API (для справки)
 - HTTP sidecar (127.0.0.1:8000): `GET /api/v1/health`, `GET /api/v1/status`,
-  `POST /api/v1/search`, `GET|POST /api/v1/config`, `POST /api/v1/get_file_path`,
+  `POST /api/v1/search`, `GET|POST /api/v1/config`,
   `POST /api/v1/read_file` (полный текст файла из индексируемых папок — через неё
   `local_read_file` читает pdf и офисные форматы).
   Управление индексацией (БТ §5.1-5.3): `POST /api/v1/activate`,
   `POST /api/v1/deactivate`, `POST /api/v1/reset` (query `keep_config`).
   Swagger — `/docs` и `/openapi.json` (`/api/v1/docs`, `/api/v1/openapi.json` —
-  редиректы на них). Других ручек нет — `/paths`, `/email`, `/rescan` не
-  существуют; смена списка папок и тумблер почты идут через `POST /api/v1/config`.
+  редиректы на них). Других ручек нет — `/paths`, `/rescan` не
+  существуют; смена списка папок идёт через `POST /api/v1/config`.
 - Запросы с не-loopback `Host` (400) или `Origin` (403) демон отклоняет — защита
   от DNS rebinding и CSRF из браузера; мост и curl `Origin` не шлют и проходят.
   Другие имена хоста — `RAG_ALLOWED_HOSTS` (через запятую). Аутентификации нет:
   процесс другой учётки на том же АРМ до API достучится.
 - MCP-мост: `mcp_server.py` (чистый stdlib) + `mcp_launcher.sh`. По умолчанию
-  агенту видны все восемь инструментов: `local_search`,
-  `local_index_status`, `local_read_file` и пять управления индексацией
-  (папки, почта, переиндексация; реализованы поверх `GET|POST /api/v1/config`).
+  агенту видны все семь инструментов: `local_search`,
+  `local_index_status`, `local_read_file` и четыре управления индексацией
+  (папки, переиндексация; реализованы поверх `GET|POST /api/v1/config`).
   Write-инструменты прячет `LQRAG_ALLOW_WRITE=0` — opt-out для закрытых установок.
 - Мост собирается в `dist/mcp/` целью `make dist_mcp` (её вызывает `make build`):
   PyInstaller пакует только `main.py`, и без этого мост не попадает в `distro.zip`.

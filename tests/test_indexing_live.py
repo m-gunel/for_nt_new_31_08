@@ -78,8 +78,12 @@ async def _fail_calls(path) -> list[bool]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", [RuntimeError("сбой инференса"), OSError("файл занят")])
-async def test_transient_parse_error_does_not_mark_indexed(tmp_path, monkeypatch, error):
+@pytest.mark.parametrize(
+    "error", [RuntimeError("сбой инференса"), OSError("файл занят")]
+)
+async def test_transient_parse_error_does_not_mark_indexed(
+    tmp_path, monkeypatch, error
+):
     """Временный или непредвиденный сбой разбора не помечает файл обработанным.
 
     Иначе повторная попытка не случится никогда — даже после перезапуска
@@ -93,7 +97,9 @@ async def test_transient_parse_error_does_not_mark_indexed(tmp_path, monkeypatch
     monkeypatch.setattr(DocxParser, "parse_io", fail)
     doc = tmp_path / "doc.docx"
     doc.write_bytes(b"PK\x03\x04")
-    assert await _fail_calls(doc) == [False], "сбой разбора не должен считаться окончательным"
+    assert await _fail_calls(doc) == [False], (
+        "сбой разбора не должен считаться окончательным"
+    )
 
 
 @pytest.mark.asyncio
@@ -105,8 +111,14 @@ async def test_corrupt_file_is_skipped_with_one_warning_line(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         assert await _fail_calls(broken) == [True]
     lines = [r for r in caplog.records if str(broken) in r.getMessage()]
-    assert len(lines) == 1 and lines[0].levelname == "WARNING" and lines[0].exc_info is None
-    assert all(r.exc_info is None for r in caplog.records), "в журнале не должно быть стека"
+    assert (
+        len(lines) == 1
+        and lines[0].levelname == "WARNING"
+        and lines[0].exc_info is None
+    )
+    assert all(r.exc_info is None for r in caplog.records), (
+        "в журнале не должно быть стека"
+    )
 
 
 @pytest.mark.asyncio
@@ -342,10 +354,6 @@ async def test_reconcile_removes_stale(index: Index, tmp_path):
         await index.cfg.lance.files.add_batch(
             _chunk_table(path, "содержимое", index.cfg.embed_dim)
         )
-    # у писем файла на диске нет — сверка не должна их трогать
-    await index.lsm_collection.indexed.async_set(
-        "email_INBOX:0:10", FileMetadata("email_INBOX:0:10", 10, 1)
-    )
 
     removed = await index.reconcile_deleted()
 
@@ -353,7 +361,6 @@ async def test_reconcile_removes_stale(index: Index, tmp_path):
     paths = index.cfg.lance.files.table.search().limit(100).to_list()
     assert {row["path"] for row in paths} == {str(alive)}
     assert await index.lsm_collection.indexed.async_get(gone) is None
-    assert await index.lsm_collection.indexed.async_get("email_INBOX:0:10") is not None
     assert not os.path.exists(gone)
 
 

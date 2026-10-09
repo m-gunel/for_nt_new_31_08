@@ -72,8 +72,7 @@ def pq_num_sub_vectors(embed_dim: int, target_sub_dim: int = PQ_TARGET_SUB_DIM) 
 class LanceWrapper:
     """Одна таблица LanceDB: её схема, её индексы, её хендлы.
 
-    Экземпляр на источник данных (см. `LanceTables`); локи и кэши свои,
-    поэтому таблицы не ждут друг друга.
+    Локи и кэши — свои у экземпляра (см. `LanceTables`).
     """
 
     def __init__(
@@ -258,7 +257,7 @@ class LanceWrapper:
         {параметр: (в индексе, в конфиге)}. Индекс без `index_details` или без
         параметра считается расходящимся: его построила старая версия lancedb.
 
-        Не через self.table: обращение к нему создало бы таблицу почты.
+        Не через self.table: обращение к нему создало бы таблицу.
         Параметры берутся из lancedb, а не из модуля lance: его может не
         оказаться в сборке (см. optimize_indices).
         """
@@ -415,55 +414,6 @@ class LanceWrapper:
             return 0
         return self.table.count_rows(predicate)
 
-    def paths_matching(self, predicate: str) -> set[str]:
-        """Пути строк под фильтром. Пусто — если таблицы ещё нет."""
-        if not self.has_table:
-            return set()
-        rows = self.table.search().where(predicate).select(["path"]).limit(None)
-        return set(rows.to_arrow().column("path").to_pylist())
-
-    def move_rows_to(
-        self, target: "LanceWrapper", predicate: str, batch_size: int = 1024
-    ) -> int:
-        """Перенести строки в другую таблицу. Возвращает число перенесённых.
-
-        Перенос, а не переиндексация: схема одна, векторы уже посчитаны.
-        Сначала копирование целиком, потом удаление — удаление по пути между
-        батчами снесло бы ещё не скопированные чанки того же письма (путь у
-        них общий).
-
-        Повтор после обрыва безопасен: копии путей, которые ещё лежат здесь,
-        из target сначала удаляются, остальные строки target не трогаются.
-        Чтение — запросом lancedb, а не через модуль lance: его может не быть
-        в сборке.
-        """
-        if not self.has_table:
-            return 0
-        expected = self.count_matching(predicate)
-        if not expected:
-            return 0
-        copied = sorted(
-            self.paths_matching(predicate) & target.paths_matching(predicate)
-        )
-        for i in range(0, len(copied), DELETE_BATCH):
-            batch_paths = copied[i : i + DELETE_BATCH]
-            quoted = ", ".join(f"'{sql_quote(p)}'" for p in batch_paths)
-            target.delete_sync(f"path IN ({quoted})")
-        moved = 0
-        query = self.table.search().where(predicate).limit(None)
-        for batch in query.to_batches(batch_size):
-            if not batch.num_rows:
-                continue
-            target.add_sync(pa.Table.from_batches([batch]))
-            moved += batch.num_rows
-        if moved != expected:
-            # Исходные удаляются тем же фильтром: недочитанные строки пропали бы.
-            raise RuntimeError(
-                f"перенесено {moved} строк из {expected}, исходные оставлены"
-            )
-        self.delete_sync(predicate)
-        return moved
-
     def add_sync(self, data) -> None:
         """Синхронная запись — для путей, которые и так идут в потоке."""
         self.table.add(data)
@@ -498,14 +448,6 @@ class LanceWrapper:
 
 
 class LanceTables(NamedTuple):
-    """Хранилища проекта: отдельно файлы, отдельно почта.
+    """Таблицы индекса; `for store in cfg.lance` обходит их все."""
 
-    Раздельные таблицы, а не одна с колонкой-источником: `.limit(top_k)`
-    работает по таблице, и в общей письма вытесняют файлы из выдачи. Заодно
-    у каждой свой IVF-PQ, а выключение почты — дроп таблицы.
-    """
-
-    # NamedTuple обходится по полям в порядке объявления, поэтому
-    # `for store in cfg.lance` — это «по обеим таблицам».
     files: LanceWrapper
-    email: LanceWrapper

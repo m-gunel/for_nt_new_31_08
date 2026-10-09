@@ -91,7 +91,6 @@ async def test_migration_rebuilds_old_index(index: Index):  # noqa: F811
     # Через тот же закэшированный хендл: без пометки «устарел» поиск остался
     # бы на старом индексе, где длинного слова нет.
     assert _found(store, LONG) == ["/tmp/кредит.txt"]
-    assert not index.email_store.has_table, "миграция не должна создавать таблицу почты"
 
 
 @pytest.mark.asyncio
@@ -117,7 +116,6 @@ async def test_migration_skips_matching_index(index: Index):  # noqa: F811
 async def test_migration_without_tables_does_nothing(index: Index):  # noqa: F811
     assert await index.migrate_fts_config() == []
     assert not index.files_store.has_table
-    assert not index.email_store.has_table
 
 
 @pytest.mark.asyncio

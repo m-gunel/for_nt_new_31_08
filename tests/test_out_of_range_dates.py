@@ -1,40 +1,36 @@
-"""Файл или письмо с датой вне диапазона хранилищ не обрывает проход.
+"""Файл с датой вне диапазона хранилищ не обрывает проход.
 
 mtime в LSM — беззнаковые 32 бита (`<QL`), даты в Lance — timestamp("ns")
 (1677–2262). Дата до 1970 года или после 2106-го (копии с SMB, tar-архивы,
-`touch -d`, письма с кривым Date) не должна ронять ни отметку в LSM, ни запись
-батча: иначе проход обрывается на этом файле каждый раз, и всё, что стоит в
-очереди после него, не индексируется.
+`touch -d`) не должна ронять ни отметку в LSM, ни запись батча: иначе проход
+обрывается на этом файле каждый раз, и всё, что стоит в очереди после него,
+не индексируется.
 """
 
 import os
 import struct
 from datetime import UTC, datetime
 
-import aiofiles
 import pyarrow as pa
 import pytest
 import pytest_asyncio as pa_fixture
 from pytest import fixture
 
-from src.common import FileMetadata, chunk_with_meta_schema
+from src.common import FileMetadata
 from src.common.doc_meta import (
     datetime_from_timestamp,
     doc_meta_schema,
     storable_datetime,
 )
-from src.config import Config, EmailConfig
+from src.config import Config
 from src.indexer.indexer import Index
-from src.parsers import _process_email_chunks
 from src.parsers.metadata import file_metadata
-from src.thunderbird.lazy_iter_mbox import iter_emails_as_metadata
 from src.utils.lsm_adapter import (
     LSMTable,
     _decode_file_meta,
     _encode_file_meta,
     check_meta_changed,
 )
-from tests.mbox_fixture import make_plain_email, make_profile
 
 # 1969-12-31; 1601-01-01 (нулевой FILETIME с SMB); сразу за 2106-02-07;
 # 2302 год (APFS зажимает до 2262-04-12).
@@ -107,51 +103,6 @@ def test_file_metadata_with_far_future_mtime_fits_schema(tmp_path):
     pa.array([meta], pa.struct(doc_meta_schema))  # без ArrowInvalid
 
 
-@fixture
-def mail_root(tmp_path):
-    messages = [
-        make_plain_email(
-            "Из будущего",
-            "тело письма с датой 2300 года",
-            msg_id="future@fixture",
-            date=datetime(2300, 1, 1, tzinfo=UTC),
-        ),
-        make_plain_email(
-            "Из прошлого",
-            "тело письма с датой 1601 года",
-            msg_id="past@fixture",
-            date=datetime(1601, 1, 2, tzinfo=UTC),
-        ),
-    ]
-    return make_profile(tmp_path / "tb-profile", {"INBOX": messages})
-
-
-@pytest.mark.asyncio
-async def test_email_with_out_of_range_date_fits_storage(config: Config, mail_root):
-    metas = [
-        meta
-        for _start, meta in iter_emails_as_metadata(
-            str(mail_root / "INBOX"), prefix="email_INBOX:"
-        )
-        if meta is not None
-    ]
-    assert len(metas) == 2
-
-    async def fail_cb(meta, *, permanent):
-        raise AssertionError(f"письмо {meta.path} не разобрано")
-
-    chunks = []
-    async with aiofiles.open(mail_root / "INBOX", "rb") as f:
-        for meta in metas:
-            _encode_file_meta(meta)  # отметка в LSM без struct.error
-            async for chunk in _process_email_chunks({"INBOX": f}, meta, fail_cb):
-                chunks.append(chunk)
-
-    assert chunks
-    assert all(c["meta"]["date_created"] is None for c in chunks)
-    pa.RecordBatch.from_pylist(chunks, schema=chunk_with_meta_schema)
-
-
 @fixture(params=[-86400, 2**32 + 100, 10_500_000_000])
 def bad_mtime_config(config: Config, tmp_path, monkeypatch, request):
     docs = tmp_path / "docs"
@@ -170,7 +121,6 @@ def bad_mtime_config(config: Config, tmp_path, monkeypatch, request):
     monkeypatch.setattr(config, "data_directory", str(tmp_path / "ragsearch"))
     config.__dict__.pop("user_conf_path", None)
     config.__dict__.pop("data_directory_path", None)
-    monkeypatch.setattr(config, "email", EmailConfig(enabled=False))
     monkeypatch.setattr(config.file_scan_cfg, "paths", [str(docs)])
     # Маленький батч записи: файлы идут разными батчами, как на большом корпусе.
     monkeypatch.setattr(config, "parquet_record_batch_size", 2)

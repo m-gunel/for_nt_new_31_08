@@ -480,7 +480,7 @@ def _sheet(ws, n: int, budget: Budget, limit: int) -> tuple[list[Block], str | N
 @parser("xlsx", "xls")
 class XlsxParser(Parser):
     def parse_io(self, file: BinaryIO) -> ParsedDoc:
-        # Формат узнаём по сигнатуре, а не по расширению: во вложениях почты имени нет.
+        # Формат узнаём по сигнатуре, а не по расширению: оно бывает неверным.
         head = file.read(8)
         file.seek(0)
         if head.startswith(b"\xd0\xcf\x11\xe0"):

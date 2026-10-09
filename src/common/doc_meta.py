@@ -6,18 +6,10 @@ from typing import NamedTuple, NotRequired, TypedDict
 
 import pyarrow as pa
 
-# Префикс ключа письма: "email_<папка>:<начало>:<конец>". После разбора путь —
-# единственный носитель источника: `file_meta` в схему таблицы не входит.
-EMAIL_PREFIX = "email_"
-
 # Строка сверху каждого чанка документа: имя файла попадает и в BM25, и в вектор,
 # и чанк «знает», из какого он документа (похожие отчёты разных банков и лет).
 # Хранится в text; выдача её снимает — имя и так в заголовке результата.
 DOC_PREFIX = "Документ: "
-
-
-def is_email_path(path: str) -> bool:
-    return path.startswith(EMAIL_PREFIX)
 
 
 def doc_prefix(original_name: str | None) -> str:
@@ -131,11 +123,13 @@ class Chunk(TypedDict):
 
 class DocumentMetadata(TypedDict, total=False):
     # date_created — время рождения файла (не ctime: тот меняется от chmod и
-    # копирования); ОС не знает его — None. Для писем — дата письма.
+    # копирования); ОС не знает его — None.
     date_created: datetime | None
     date_modified: datetime | None
     original_name: str | None
     ext: str | None
+    # Поля писем: почты в индексе больше нет, но колонки остаются в схеме —
+    # иначе таблицы прежних версий пришлось бы пересобирать. У файлов — null.
     th_message_id: str | None
     conversation_id: str | None
     offset_start: int | None
@@ -145,7 +139,7 @@ class DocumentMetadata(TypedDict, total=False):
     size: int | None
     sha256: str | None  # одинаковые файлы в разных папках, кэш OCR
     mime: str | None  # по сигнатуре содержимого
-    source_type: str | None  # file / email / email_attachment
+    source_type: str | None  # file
     source_uri: str | None  # file:///…
     origin_url: str | None  # откуда скачан (user.xdg.origin.url)
     # Свойства самого документа.

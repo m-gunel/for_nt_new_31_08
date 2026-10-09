@@ -38,7 +38,7 @@ echo "Будет удалено:"
 echo "  $STATE   (индексы, состояние LSM, очереди, port, pid)"
 [ -z "$INDEX_HOME" ] || echo "  $INDEX_HOME   (индекс LanceDB, лог)"
 [ -z "${RAG_LD_DB_PATH:-}" ] || echo "  $RAG_LD_DB_PATH   (индекс LanceDB)"
-echo "  $USER_CONF        (пользовательский конфиг: список папок, настройки почты)"
+echo "  $USER_CONF        (пользовательский конфиг: список папок)"
 echo "  временные выдачи ${TMPDIR:-/tmp}/rag_file_*"
 echo "  запись localrag из конфига MCP-агента"
 echo
@@ -157,7 +157,7 @@ for target in "$STATE" "$INDEX_HOME" "${RAG_LD_DB_PATH:-}" "$USER_CONF"; do
     fi
 done
 
-# Временные выдачи POST /get_file_path — только свои: каталог общий.
+# Временные выдачи прежних версий (POST /get_file_path) — только свои: каталог общий.
 find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'rag_file_*' -user "$(id -u)" \
     -exec rm -rf {} + 2>/dev/null || true
 echo "  удалены временные выдачи ${TMPDIR:-/tmp}/rag_file_*"

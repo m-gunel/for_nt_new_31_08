@@ -15,7 +15,6 @@ WRITE_TOOL_NAMES = [
     "local_list_paths",
     "local_add_path",
     "local_remove_path",
-    "local_set_email",
     "local_trigger_rescan",
 ]
 
@@ -29,7 +28,11 @@ def test_initialize_keeps_known_protocol_version(bridge):
     """Клиенту отвечают его версией, если мы её поддерживаем."""
     result = bridge.request(
         "initialize",
-        {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "t"}},
+        {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "t"},
+        },
     )["result"]
     assert result["protocolVersion"] == "2024-11-05"
     assert result["serverInfo"]["name"] == "localrag-mcp"
@@ -51,9 +54,11 @@ def test_capabilities_do_not_promise_list_changed(bridge):
     assert caps["tools"].get("listChanged") is not True
 
 
-def test_default_surface_is_all_eight_tools(bridge):
+def test_default_surface_is_all_tools(bridge):
     """Пульт у агента один: write-инструменты видны без дополнительных флагов."""
-    assert [tool["name"] for tool in bridge.tools()] == READ_TOOL_NAMES + WRITE_TOOL_NAMES
+    assert [
+        tool["name"] for tool in bridge.tools()
+    ] == READ_TOOL_NAMES + WRITE_TOOL_NAMES
 
 
 def test_write_tools_hidden_only_by_explicit_opt_out(bridge_factory):  # noqa: F811
@@ -121,7 +126,13 @@ def test_descriptions_carry_no_personal_data(bridge_factory):  # noqa: F811
     """Описания уезжают в промпт модели — личных путей в них быть не должно."""
     bridge = bridge_factory(LQRAG_ALLOW_WRITE="1")
     dump = json.dumps(bridge.tools(), ensure_ascii=False)
-    for leak in ("news_briefing", "spec-master", "agentanal", "sigma.sbrf.ru", "/home/work"):
+    for leak in (
+        "news_briefing",
+        "spec-master",
+        "agentanal",
+        "sigma.sbrf.ru",
+        "/home/work",
+    ):
         assert leak not in dump, leak
 
 

@@ -121,22 +121,18 @@ class _StubIndex:
         # Полный проход и его доигрывание.
         self._scan_lock = asyncio.Lock()
         self._rescan_requested = False
-        self.scan_calls: list[bool] = []
         # Запись чанков.
         self.counter = UniqueCounter()
         self.lsm_collection = SimpleNamespace(indexed=_FakeIndexed(self.recorder))
         self.files_store = store
-        # Отдельный объект: `store is self.email_store` решает, открывать ли mbox.
-        self.email_store = object()
         # Что трогают activate/deactivate.
         self.calls: list[str] = []
-        self.emails_task: asyncio.Task | None = None
         self._dirty_stores: set[str] = set()
         self._index_task: asyncio.Task | None = None
 
     # Заглушки тяжёлых частей.
-    async def _scan_all(self, emails_only: bool = False) -> None:
-        self.scan_calls.append(emails_only)
+    async def _scan_all(self) -> None:
+        pass
 
     async def start_reindex(self) -> None:
         self.calls.append("start_reindex")
@@ -146,9 +142,6 @@ class _StubIndex:
 
     async def _stop_index_refresh(self) -> None:
         self.calls.append("stop_index_refresh")
-
-    async def start_emails_polling(self, immediate: bool = False) -> None:
-        self.calls.append("start_emails_polling")
 
 
 @pytest_asyncio.fixture
@@ -194,7 +187,7 @@ def _install_chunk_pipeline(
     # поднимет настоящий OpenVINO ради partial().
     monkeypatch.setitem(config.__dict__, "ov_model", _FakeEmbedModel())
 
-    async def fake_parse(files, *, fail_cb, with_emails: bool = False):
+    async def fake_parse(files, *, fail_cb):
         # Как настоящий async_parse_files: файлы строго по одному, все чанки
         # файла подряд — именно на этом держится определение «дочитан».
         async for meta in files:
@@ -246,21 +239,19 @@ async def test_periodic_rescan_is_disabled_by_non_positive_interval(
 
 @pytest.mark.asyncio
 async def test_periodic_rescan_runs_when_indexer_is_idle(stub: _StubIndex):
-    """В простое проход обязан состояться — и именно полный, а не почтовый."""
-    calls: list[bool] = []
+    """В простое проход обязан состояться."""
+    passes = 0
 
-    async def fake_scan_all(emails_only: bool = False) -> None:
-        calls.append(emails_only)
+    async def fake_scan_all() -> None:
+        nonlocal passes
+        passes += 1
 
     stub.scan_all = fake_scan_all  # type: ignore[method-assign]
 
     await stub.start_periodic_rescan()
     assert stub.rescan_task is not None, "задача периодического прохода не создана"
 
-    assert await _wait_until(lambda: bool(calls)), "проход в простое не состоялся"
-    assert all(only is False for only in calls), (
-        "по расписанию нужен полный проход: почтовый и так повторяет поллинг"
-    )
+    assert await _wait_until(lambda: passes > 0), "проход в простое не состоялся"
 
 
 @pytest.mark.parametrize(
@@ -283,10 +274,11 @@ async def test_periodic_rescan_skipped_while_indexer_is_busy(
     нагрузку, а на деактивированном индексе нарушает БТ §5.2. Вторая половина
     теста проверяет, что задача при этом жива.
     """
-    calls: list[bool] = []
+    passes = 0
 
-    async def fake_scan_all(emails_only: bool = False) -> None:
-        calls.append(emails_only)
+    async def fake_scan_all() -> None:
+        nonlocal passes
+        passes += 1
 
     stub.scan_all = fake_scan_all  # type: ignore[method-assign]
     setattr(stub, attr, busy)
@@ -294,10 +286,10 @@ async def test_periodic_rescan_skipped_while_indexer_is_busy(
     await stub.start_periodic_rescan()
     await asyncio.sleep(_TICK * 15)
 
-    assert calls == [], f"проход пошёл, хотя {attr}={busy!r}"
+    assert passes == 0, f"проход пошёл, хотя {attr}={busy!r}"
 
     setattr(stub, attr, idle)
-    assert await _wait_until(lambda: bool(calls)), (
+    assert await _wait_until(lambda: passes > 0), (
         "задача пропустила проход и больше не проснулась"
     )
 
@@ -309,18 +301,19 @@ async def test_periodic_rescan_survives_failing_pass(stub: _StubIndex):
     Задача — единственная страховка поверх watcher'а: без неё после первой
     ошибки индекс больше не сверялся бы с диском.
     """
-    calls: list[bool] = []
+    passes = 0
 
-    async def flaky(emails_only: bool = False) -> None:
-        calls.append(emails_only)
-        if len(calls) == 1:
+    async def flaky() -> None:
+        nonlocal passes
+        passes += 1
+        if passes == 1:
             raise RuntimeError("проход упал")
 
     stub.scan_all = flaky  # type: ignore[method-assign]
 
     await stub.start_periodic_rescan()
 
-    assert await _wait_until(lambda: len(calls) >= 2), (
+    assert await _wait_until(lambda: passes >= 2), (
         "после упавшего прохода задача не сделала следующий"
     )
     assert stub.rescan_task is not None and not stub.rescan_task.done()
@@ -361,7 +354,7 @@ async def test_activate_starts_rescan_and_deactivate_stops_it(stub: _StubIndex):
     task = stub.rescan_task
     assert task is not None and not task.done(), "активация не подняла проход"
     # Активация поднимает и саму индексацию, а не только проход.
-    assert stub.calls == ["start_reindex", "start_emails_polling"], (
+    assert stub.calls == ["start_reindex"], (
         f"активация подняла проход, но не индексацию: {stub.calls}"
     )
 
@@ -381,11 +374,12 @@ async def test_failed_pass_still_replays_requested_rescan(stub: _StubIndex):
     поднимается после доигрывания.
     """
     boom = RuntimeError("проход упал на середине")
-    calls: list[bool] = []
+    passes = 0
 
-    async def flaky(emails_only: bool = False) -> None:
-        calls.append(emails_only)
-        if len(calls) == 1:
+    async def flaky() -> None:
+        nonlocal passes
+        passes += 1
+        if passes == 1:
             # Запрос на полный проход пришёл, пока текущий ещё шёл.
             stub._rescan_requested = True
             raise boom
@@ -395,9 +389,7 @@ async def test_failed_pass_still_replays_requested_rescan(stub: _StubIndex):
     with pytest.raises(RuntimeError) as excinfo:
         await stub.scan_all()
 
-    assert calls == [False, False], (
-        "отложенный полный проход потерян: падение текущего его съело"
-    )
+    assert passes == 2, "отложенный полный проход потерян: падение текущего его съело"
     assert excinfo.value is boom, "исходная ошибка прохода подменена или потеряна"
     assert stub._rescan_requested is False, "флаг доигрывания не снят"
     assert not stub._scan_lock.locked(), "лок прохода не отпущен после ошибки"
@@ -412,10 +404,11 @@ async def test_cancelled_pass_does_not_replay_rescan(stub: _StubIndex):
     (stop_index на POST /config и /deactivate) стала бы обычной ошибкой, и
     отменённая задача пошла бы доигрывать полный проход.
     """
-    calls: list[bool] = []
+    passes = 0
 
-    async def cancelled(emails_only: bool = False) -> None:
-        calls.append(emails_only)
+    async def cancelled() -> None:
+        nonlocal passes
+        passes += 1
         raise asyncio.CancelledError
 
     stub._scan_all = cancelled  # type: ignore[method-assign]
@@ -424,10 +417,9 @@ async def test_cancelled_pass_does_not_replay_rescan(stub: _StubIndex):
     with pytest.raises(asyncio.CancelledError):
         await stub.scan_all()
 
-    assert calls == [False], "отменённый проход всё-таки доигрывали"
+    assert passes == 1, "отменённый проход всё-таки доигрывали"
     assert stub._rescan_requested is True, (
-        "запрос на полный проход съеден отменой — после активации его никто "
-        "не повторит"
+        "запрос на полный проход съеден отменой — после активации его никто не повторит"
     )
 
 
@@ -594,9 +586,8 @@ async def test_path_queued_twice_is_indexed_once(
 ):
     """Путь, дважды попавший в очередь прохода, ложится в таблицу один раз.
 
-    Очередь переживает прерванный проход (сбой, нехватка места; почтовая —
-    ещё и рестарт), и следующий preindex кладёт тот же путь ещё раз, иногда с
-    другим mtime. Повтор отбрасывается до разбора, поэтому удалять записанное
+    Очередь переживает прерванный проход (сбой, нехватка места), и следующий
+    preindex кладёт тот же путь ещё раз, иногда с другим mtime. Повтор отбрасывается до разбора, поэтому удалять записанное
     в этом же проходе не нужно никогда.
     """
     dup = FileMetadata(path="/дом/дважды.pdf", size=50, mtime_seconds=1)
@@ -784,33 +775,27 @@ async def test_file_that_lost_its_text_leaves_no_previous_chunks(
     assert sorted(recorder.kinds("set")) == sorted(("set", str(p)) for p in files)
 
 
-@pytest.mark.parametrize(
-    "path", ["/дом/новый_пустой.txt", "email_INBOX:0:10"], ids=["new-file", "email"]
-)
 @pytest.mark.asyncio
 async def test_no_text_without_previous_version_costs_no_delete(
-    config: Config, monkeypatch, tmp_path, path: str
+    config: Config, monkeypatch, tmp_path
 ):
-    """Удаление — только для пути, уже лежавшего в индексе, и не для письма.
+    """Удаление — только для пути, уже лежавшего в индексе.
 
     Новый пустой файл строк не имеет, а каждый `delete` — коммит с новой
-    версией таблицы. У письма ключ в LSM и путь чанка различаются, и удаление
-    по префиксу задело бы тело, записанное в этом же проходе.
+    версией таблицы.
     """
-    meta = FileMetadata(path=path, size=0, mtime_seconds=1)
-    _install_chunk_pipeline(config, monkeypatch, {}, no_text=frozenset({path}))
+    meta = FileMetadata(path="/дом/новый_пустой.txt", size=0, mtime_seconds=1)
+    _install_chunk_pipeline(config, monkeypatch, {}, no_text=frozenset({meta.path}))
     store = _lance_store(tmp_path)
     await store.add_batch(_stale_rows({"/дом/другой.pdf": 1}))
     deletes = _spy_deletes(store, monkeypatch)
     recorder = _Recorder()
     idx = _StubIndex(config, store=store, recorder=recorder)  # type: ignore[arg-type]
-    if path.startswith("email_"):
-        idx.lsm_collection.indexed.known.add(path)
 
     await idx.process_stream(_stream(meta), store=store)
 
     assert deletes == [], f"холостое удаление: {deletes}"
-    assert recorder.kinds("set") == [("set", path)]
+    assert recorder.kinds("set") == [("set", meta.path)]
 
 
 @pytest.mark.asyncio

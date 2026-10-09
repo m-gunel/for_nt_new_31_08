@@ -1,17 +1,17 @@
-"""POST /config: порядок шагов и холостой сброс почты.
+"""POST /config: порядок шагов и снятие папок с индекса.
 
 Фоновая задача `start_reindex()` живёт вне `reconfigure_lock`, поэтому
-стартует последним шагом: параллельно с `drop_email_index()` она писала бы в
-ту же БД состояния (assert_db_state в lsm1, SIGABRT).
+стартует последним шагом: параллельно со снятием папок (`delete_prefix()`)
+она писала бы в ту же БД состояния (assert_db_state в lsm1, SIGABRT).
 """
 
 import os
 
 import pytest
 
-from src.config import Config, EmailConfig
+from src.config import Config
 from src.indexer.indexer import Index
-from src.server.model import UserConfig
+from src.server.model import UserConfig, UserConfigUpdate
 from src.server.router import update_config
 
 # Index на временном хранилище.
@@ -23,7 +23,6 @@ def cfg(config: Config, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "data_directory", str(tmp_path / "ragsearch"))
     config.__dict__.pop("user_conf_path", None)
     config.__dict__.pop("data_directory_path", None)
-    monkeypatch.setattr(config, "email", EmailConfig(enabled=False))
     yield config
     config.__dict__.pop("user_conf_path", None)
     config.__dict__.pop("data_directory_path", None)
@@ -52,7 +51,6 @@ class RecordingIndex:
 
     def __init__(self, calls: list):
         self.calls = calls
-        self.emails_scanner = None
         # update_config не сканирует на деактивированном индексе (БТ §5.4);
         # True — как у демона с автозапуском.
         self.active = True
@@ -66,23 +64,13 @@ class RecordingIndex:
     async def delete_prefix(self, prefix):
         self.calls.append(("delete_prefix", prefix))
 
-    async def drop_email_index(self):
-        self.calls.append("drop_email_index")
 
-    async def start_emails_polling(self, immediate=False):
-        self.calls.append(("start_emails_polling", immediate))
-
-    async def stop_emails_polling(self):
-        self.calls.append("stop_emails_polling")
-
-
-def _nt_body(folder: str) -> UserConfig:
+def _nt_body(folder: str) -> UserConfigUpdate:
     """Тело, которое реально шлёт нагрузочный стенд (и hunt_crash.py).
 
-    email.enabled=false приходит явно на каждый запрос, поэтому ветка сброса
-    почты выполняется, даже когда почту не включали.
+    Секция email в нём осталась: роутер принимает её и игнорирует.
     """
-    return UserConfig.model_validate(
+    return UserConfigUpdate.model_validate(
         {
             "folders": [folder],
             "email": {
@@ -96,8 +84,8 @@ def _nt_body(folder: str) -> UserConfig:
 
 
 @pytest.mark.asyncio
-async def test_reindex_starts_after_email_cleanup(cfg, journal, tmp_path):
-    """Перезапуск индексации — последним шагом, после работы по почте."""
+async def test_reindex_starts_last(cfg, journal, tmp_path):
+    """Перезапуск индексации — последним шагом, после остановки и снятия папок."""
     docs = tmp_path / "docs"
     docs.mkdir()
     fake_index = RecordingIndex(journal)
@@ -112,20 +100,16 @@ async def test_reindex_starts_after_email_cleanup(cfg, journal, tmp_path):
     start = journal.index("start_reindex")
     for step in ("stop_watcher", "stop_index"):
         assert journal.index(step) < start, f"{step} должен идти до start_reindex"
-    if "drop_email_index" in journal:
-        assert journal.index("drop_email_index") < start, (
-            "drop_email_index не должен работать параллельно с новым сканом"
-        )
     assert journal.index("restart_watcher") > start
 
 
 @pytest.mark.asyncio
-async def test_email_only_change_does_not_restart_indexing(cfg, journal):
+async def test_change_without_folders_does_not_restart_indexing(cfg, journal):
     """Запрос без folders не трогает ни индексацию, ни watcher."""
     fake_index = RecordingIndex(journal)
 
     await update_config(
-        UserConfig.model_validate({"email": {"enabled": False}}), cfg, fake_index
+        UserConfig.model_validate({"sberchat": {"enabled": False}}), cfg, fake_index
     )
 
     assert "start_reindex" not in journal
@@ -146,34 +130,6 @@ async def test_repeated_config_keeps_order_stable(cfg, journal, tmp_path):
         start = journal.index("start_reindex")
         assert journal.index("stop_index") < start
         assert journal.index("restart_watcher") > start
-
-
-@pytest.mark.asyncio
-async def test_drop_email_index_is_noop_when_nothing_to_drop(
-    index: Index,  # noqa: F811
-    monkeypatch,
-):
-    """Холостой сброс почты не трогает БД состояния.
-
-    Клиенты шлют email.enabled=false на каждый POST /config: без проверки
-    «сбрасывать нечего» любое обновление папок обходило бы всю таблицу
-    состояния.
-    """
-    monkeypatch.setattr(index, "emails_scanner", None)
-    assert not index.email_store.has_table, "почтовой таблицы быть не должно"
-
-    touched: list[str] = []
-
-    async def fake_delete_prefix(prefix):
-        touched.append(prefix)
-
-    monkeypatch.setattr(
-        index.lsm_collection.indexed, "async_delete_prefix", fake_delete_prefix
-    )
-
-    await index.drop_email_index()
-
-    assert touched == [], "холостой сброс не должен ходить в таблицу состояния"
 
 
 @pytest.mark.asyncio

@@ -20,11 +20,4 @@ file_scan_cfg:
 embed_model_cfg:
   model_path: models/rubert-tiny2_002
 
-email_poll_interval: 3600
-email:
-  # Выключена: индекс сильно растёт, а первый проход по большому mbox выглядит
-  # как зависание. Включать через POST /api/v1/config, а не правкой файла.
-  enabled: false
-  index_last_n_days: 90
-
 app_logging_level: INFO

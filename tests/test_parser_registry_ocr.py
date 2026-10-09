@@ -1,4 +1,4 @@
-"""Реестр парсеров, вложения писем и OCR: исходы, порча zip, кэш и остановка воркера."""
+"""Реестр парсеров и OCR: исходы, порча zip, кэш и остановка воркера."""
 
 import io
 import json
@@ -7,92 +7,17 @@ import struct
 import sys
 import zipfile
 import zlib
-from email.message import EmailMessage
 from pathlib import Path
 
-import aiofiles
 import pymupdf
 import pytest
 
-import src.parsers as parsers
 from src.common import FileMetadata
 from src.indexer.indexer import Index
-from src.parsers import _process_email_chunks, _process_path, document_chunks, ocr
+from src.parsers import _process_path, document_chunks, ocr
 from src.parsers.base import SkipFile, get_parser
 from src.parsers.metadata import ooxml_properties
 from tests.test_indexing_live import index, isolated_config  # noqa: F401
-
-# ---------------------------------------------------------------- T027
-
-
-def _message(body: str | None, attachments: list[tuple[bytes, str]]) -> bytes:
-    m = EmailMessage()
-    m["Subject"] = "отчёт"
-    m["From"] = "a@b.ru"
-    m["To"] = "c@d.ru"
-    m["Message-ID"] = "<wp22@x>"
-    m.set_content(body or "")
-    for payload, name in attachments:
-        m.add_attachment(payload, maintype="text", subtype="plain", filename=name)
-    return m.as_bytes()
-
-
-async def _email_events(tmp_path, raw: bytes) -> list:
-    box = tmp_path / "INBOX"
-    box.write_bytes(raw)
-    meta = FileMetadata(f"email_INBOX:0:{len(raw)}", len(raw), 0)
-    events: list = []
-
-    async def fail_cb(_meta, *, permanent: bool) -> None:
-        events.append(("fail_cb", permanent))
-
-    async with aiofiles.open(box, "rb") as f:
-        async for chunk in _process_email_chunks({"INBOX": f}, meta, fail_cb):
-            events.append(("chunk", chunk["path"].rsplit(":", 1)[-1]))
-    return events
-
-
-@pytest.fixture
-def flaky_attachment(monkeypatch):
-    """Вложение с содержимым FLAKY падает OSError — временный сбой разбора."""
-    real = parsers.document_chunks
-
-    def flaky(path, parser, *, io=None, **kwargs):
-        if io is not None and io.getvalue().startswith(b"FLAKY"):
-            raise OSError("файл занят")
-        return real(path, parser, io=io, **kwargs)
-
-    monkeypatch.setattr(parsers, "document_chunks", flaky)
-
-
-@pytest.mark.asyncio
-async def test_empty_attachment_does_not_mark_email_before_body(tmp_path, caplog):
-    raw = _message("Тело письма с пустым вложением", [(b"", "empty.txt")])
-    with caplog.at_level("WARNING"):
-        events = await _email_events(tmp_path, raw)
-    assert events and all(kind == "chunk" for kind, _ in events), events
-    assert not any("no chunks generated" in r.getMessage() for r in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_transient_attachment_failure_is_not_permanent(
-    tmp_path, caplog, flaky_attachment
-):
-    raw = _message(None, [(b"FLAKY", "report.txt")])
-    with caplog.at_level("WARNING"):
-        events = await _email_events(tmp_path, raw)
-    assert events == [("fail_cb", False)]
-    assert any("report.txt" in r.getMessage() for r in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_body_with_transient_attachment_is_retried(tmp_path, flaky_attachment):
-    raw = _message("Тело письма", [(b"FLAKY", "report.txt")])
-    events = await _email_events(tmp_path, raw)
-    assert events[-1] == ("fail_cb", False)
-    assert ("fail_cb", True) not in events
-    assert ("chunk", "body") in events
-
 
 # ---------------------------------------------------------------- T096
 

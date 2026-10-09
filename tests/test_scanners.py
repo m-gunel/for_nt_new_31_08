@@ -7,8 +7,7 @@ import pytest_asyncio as pa
 from pytest import fixture
 
 from src.config import Config
-from src.indexer.indexer import EmailsScanner, FilesScanner, list_email_folders
-from src.thunderbird.find_files import find_email_root
+from src.indexer.scanners import FilesScanner
 from src.utils.lsm_adapter import _decode_file_meta, _encode_file_meta
 from tests.test_lsm import LSMTable
 
@@ -41,23 +40,6 @@ async def files_scanner(lsm_table: LSMTable, tmp_path, monkeypatch):
     async with FilesScanner(
         lsm_table,
         queue_path=root / "files_queue",
-        reset=True,
-    ) as scanner:
-        yield scanner
-
-
-@pa.fixture
-async def emails_scanner(lsm_table: LSMTable, config: Config):
-    email_root = config.email_root
-    if email_root is None:
-        pytest.skip(
-            "нет профиля Thunderbird с mbox — почтовому сканеру не на чем работать"
-        ) # type: ignore
-    async with EmailsScanner(
-        email_path=email_root,
-        folders=list_email_folders(email_root),
-        lsm_checker=lsm_table,
-        queue_path=root / "emails_queue",
         reset=True,
     ) as scanner:
         yield scanner
@@ -110,9 +92,3 @@ async def test_clear_removes_retired_queue_dir(files_scanner: FilesScanner):
     await files_scanner.clear()
     retired = list(parent.glob(f"{files_scanner.queu_path.name}.retired.*"))
     assert retired == [], f"остались временные каталоги очереди: {retired}"
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_emails_scanner(emails_scanner: EmailsScanner):
-    await emails_scanner.scan()

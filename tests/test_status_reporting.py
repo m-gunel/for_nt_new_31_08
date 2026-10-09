@@ -91,7 +91,7 @@ async def test_status_is_idle_after_pass_with_repeated_path(
         for meta in (b, c, b):
             yield meta
 
-    async def empty_files(files, *, fail_cb, with_emails: bool = False):
+    async def empty_files(files, *, fail_cb):
         # Разбор без текста: чанков нет, файл уходит в fail_cb.
         async for meta in files:
             await fail_cb(meta, permanent=True)

@@ -140,9 +140,9 @@ python3 mcp/register_mcp.py                # из распакованного d
 демоном в `~/.files-search/port`. Поэтому запись остаётся верной и после
 перезапуска индексатора на другом порту, в том числе при `RAG_PORT=0`.
 
-Агенту по умолчанию видны все восемь инструментов: три чтения (`local_search`,
-`local_index_status`, `local_read_file`) и пять управления индексацией
-(папки, почта, переиндексация) — агент в поставке остаётся единственным
+Агенту по умолчанию видны все семь инструментов: три чтения (`local_search`,
+`local_index_status`, `local_read_file`) и четыре управления индексацией
+(папки, переиндексация) — агент в поставке остаётся единственным
 пультом. Для закрытых установок write-инструменты прячет
 `LQRAG_ALLOW_WRITE=0`; песочница `local_read_file` от флага не зависит.
 
@@ -157,7 +157,6 @@ python3 mcp/register_mcp.py                # из распакованного d
 | `uv sync` тянет torch на 2 ГБ | Кто-то вернул `sentence-transformers` в `[project.dependencies]` | Убрать: модель грузится через OpenVINO, torch не нужен |
 | `lancedb ... doesn't have a wheel for the current platform` | Потерялся `required-environments` в `pyproject.toml` | Вернуть `["sys_platform == 'linux' and platform_machine == 'x86_64'"]` |
 | `ModuleNotFoundError: pytest_asyncio` | Ставили без группы `test` | `uv sync --frozen` (группа `dev` включает `test`) |
-| Почтовые тесты падают с `assert 1 == 4` | Даты фикстуры разошлись с окном `index_last_n_days` | Проверьте `_NOW` в `tests/mbox_fixture.py` — даты должны быть относительными |
 | Демон не поднимается | Нет модели или зависимостей | `/tmp/rag.log`; модель — в `models/rubert-tiny2_002` |
 | Поиск пуст, файлы на месте | Индексация ещё идёт | `curl /api/v1/status`, либо инструмент `local_index_status` |
 | В логе `nothing new`, `total=0` | Папки меняли правкой YAML мимо API | Задать через `POST /config`, либо сбросить `~/.files-search` |

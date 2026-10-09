@@ -98,8 +98,9 @@ def test_archive_skips_token_files_and_service_dirs(tmp_path):
     (proj / "pip.conf").write_text(
         f"[global]\nindex-url={LIVE_URL}\n", encoding="utf-8"
     )
-    (proj / ".planning").mkdir()
-    (proj / ".planning" / "review.md").write_text("ревью\n", encoding="utf-8")
+    (proj / ".python-version").write_text("3.12\n", encoding="utf-8")
+    (proj / ".tool-state").mkdir()  # скрытый каталог инструмента или IDE
+    (proj / ".tool-state" / "notes.md").write_text("заметки\n", encoding="utf-8")
     (proj / "CHANGES.diff").write_text("diff\n", encoding="utf-8")
     (proj / "notebooks").mkdir()
     (proj / "notebooks" / "mail.ipynb").write_text("{}\n", encoding="utf-8")
@@ -112,10 +113,11 @@ def test_archive_skips_token_files_and_service_dirs(tmp_path):
         "lib-local-rag/uv.lock",
         "lib-local-rag/Makefile",
         "lib-local-rag/src/app.py",
+        "lib-local-rag/.python-version",  # скрытые файлы остаются, отсекаются каталоги
     } <= names
     top = {n.split("/")[1] for n in names if n.count("/") >= 1 and n.split("/")[1]}
     assert top.isdisjoint(
-        {"Dockerfile", "pip.conf", ".planning", "CHANGES.diff", "notebooks"}
+        {"Dockerfile", "pip.conf", ".tool-state", "CHANGES.diff", "notebooks"}
     )
     assert TOKEN not in out.stdout + out.stderr
 

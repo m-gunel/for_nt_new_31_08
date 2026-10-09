@@ -90,16 +90,16 @@ fi
 say "=== 7. Сборка архива ==="
 rm -rf "/tmp/${NAME}" && mkdir -p "/tmp/${NAME}"
 # Исключаем секреты, локальное состояние индекса и всё, что пересоздаётся само.
-# Dockerfile и pip.conf от git прячет только .git/info/exclude, а rsync его не читает;
-# .planning/, CHANGES.diff и ноутбуки с сохранёнными выводами тестировщику не нужны.
+# Dockerfile и pip.conf от git прячет только .git/info/exclude, а rsync его не читает.
+# Скрытые каталоги — состояние git, venv, IDE и инструментов: в репозитории их нет.
+# CHANGES.diff и ноутбуки с сохранёнными выводами тестировщику не нужны.
 rsync -a \
-  --exclude '__pycache__/' --exclude '*.pyc' \
-  --exclude '.pytest_cache/' --exclude '.ruff_cache/' \
-  --exclude '.venv/' --exclude 'dist/' --exclude 'build/' \
+  --exclude '.*/' --exclude '__pycache__/' --exclude '*.pyc' \
+  --exclude 'dist/' --exclude 'build/' \
   --exclude 'data/' --exclude 'tests/tmp/' \
   --exclude '.env' --exclude '.env.*' --exclude '.secret' --exclude '.secret.temp' \
-  --exclude '.gigaide/' --exclude '.DS_Store' --exclude '.git/' \
-  --exclude 'Dockerfile' --exclude 'pip.conf' --exclude '.planning/' \
+  --exclude '.DS_Store' \
+  --exclude 'Dockerfile' --exclude 'pip.conf' \
   --exclude 'CHANGES.diff' --exclude 'notebooks/' \
   ./ "/tmp/${NAME}/lib-local-rag/"
 
@@ -121,6 +121,6 @@ rm -rf "/tmp/${NAME}"
 say ""
 say "Готово: $(cd .. && pwd)/${NAME}.zip"
 say "Внутри: uv.lock, код, тесты, MCP-мост, модель. Без .env, .secret, Dockerfile,"
-say "pip.conf, .planning/ и data/; учётных данных в URL нет."
+say "pip.conf, скрытых каталогов и data/; учётных данных в URL нет."
 say ""
 say "Тестировщику передайте вместе с docs/HANDOVER.md — там порядок запуска."

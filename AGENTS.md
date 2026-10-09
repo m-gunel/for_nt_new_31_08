@@ -54,7 +54,11 @@ CONFIG_PATH=cfg/mcp.yml RAG_PORT=8000 .venv/bin/python main.py &
   и без условия демон поднимется у root и greeter-а, а root проиндексирует весь `/home`.
 
 ## Лечение известных проблем
-- **`persistqueue`/индекс битый** → `rm -rf ~/.files-search/files` (индекс пересоздастся).
+- **Индекс битый, старой схемы или другой модели** → демон при старте сам собирает
+  его заново (`src/indexer/storage_check.py`, файл `~/.files-search/index_version.json`),
+  повреждённое кладёт в `~/.files-search/corrupt/`. Очередь `files/` пересоздаётся
+  на каждом старте. Меняя нарезку или нормализацию текста при той же схеме,
+  поднимайте `INDEX_FORMAT` в `storage_check.py` — иначе старый индекс останется.
 - **`RuntimeError: Infer Request is busy`** → гонка между синхронным токенизатором и `async_encode`.
   Фикс в `src/config.py`: `_ov_token_len` идёт через `self.ov_model.count_tokens`, у которого
   свой `threading.local()` InferRequest на поток, а НЕ через общий на модель

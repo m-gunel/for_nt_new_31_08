@@ -10,7 +10,7 @@ from src.utils import get_config, get_logger
 from src.utils.lsm_adapter import wait_idle as lsm_wait_idle
 
 from .indexer import Index
-from .storage_check import remove_email_leftovers
+from .storage_check import ensure_index_usable, remove_email_leftovers
 from .watcher import Watcher
 
 lg = get_logger(__name__, slice=-1)
@@ -58,12 +58,13 @@ async def serve_indexer():
     cfg.file_scan_cfg.filter_files = filter_files
     cfg.file_scan_cfg.filter_meta = filter_meta
 
-    # До Index(cfg): он сразу открывает LSM и очередь. Сбой не мешает работе —
-    # остатки почты лишь занимают место.
-    try:
-        await asyncio.to_thread(remove_email_leftovers, cfg)
-    except Exception:
-        lg.exception("не удалось удалить данные почты прежних версий")
+    # До Index(cfg): он сразу открывает LSM и очередь. Сбой шага пишем в лог,
+    # но демон поднимаем — поиск по тому, что есть, лучше отказа.
+    for prepare in (remove_email_leftovers, ensure_index_usable):
+        try:
+            await asyncio.to_thread(prepare, cfg)
+        except Exception:
+            lg.exception("подготовка хранилища (%s) не удалась", prepare.__name__)
     index = Index(cfg)
     _watcher = Watcher(cfg, index)
     async with index.lifespan():

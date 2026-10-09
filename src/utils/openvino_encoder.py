@@ -2,6 +2,7 @@ import asyncio
 import concurrent
 import concurrent.futures
 import gc
+import hashlib
 import os
 import threading
 from functools import cached_property, partial
@@ -38,6 +39,27 @@ DEFAULT_INFERENCE_STREAMS = 2
 # счёт, поэтому по умолчанию берём половину ядер. RAG_OV_NUM_THREADS (старое
 # имя OV_NUM_THREADS) перекрывает дефолт, значение 0 возвращает решение плагину.
 DEFAULT_INFERENCE_THREADS = max(2, (os.cpu_count() or 4) // 2)
+
+# IR модели и токенизатора относительно каталога модели (.bin лежит рядом с .xml).
+MODEL_IR = "openvino/openvino_model_qint8_quantized.xml"
+TOKENIZER_IR = "openvino_tokenizer.xml"
+# Длина отпечатка: 64 бита хватает, чтобы различать версии модели.
+_FINGERPRINT_CHARS = 16
+
+
+def model_fingerprint(model_path: str | os.PathLike) -> str:
+    """Отпечаток модели: sha256 IR модели и токенизатора (.xml и .bin).
+
+    От них зависят векторы и нарезка — чанк считается токенами этого
+    токенизатора, — поэтому индекс другой модели собирается заново.
+    """
+    digest = hashlib.sha256()
+    for ir in (MODEL_IR, TOKENIZER_IR):
+        xml = Path(model_path) / ir
+        for part in (xml, xml.with_suffix(".bin")):
+            with open(part, "rb") as f:
+                digest.update(hashlib.file_digest(f, "sha256").digest())
+    return digest.hexdigest()[:_FINGERPRINT_CHARS]
 
 
 def _resolve_num_threads() -> int | None:
@@ -176,8 +198,8 @@ class OpenVINOEmbedder:
     def __init__(
         self,
         model_path: str,
-        openvino: str = "openvino/openvino_model_qint8_quantized.xml",
-        tokenizer: str = "openvino_tokenizer.xml",
+        openvino: str = MODEL_IR,
+        tokenizer: str = TOKENIZER_IR,
         device: str = "CPU",
     ):
         tokenizer_path = Path(model_path) / tokenizer

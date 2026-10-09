@@ -1,13 +1,11 @@
 """Стенд для тестов MCP-моста: мост подпроцессом и стаб сайдкара.
 
-Мост не ищет сам, а транслирует вызовы в HTTP, поэтому проверять его можно
-без OpenVINO, LanceDB и индекса: стаб отдаёт ровно те ответы, что и сайдкар,
-и записывает всё, что в него пришло. Тест проверяет обе стороны — и что мост
-вернул агенту, и что он отправил в API.
+Мост только транслирует вызовы в HTTP, поэтому OpenVINO и индекс не нужны:
+стаб отвечает как сайдкар и записывает входящие запросы — тест проверяет и
+ответ агенту, и запрос в API.
 
-Чтение stdout идёт через отдельный поток с очередью: `readline()` на мёртвом
-процессе блокируется навсегда, и падение моста выглядело бы как зависший
-прогон вместо упавшего теста.
+stdout читает отдельный поток через очередь: `readline()` на мёртвом процессе
+блокируется навсегда, и падение моста выглядело бы зависшим прогоном.
 """
 
 import json
@@ -24,8 +22,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 SERVER = ROOT / "mcp_server.py"
 
-# Ответ обязан прийти быстро: мост — тонкая прослойка, всё медленное живёт
-# за стабом, который отвечает мгновенно.
+# Мост — тонкая прослойка над мгновенным стабом, ответ обязан прийти быстро.
 READ_TIMEOUT = 15.0
 # Сколько ждём, убеждаясь, что ответа НЕ будет (нотификации).
 SILENCE_TIMEOUT = 1.0
@@ -45,8 +42,15 @@ class _StubHandler(BaseHTTPRequestHandler):
 
         route = self.stub.routes.get((method, self.path))
         if route is None:
+            # Как FastAPI на неизвестный маршрут: по detail "Not Found" мост
+            # отличает «ручки нет» (старый демон) от 404 самой ручки.
             self.send_response(404)
-            payload = json.dumps({"detail": "нет заглушки для %s %s" % (method, self.path)})
+            payload = json.dumps(
+                {
+                    "detail": "Not Found",
+                    "stub": "нет заглушки для %s %s" % (method, self.path),
+                }
+            )
             data = payload.encode("utf-8")
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -83,9 +87,8 @@ class _StubHandler(BaseHTTPRequestHandler):
 class _QuietHTTPServer(ThreadingHTTPServer):
     """HTTPServer без обратного DNS на старте.
 
-    Штатный `server_bind` зовёт `socket.getfqdn()`, и на машине без быстрого
-    резолвера подъём заглушки занимает десятки секунд — из-за одной строки
-    логирования, которую мы всё равно отключили.
+    Штатный `server_bind` зовёт `socket.getfqdn()`, и без быстрого резолвера
+    подъём заглушки занимает десятки секунд.
     """
 
     def server_bind(self):
@@ -96,10 +99,9 @@ class _QuietHTTPServer(ThreadingHTTPServer):
         self.server_port = self.server_address[1]
 
     def handle_error(self, request, client_address):
-        """Клиент, отвалившийся посреди ответа, — это часть проверки таймаута.
+        """Обрыв клиента посреди ответа — штатная часть проверки таймаута.
 
-        Штатный handle_error печатает трейсбек прямо в вывод pytest, и зелёный
-        прогон выглядит так, будто в нём что-то сломалось.
+        Штатный handle_error печатал бы трейсбек в вывод зелёного прогона.
         """
         exc = sys.exc_info()[1]
         if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
@@ -115,8 +117,8 @@ class StubSidecar:
         self.requests = []
         handler = type("_Bound", (_StubHandler,), {"stub": self})
         self._server = _QuietHTTPServer(("127.0.0.1", 0), handler)
-        # Короткий poll: shutdown() ждёт следующего опроса, и на дефолтных
-        # 0.5 с каждый тест платил полсекунды в teardown.
+        # Короткий poll: shutdown() ждёт следующего опроса, дефолтные 0,5 с
+        # добавляли бы полсекунды к каждому teardown.
         self._thread = threading.Thread(
             target=self._server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
         )

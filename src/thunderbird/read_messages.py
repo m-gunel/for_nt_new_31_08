@@ -1,3 +1,9 @@
+"""Письма из базы Gloda Thunderbird (global-messages-db.sqlite).
+
+Демон модуль не использует — почту он читает из mbox (lazy_iter_mbox).
+Модуль нужен скриптам experiments/ и блокноту notebooks/thunderbird.ipynb.
+"""
+
 import sqlite3
 from collections.abc import Iterable
 from datetime import datetime
@@ -9,12 +15,8 @@ from rich.progress import Progress
 
 from src.parsers import ChunkWithMeta, DocumentMetadata
 
-# Реализация переехала в body_cleanup (разрыв циклического импорта
-# parsers -> get_body -> read_messages -> parsers); реимпорт оставлен
-# для совместимости со скриптами в experiments/.
+# Отсюда extract_unique_body импортируют и скрипты experiments/.
 from .body_cleanup import extract_unique_body
-
-# quote_regexes = [re.compile(pat, re.IGNORECASE) for pat in QUOTE_PATTERNS]
 
 
 class _MessageRow(NamedTuple):
@@ -81,50 +83,6 @@ MESSAGE_SCHEMA = pa.schema(
 )
 
 
-SMALL_MESSAGE_SCHEMA = pa.schema(
-    [
-        pa.field("id", pa.int64()),
-        pa.field("folderID", pa.int64()),
-        pa.field("headerMessageID", pa.string()),
-        pa.field("conversationID", pa.string()),
-        pa.field("date", pa.timestamp("us")),
-        pa.field("from_", pa.int64()),
-        pa.field("to", pa.list_(pa.int64())),
-        pa.field("cc", pa.list_(pa.int64())),
-        pa.field("bcc", pa.list_(pa.int64())),
-        pa.field(
-            "attachments",
-            pa.list_(
-                pa.struct(
-                    [
-                        pa.field("name", pa.string()),
-                        pa.field("doc_type", pa.string()),
-                        pa.field("size", pa.int64()),
-                        pa.field("field_1", pa.string()),
-                        pa.field("field_2", pa.string()),
-                        pa.field("field_3", pa.bool_()),
-                    ]
-                )
-            ),
-        ),
-        pa.field("from_me", pa.bool_()),
-        pa.field("to_me", pa.bool_()),
-    ]
-)
-
-_query_messages_small = """
-select
-	m.id,
-    m.folderID, 
-    m.headerMessageID, 
-    m.conversationID, 
-    m.date, 
-    m.jsonAttributes
-    from messages as m
-    where date is not null and c.c0body is not null
-    and (:min_date is null or date >= :min_date)
-"""
-
 _query_messages_full = """
 select
 	m.id,
@@ -160,16 +118,6 @@ where date is not null and c.c0body is not null
     and m.conversationID == :conversation_id
 """
 
-_query_list_conversations = """
-select
-    m.conversationID, 
-    max(m.date) as max_dt
-from messages as m
-group by m.conversationID
-where date is not null
-    and (:min_date is null or date >= :min_date)
-"""
-
 _query_count_messages = """
 select count(1) from messages as m
 join messagesText_content as c
@@ -189,7 +137,6 @@ def _parse_row(
     json_attributes = msg_dict.pop("jsonAttributes")
     json_parsed = JsonAttributes.model_validate_json(json_attributes or "{}")
     msg_dict.update(json_parsed.model_dump())
-    # Convert IDs to strings if they are integers
     msg_dict["headerMessageID"] = str(msg_dict["headerMessageID"])
     msg_dict["conversationID"] = str(msg_dict["conversationID"])
     msg_dict["date"] = datetime.fromtimestamp(msg.date / 1000000)
@@ -222,13 +169,13 @@ def read_messages(
     min_msg_body_len: int = 10,
 ):
     with sqlite3.connect(db_path, uri=True) as conn:
+        # date в Gloda — микросекунды Unix-времени.
         min_date_us = int(min_date.timestamp() * 1000000) if min_date else None
         total_cnt = (
             conn.execute(_query_count_messages, {"min_date": min_date_us}).fetchone()[0]
             if progress
             else 0
         )
-        # Convert datetime to microseconds for SQLite
         cursor = conn.execute(query, {"min_date": min_date_us})
 
         task = (

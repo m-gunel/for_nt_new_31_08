@@ -17,10 +17,8 @@ root = Path(__file__).parent / "data"
 
 @fixture
 def lsm_table():
-    # Каталог рабочий, а не с фикстурами, и правило `data` в .gitignore матчит
-    # его на любом уровне — поэтому в свежем клоне его нет. LSM родительский
-    # каталог не создаёт, и без этой строки фикстура падает на «unable to open
-    # database file» ещё до первой проверки.
+    # В свежем клоне каталога нет (правило `data` в .gitignore), а LSM
+    # родительский каталог не создаёт: «unable to open database file».
     root.mkdir(parents=True, exist_ok=True)
     with LSMTable(
         root / "lsm.sqlite",
@@ -36,7 +34,7 @@ def lsm_table():
 @pa.fixture
 async def files_scanner(lsm_table: LSMTable, tmp_path, monkeypatch):
     # Сканируем собственный каталог, а не cfg.scan_paths: тот берётся из
-    # ~/.ragsearch/user_conf.yml и зависит от машины.
+    # общего user_conf.yml и зависит от машины.
     for i in range(3):
         (tmp_path / f"doc_{i}.txt").write_text(f"документ {i}", encoding="utf-8")
     monkeypatch.setattr(Config, "scan_paths", property(lambda self: [str(tmp_path)]))
@@ -82,11 +80,9 @@ async def test_files_scanner(files_scanner: FilesScanner):
 async def test_clear_during_iteration(files_scanner: FilesScanner):
     """clear() на ходу не ломает уже начатый обход очереди.
 
-    POST /config зовёт clear() ровно тогда, когда проход может быть в
-    середине. Раньше очередь пересоздавалась под тем же путём, а обход
-    продолжал звать task_done() — но уже у НОВОГО объекта очереди, где
-    незавершённых задач нет: persistqueue отвечает на это «task_done()
-    called too many times».
+    POST /config зовёт clear(), когда проход может быть в середине: очередь,
+    пересозданная под тем же путём, получила бы task_done() от старого обхода,
+    и persistqueue ответил бы «task_done() called too many times».
     """
     await files_scanner.scan()
     assert await files_scanner.total() > 0

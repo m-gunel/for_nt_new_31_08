@@ -1,7 +1,7 @@
 """Контракт почтовой очереди и наблюдаемость почтового прохода.
 
-Регрессии по замечаниям к почтовому тракту: тип элементов в очереди,
-раздельный счёт файлов и писем, фазовые логи.
+Тип элементов в очереди, раздельный счёт файлов и писем в /status, фазовые
+логи.
 """
 
 import pytest
@@ -45,9 +45,6 @@ def email_config(config: Config, mail_root, tmp_path, monkeypatch):
     config.__dict__.pop("data_directory_path", None)
 
 
-# --------------------------------------------------- контракт очереди -------
-
-
 @pytest.mark.asyncio
 async def test_queue_holds_file_metadata_not_tuples(email_config, mail_root, tmp_path):
     """В очередь кладутся FileMetadata, а не кортежи (offset, meta).
@@ -86,15 +83,12 @@ async def test_preindex_yields_bare_metadata(email_config, mail_root, tmp_path):
     assert items and all(isinstance(m, FileMetadata) for m in items)
 
 
-# ------------------------------------------- раздельный счёт в /status ------
-
-
 @pytest.mark.asyncio
 async def test_status_splits_files_and_emails(email_config):
     """/status показывает отдельно файлы и письма.
 
-    Общий `files_to_index` читался как «столько файлов осталось», хотя
-    почти всё в нём — письма.
+    Общий `files_to_index` читается как «столько файлов осталось», хотя почти
+    всё в нём — письма.
     """
     index = Index(email_config)
     async with index:
@@ -116,8 +110,8 @@ async def test_status_splits_files_and_emails(email_config):
 async def test_status_is_indexing_during_preindex(email_config, monkeypatch):
     """Сбор очереди — это работа, а не простой.
 
-    Обход многогигабайтного mbox идёт минутами при нулевом counter, и
-    /status отвечал "is_indexing: false" — клиент считал демон свободным.
+    Обход многогигабайтного mbox идёт минутами при нулевом counter — без этого
+    клиент считал бы демон свободным.
     """
     index = Index(email_config)
     async with index:
@@ -144,15 +138,11 @@ async def test_status_breakdown_zero_when_idle(email_config):
             await index.stop_emails_polling()
 
 
-# ------------------------------------------------------ фазовые логи --------
-
-
 @pytest.mark.asyncio
 async def test_phase_logs_on_info_level(email_config, mail_root, tmp_path, caplog):
     """Обход mbox виден на INFO: размер, длительность, разбивка.
 
-    Раньше всё было на DEBUG — в бою по логу нельзя было отличить
-    «читаю большой mbox» от «завис».
+    Иначе по логу не отличить «читаю большой mbox» от «завис».
     """
     lsm = LSMCollection()
     with lsm, caplog.at_level("INFO", logger="app.email"):
@@ -176,8 +166,8 @@ async def test_skipped_by_date_is_reported(
 
     Иначе непонятно, почему на 15000 писем в очередь ушло 500.
     """
-    # index_last_n_days=1 отсекает всю фикстуру: её письма старше суток
-    # (см. _NOW в tests/mbox_fixture.py — они от 5 до 2 суток назад)
+    # index_last_n_days=1 отсекает всю фикстуру: письма в ней от 2 до 5 суток
+    # назад (см. _NOW в tests/mbox_fixture.py)
     monkeypatch.setattr(
         email_config,
         "email",

@@ -1,20 +1,12 @@
 #!/usr/bin/make -f
-#
-# Пакет собирается из УЖЕ ГОТОВОГО каталога dist/: бинарь делает PyInstaller,
-# мост и конфиг докладывает make. То есть перед dpkg-buildpackage должен быть
-# выполнен `make build` (или `make docker_build`) — см. цель `deb` в Makefile.
-# Своей сборки у пакета нет.
+# Пакет собирается из готового dist/: перед dpkg-buildpackage нужен `make build`
+# (или `make docker_build`), см. цель `deb` в Makefile.
 
 %:
 	dh $@
 
-# Своей сборки нет — глушим весь auto-слой.
-#
-# Целей configure/install/clean в корневом Makefile сейчас нет, и debhelper их
-# пропустил бы сам. Но buildsystem он выбирает по НАЛИЧИЮ Makefile, а не по
-# содержимому: появится в нём когда-нибудь цель `clean` — и dh_auto_clean
-# начнёт звать её посреди сборки пакета, вычищая тот самый dist/, из которого
-# пакет и собирается. Перечисляем все четыре явно.
+# Своей сборки нет — глушим auto-слой целиком. Buildsystem debhelper выбирает по
+# наличию Makefile: появись в нём цель clean, dh_auto_clean вычистил бы dist/.
 override_dh_auto_configure:
 
 override_dh_auto_build:
@@ -25,43 +17,30 @@ override_dh_auto_install:
 
 override_dh_auto_clean:
 
-# --- бандл PyInstaller трогать нельзя -----------------------------------------
-#
-# dist/main/_internal/ — это сотни чужих .so, приехавших вместе с бинарём.
-# Стандартные шаги dh рассчитаны на библиотеки, собранные из исходников в этом
-# же пакете, и на бандле ведут себя плохо.
+# Шаги ниже рассчитаны на библиотеки, собранные в этом пакете, а
+# dist/main/_internal/ — сотни чужих .so бандла PyInstaller.
 
-# dh_shlibdeps без --ignore-missing-info ПАДАЕТ на них с «no dependency
-# information found for <lib> (used by <bin>)»: у приватных библиотек
-# PyInstaller нет ни SONAME, ни shlibs-файла в системе, и взяться им неоткуда —
-# они не установлены, а лежат рядом с бинарём и подхватываются через RPATH.
-# Результат при этом никому не нужен: ${shlibs:Depends} в debian/control не
-# используется (почему — см. комментарий там же).
+# dh_shlibdeps падает на приватных .so бандла («no dependency information
+# found»): в системе их нет, бинарь находит их через RPATH. ${shlibs:Depends} в
+# debian/control всё равно не используется.
 override_dh_shlibdeps:
 
-# dh_makeshlibs нашёл бы в бандле .so с SONAME (libssl, libpython и прочие) и
-# объявил бы наш пакет их поставщиком — control-файл shlibs с чужими
-# библиотеками. Вместе с этим он может вставить триггер ldconfig: лишний прогон
-# ldconfig на каждой установке ради библиотек, которые через ld.so.conf никто
-# не ищет, — бандл находит их сам, через RPATH.
+# dh_makeshlibs объявил бы пакет поставщиком чужих .so (libssl, libpython) и
+# добавил бы лишний триггер ldconfig.
 override_dh_makeshlibs:
 
-# dh_strip снял бы символы с бинаря и .so и породил -dbgsym. Бутлоадер
-# PyInstaller несёт приложенные к себе данные, и strip по нему — известный
-# способ получить «собралось, но молча не запускается». Отладочный пакет от
-# чужих библиотек нам всё равно не нужен.
+# strip ломает бутлоадер PyInstaller (данные приложены к бинарю): собирается,
+# но молча не запускается.
 override_dh_strip:
 
-# dh_dwz — по той же причине, что dh_strip: чужие ELF без нашей отладочной
-# информации. Работать не над чем, а падать есть на чём.
+# dh_dwz — то же, что dh_strip: чужие ELF без нашей отладочной информации.
 override_dh_dwz:
 
-# dh_strip_nondeterminism переписывает таймстемпы внутри zip-архивов, а внутри
-# бандла лежит base_library.zip. Воспроизводимость сборки мы получаем из
-# uv.lock и закоммиченного main.spec, а не из правки чужого артефакта.
+# Не переписывать base_library.zip внутри бандла; воспроизводимость дают
+# uv.lock и main.spec.
 override_dh_strip_nondeterminism:
 
-# --- ВНИМАНИЕ: dh_installsystemduser здесь НЕ глушится ------------------------
+# dh_installsystemduser здесь НЕ глушится.
 #
 # Именно она включает наши пользовательские юниты. Команда входит в стандартную
 # последовательность dh начиная с compat 12, сканирует готовый каталог сборки
@@ -70,12 +49,8 @@ override_dh_strip_nondeterminism:
 # debian/install) и через маркер #DEBHELPER# вставляет в postinst
 # `deb-systemd-helper --user enable`, а в postrm — парное снятие.
 #
-# Не добавляйте сюда override_dh_installsystemduser по аналогии с шагами выше:
-# автозапуск исчезнет молча, и пакет будет ставиться «успешно», не поднимая
-# демон ни у одного пользователя.
+# override_dh_installsystemduser по аналогии с шагами выше не добавлять: пакет
+# будет ставиться «успешно», не поднимая демон ни у кого.
 #
-# Парного override_dh_installsystemd тоже больше нет, и он не нужен: системных
-# юнитов пакет не ставит, а файл называется .user.service — под шаблон
-# debian/<pkg>.service, который dh_installsystemd кладёт в /lib/systemd/system,
-# он не подходит. Раньше здесь стояла заглушка, и она была единственным, что
-# мешало разложить ВТОРОЙ, системный экземпляр юнита с запуском от root.
+# override_dh_installsystemd не нужен: .user.service не подходит под шаблон
+# debian/<pkg>.service, системного экземпляра юнита не будет.

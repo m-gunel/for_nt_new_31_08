@@ -88,7 +88,7 @@ def test_numeric_sheet_is_not_skipped(tmp_path):
         [2000 + i, i * 1.5, i * 2.25] for i in range(1, 60)
     ]
     texts = _texts(_book(tmp_path / "nums.xlsx", {"Данные": rows}))
-    assert len(texts) >= 50  # прежний парсер пропускал такой лист по доле текста
+    assert len(texts) >= 50  # лист с малой долей текста не пропускается
 
 
 def test_bold_single_row_is_a_section(tmp_path):
@@ -146,7 +146,7 @@ def test_row_limit_cuts_sheet_with_warning(tmp_path, config, monkeypatch, caplog
     with caplog.at_level(logging.WARNING):
         texts = _texts(_book(tmp_path / "long.xlsx", {"Реестр": rows}))
     assert 50 < len(texts) < 300  # лист не потерян, но обрезан
-    assert any("больше 100 строк" in r.message for r in caplog.records)
+    assert any("первые 140 строк" in r.message for r in caplog.records)
 
 
 def test_sheet_without_table_is_text(tmp_path):
@@ -184,3 +184,90 @@ def test_legacy_xls_goes_through_r7_converter(tmp_path, monkeypatch):
     monkeypatch.setenv("LQRAG_R7_X2T", str(stub))
     texts = _texts(LEGACY_XLS)
     assert any("Челябинская область" in t and "1 января 2025" in t for t in texts)
+
+
+def test_integer_percent_keeps_scale_and_sign(tmp_path):
+    # read_only отдаёт 100 % (и 1.0, и результат формулы) как int 1.
+    assert fmt_number(1, "0%") == "100%"
+    assert fmt_number(0, "0.0%") == "0%"
+    assert fmt_number(2, "0%") == "200%"
+    assert fmt_number(0.5, "0%") == "50%"  # дробные — как прежде
+    assert fmt_number(1500) == "1500" and fmt_number(7, "#,##0") == "7"
+    # «%» в кавычках или после «\» — просто знак, Excel на 100 не умножает.
+    assert fmt_number(5, '0"%"') == "5" and fmt_number(5, "0\\%") == "5"
+    assert fmt_number(12.5, '0.0"%"') == "12,5"
+    path = tmp_path / "доли.xlsx"
+    _book(path, {"Доли": [
+        ["Участник", "Сумма, млн руб.", "Доля участия"],
+        ["ООО Альфа", 1500, 1],
+        ["ООО Бета", 750, 0.5],
+        ["ООО Гамма", 0, 0],
+        ["Итого", 2250, 1.0],
+    ]})  # fmt: skip
+    wb = openpyxl.load_workbook(path)
+    for row in range(2, 6):
+        wb["Доли"].cell(row=row, column=3).number_format = "0%"
+    wb.save(path)
+    assert _texts(path) == [
+        "Лист «Доли»\nУчастник: ООО Альфа\nСумма, млн руб.: 1500; Доля участия: 100%",
+        "Лист «Доли»\nУчастник: ООО Бета\nСумма, млн руб.: 750; Доля участия: 50%",
+        "Лист «Доли»\nУчастник: ООО Гамма\nСумма, млн руб.: 0; Доля участия: 0%",
+        "Лист «Доли»\nУчастник: Итого\nСумма, млн руб.: 2250; Доля участия: 100%",
+    ]
+
+
+def test_typical_book_text_is_unchanged(tmp_path):
+    """Обычная книга: карточки строк, текстовый лист и свойства — прежние."""
+    path = _book(
+        tmp_path / "отчёт.xlsx",
+        {
+            "12": _regions_table(),
+            "Пояснения": [
+                ["Пояснения к отчётности банка"],
+                ["Данные приведены в единицах"],
+            ],
+        },
+    )
+    rows = list(file_chunks(path))
+    section = f"12 › {TITLE}"
+    card = (
+        "Документ: отчёт\n{title}\nФедеральный округ: {region}\n"
+        "1 января 2025 — Всего: {a}; {vsp}: {b}\n1 января 2026 — Всего: {c}; {vsp}: {d}"
+    )
+    assert [
+        (r["kind"], r.get("section"), r["text"]) for r in rows if r["kind"] != "card"
+    ] == [
+        (
+            "table_row",
+            section,
+            card.format(
+                title=TITLE,
+                region="Челябинская область",
+                vsp=VSP,
+                a=613,
+                b=165,
+                c=576,
+                d=162,
+            ),
+        ),
+        (
+            "table_row",
+            section,
+            card.format(
+                title=TITLE,
+                region="Свердловская область",
+                vsp=VSP,
+                a=900,
+                b=200,
+                c=880,
+                d=190,
+            ),
+        ),
+        (
+            "text",
+            "Пояснения",
+            "Документ: отчёт\nЛист «Пояснения»\nПояснения к отчётности банка\n"
+            "Данные приведены в единицах",
+        ),
+    ]
+    assert (rows[0]["meta"]["title"], rows[0]["meta"]["page_count"]) == (TITLE, 2)

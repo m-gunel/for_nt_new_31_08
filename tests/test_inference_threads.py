@@ -4,6 +4,7 @@
 """
 
 import importlib
+import logging
 
 import pytest
 
@@ -51,9 +52,6 @@ def _restore_module():
     importlib.reload(encoder)
 
 
-# ------------------------------------------------------------- streams ------
-
-
 def test_streams_default_matches_channel_count():
     """По умолчанию streams ровно два — по числу каналов search и index.
 
@@ -85,3 +83,17 @@ def test_streams_garbage_does_not_crash(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setenv("RAG_OV_NUM_STREAMS", "две штуки")
     assert _resolve_num_streams() is None
+
+
+@pytest.mark.parametrize("variable", ["RAG_OV_NUM_THREADS", "OV_NUM_THREADS"])
+def test_garbage_warning_names_the_variable_it_came_from(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, variable: str
+):
+    """Предупреждение называет ту переменную, из которой пришло значение:
+    иначе при неверной каноничной RAG_OV_NUM_THREADS ищут не ту."""
+    monkeypatch.delenv("RAG_OV_NUM_THREADS", raising=False)
+    monkeypatch.delenv("OV_NUM_THREADS", raising=False)
+    monkeypatch.setenv(variable, "шесть")
+    caplog.set_level(logging.WARNING)
+    assert encoder._resolve_num_threads() is None
+    assert [r.getMessage().split("=")[0] for r in caplog.records] == [variable]

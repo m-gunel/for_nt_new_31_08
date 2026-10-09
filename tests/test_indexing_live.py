@@ -1,5 +1,5 @@
-"""Регрессии на индексацию «на лету»: файл, добавленный во время активной
-индексации, должен находиться поиском, а удалённый — исчезать из выдачи.
+"""Индексация «на лету»: файл, добавленный во время активной индексации,
+находится поиском, а удалённый — исчезает из выдачи.
 """
 
 import asyncio
@@ -38,10 +38,11 @@ def _chunk_table(path: str, text: str, dim: int = EMBED_DIM) -> pa.Table:
 
 
 def test_token_len_is_thread_safe(config: Config):
-    """Сплиттер считает токены из потоков парсинга, которых несколько.
+    """Сплиттер считает токены из нескольких потоков парсинга.
 
-    Один общий InferRequest на модель даёт «RuntimeError: Infer Request is
-    busy», когда полный проход и watcher парсят одновременно.
+    Общий InferRequest на модель даёт «RuntimeError: Infer Request is busy»,
+    поэтому `_ov_token_len` идёт через count_tokens со своим InferRequest на
+    поток.
     """
     text = "Проверка потокобезопасности подсчёта токенов. " * 20
     assert config._ov_token_len(text) > 0  # прогрев, модель грузится лениво
@@ -110,7 +111,7 @@ async def test_corrupt_file_is_skipped_with_one_warning_line(tmp_path, caplog):
 
 @pytest.mark.asyncio
 async def test_empty_file_is_marked_indexed(tmp_path):
-    """А вот успешно разобранный, но пустой файл помечать нужно."""
+    """Успешно разобранный пустой файл помечается обработанным."""
     from src.parsers import _process_path
 
     empty = tmp_path / "empty.txt"
@@ -133,9 +134,8 @@ def test_token_len_cache_keeps_chunking_identical(config: Config):
     """Кэш подсчёта токенов не должен менять границы чанков.
 
     Сплиттер меряет длину нейросетевым токенизатором и переспрашивает одни и те
-    же фрагменты сотни раз (2313 вызовов на документ в 11 чанков). Кэш убирает
-    повторы, но результат обязан остаться прежним — иначе меняется разбиение,
-    а с ним и выдача поиска.
+    же фрагменты сотни раз. Кэш убирает повторы, но разбиение, а с ним и
+    выдача, меняться не должны.
     """
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -172,7 +172,7 @@ def test_pq_sub_vectors_divide_embedding_dim():
     for dim in (312, 384, 768, 1024):
         n = pq_num_sub_vectors(dim)
         assert dim % n == 0, f"{dim} не делится на {n}"
-    # для rubert-tiny2 сохраняется прежнее значение — индексы совместимы
+    # для rubert-tiny2 — 39, как в уже построенных индексах
     assert pq_num_sub_vectors(312) == 39
 
 
@@ -181,7 +181,7 @@ async def test_search_sees_async_writes(tmp_path):
     """Синхронный хендл обязан видеть записи через async-соединение.
 
     Таблицы Lance версионированы, а кэшированный хендл держит снимок: без
-    checkout_latest поиск отвечал по состоянию на момент старта демона.
+    checkout_latest поиск отвечал бы по состоянию на момент старта демона.
     """
     wrapper = LanceWrapper(
         ld_db_path=str(tmp_path / "lance"),
@@ -303,9 +303,9 @@ async def test_refresh_survives_main_index(index: Index):
 async def test_compaction_never_runs_during_indexing(index: Index, monkeypatch):
     """Полная компакция не должна запускаться во время активной индексации.
 
-    Она склеивает фрагменты и чистит версии — это стоит CPU и памяти. Демон
-    работает на рабочей станции человека, поэтому тяжёлые операции допустимы
-    только в простое. Дешёвое дообновление индексов идёт отдельным путём.
+    Она склеивает фрагменты и чистит версии — дорого по CPU и памяти на
+    рабочей станции пользователя, поэтому только в простое. Дешёвое
+    дообновление индексов идёт отдельным путём.
     """
     calls: list[str] = []
     monkeypatch.setattr(
@@ -355,3 +355,39 @@ async def test_reconcile_removes_stale(index: Index, tmp_path):
     assert await index.lsm_collection.indexed.async_get(gone) is None
     assert await index.lsm_collection.indexed.async_get("email_INBOX:0:10") is not None
     assert not os.path.exists(gone)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_removes_file_grown_past_max_size(
+    index: Index, tmp_path, monkeypatch
+):
+    """Файл, выросший сверх max_size, снимается с индекса сверкой.
+
+    Обход и watcher отсеивают его до очереди (filter_meta), и прежние строки
+    иначе остались бы в поиске навсегда: файл на месте, а LSM с диском уже не
+    сверяется.
+    """
+    from src.indexer.utils import filter_meta
+
+    monkeypatch.setattr(index.cfg.file_scan_cfg, "max_size", 16)
+    monkeypatch.setattr(index.cfg.file_scan_cfg, "filter_meta", filter_meta)
+    grown = tmp_path / "вырос.txt"
+    grown.write_text("строка " * 10, encoding="utf-8")
+    small = tmp_path / "мал.txt"
+    small.write_text("коротко", encoding="utf-8")
+    for path in (grown, small):
+        # В LSM — размер, с которым файл индексировали (он был в лимите).
+        await index.lsm_collection.indexed.async_set(
+            str(path), FileMetadata(str(path), 8, 1)
+        )
+        await index.cfg.lance.files.add_batch(
+            _chunk_table(str(path), "содержимое", index.cfg.embed_dim)
+        )
+
+    removed = await index.reconcile_deleted()
+
+    assert removed == 1
+    rows = index.cfg.lance.files.table.search().limit(100).to_list()
+    assert {row["path"] for row in rows} == {str(small)}
+    assert await index.lsm_collection.indexed.async_get(str(grown)) is None
+    assert await index.lsm_collection.indexed.async_get(str(small)) is not None

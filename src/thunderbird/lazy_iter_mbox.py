@@ -4,8 +4,8 @@ import os
 from collections.abc import Generator
 from datetime import datetime
 from email.header import decode_header
+from email.message import Message
 from email.parser import BytesParser
-from typing import Literal
 
 from rich.progress import Progress
 
@@ -15,9 +15,8 @@ from src.utils import get_logger
 linesep = os.linesep.encode("ascii")
 logger = get_logger(__name__)
 
-# Заголовки читаются кусками до пустой строки — она и есть граница блока.
-# Без этого обход за метаданными поднимал письмо целиком: на вложении в 80 МБ
-# это 80 МБ в памяти ради одной строки Date.
+# Заголовки читаются кусками до пустой строки (границы блока), а не всё письмо:
+# на вложении в 80 МБ это 80 МБ в памяти ради одной строки Date.
 _HEADER_CHUNK = 64 * 1024
 # Потолок на случай письма без границы заголовков (битый mbox): читать ради
 # заголовков десятки мегабайт нельзя. Заголовки крупнее мегабайта — сломанная
@@ -31,10 +30,9 @@ _HEADER_SEPARATORS = (b"\r\n\r\n", b"\n\n")
 def _read_header_block(file, length: int) -> bytes:
     """Прочитать блок заголовков письма, не поднимая в память его тело.
 
-    Одним фиксированным куском обойтись нельзя: MTA дописывают Received
-    СВЕРХУ, поэтому `Date` легко уезжает за первые десятки килобайт. Усечённый
-    блок терял `Date`, а письмо без `Date` выпадало из индексации совсем и без
-    единой строки в логе.
+    Не одним фиксированным куском: MTA дописывают Received сверху, `Date`
+    уезжает за первые десятки килобайт, а письмо без `Date` молча выпадает из
+    индексации.
     """
     cap = min(length, _HEADER_READ_LIMIT)
     buf = bytearray()
@@ -57,10 +55,9 @@ def _generate_toc_lazy(
     task_name: str = "Generating TOC",
     start_offset: int = 0,
 ):
-    """Generate key-to-(start, stop) table of contents as a lazy generator.
+    """Лениво отдать байтовые границы писем mbox — пары (start, stop).
 
-    This is a lazy version of generate_toc that yields (index, (start, stop)) pairs
-    one at a time rather than building the entire dictionary at once.
+    start — позиция строки `From ` письма, stop — конец письма.
     """
     starts = []
     last_was_empty = False
@@ -75,10 +72,8 @@ def _generate_toc_lazy(
         _file.seek(start_offset)
         total_file_size = os.path.getsize(file_name)
         if start_offset > 0 and start_offset >= total_file_size:
-            # Сохранённый offset за концом файла — след компакции mbox
-            # (Thunderbird переписал файл, и он стал короче). Молчать здесь
-            # нельзя: без сигнала новые письма перестают индексироваться
-            # до полного сброса.
+            # Offset за концом файла — след компакции mbox: без предупреждения
+            # новые письма молча не индексируются до полного сброса.
             logger.warning(
                 "mbox %s: saved offset %s beyond file size %s — "
                 "the mbox was likely compacted",
@@ -89,9 +84,12 @@ def _generate_toc_lazy(
             return
         if start_offset >= total_file_size:
             return
+        # Сканер передаёт прогресс всегда, в поставке — выключенный: он истинен,
+        # а add_task отдаёт TaskID(0), и без проверки disable его обновление
+        # (tell() и лок) шло бы на каждой строке многогигабайтного mbox.
         task = (
             progress.add_task(task_name, total=total_file_size - start_offset)
-            if progress
+            if progress is not None and not progress.disable
             else None
         )
         while True:
@@ -99,7 +97,6 @@ def _generate_toc_lazy(
             line = _file.readline()
 
             if line.startswith(b"From "):
-                # If we already have a start position, we can yield the previous message
                 if len(starts) > 0:
                     if last_was_empty:
                         stop_pos = line_pos - len(linesep)
@@ -112,7 +109,6 @@ def _generate_toc_lazy(
                 last_was_empty = False
 
             elif not line:
-                # End of file - yield the last message if we have one
                 if len(starts) > 0:
                     if last_was_empty:
                         stop_pos = line_pos - len(linesep)
@@ -128,11 +124,13 @@ def _generate_toc_lazy(
             else:
                 last_was_empty = False
 
-            # Update progress
-            if progress and task is not None:
+            if progress is not None and task is not None:
                 progress.update(task, completed=_file.tell() - start_offset)
-                if line_pos >= total_file_size:
-                    break
+            # Граница — размер файла на входе: письмо, которое Thunderbird
+            # дописывает во время обхода, не попадёт в TOC недописанным, его
+            # прочитает следующий проход.
+            if line_pos >= total_file_size:
+                break
 
 
 def _decode_filename(filename):
@@ -155,6 +153,34 @@ def _decode_filename(filename):
     except Exception as e:
         logger.warning(f"Failed to decode filename {filename}: {e}")
         return filename
+
+
+def _parse_date(value: str) -> datetime | None:
+    """Разобрать дату письма; None — если она битая или вне диапазона datetime.
+
+    Дата едет в метаданные как timestamp, а разбор письма переводит его
+    обратно (datetime.fromtimestamp), поэтому дата, не переживающая этот
+    путь (31 декабря 9999 года с поясом), — тоже битая.
+    """
+    try:
+        date = email.utils.parsedate_to_datetime(value)
+        datetime.fromtimestamp(date.timestamp())
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    return date
+
+
+def _message_date(msg: Message) -> datetime | None:
+    """Дата письма: заголовок Date, а если он битый — дата строки `From `.
+
+    Битый Date (спам, ISO-дата автоматических систем, не-ASCII) иначе ронял
+    бы обход всей папки на этом письме. Строку `From ` Thunderbird пишет,
+    когда сохраняет письмо в mbox, — это время получения.
+    """
+    if (date := _parse_date(str(msg["Date"]))) is not None:
+        return date
+    parts = (msg.get_unixfrom() or "").split(None, 2)
+    return _parse_date(parts[2]) if len(parts) == 3 else None
 
 
 def _iter_emails(
@@ -186,13 +212,22 @@ def _iter_emails(
             _bytes = (
                 _read_header_block(_file, length) if headersonly else _file.read(length)
             )
-            # msg = email.message_from_bytes(_bytes)
             msg = BytesParser().parsebytes(_bytes, headersonly=headersonly)
             if msg["Date"] is None:
                 continue
-            date = email.utils.parsedate_to_datetime(msg["Date"])
+            if (date := _message_date(msg)) is None:
+                # Ни Date, ни строка `From ` не разбираются: письмо
+                # пропускается, но обход папки идёт дальше и offset двигается.
+                logger.warning(
+                    "mbox %s: письмо по offset %s без даты (Date: %.80r) пропущено",
+                    file_name,
+                    start,
+                    str(msg["Date"]),
+                )
+                yield None, (None, start, stop)
+                continue
             if min_date and date:
-                # Convert timezone-aware datetime to naive datetime for comparison
+                # min_date наивный, а aware и naive datetime не сравниваются.
                 naive_date = date.replace(tzinfo=None)
                 if naive_date < min_date:
                     yield None, (None, start, stop)
@@ -205,7 +240,7 @@ def _iter_emails(
 
 def iter_emails_as_metadata(
     file_name: str,
-    prefix: Literal["email_i:", "email_o:"] = "email_i:",  # "i: - inbox, o: - outbox",
+    prefix: str,
     start_offset: int = 0,
     min_date: datetime | None = None,
     progress: Progress | None = None,

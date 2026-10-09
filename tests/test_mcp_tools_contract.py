@@ -1,9 +1,8 @@
 """Контракт инструментов MCP-моста на заглушке сайдкара.
 
-Проверяем три вещи, которые ломаются молча: что уходит в API, что возвращается
-агенту и как мост ведёт себя, когда сайдкар отвечает плохо или не отвечает.
-Индекс, OpenVINO и LanceDB для этого не нужны — заглушка отдаёт ровно те
-структуры, что и настоящий `SearchResponse`.
+Что уходит в API, что возвращается агенту и как мост ведёт себя, когда
+сайдкар отвечает плохо или не отвечает. Заглушка отдаёт те же структуры, что и
+настоящий `SearchResponse`.
 """
 
 import time
@@ -41,9 +40,6 @@ def write_bridge(stub, bridge_factory):  # noqa: F811
     return bridge_factory(stub.url, LQRAG_ALLOW_WRITE="1")
 
 
-# ---------------------------------------------------------------------------
-# Поиск: что уходит в API
-# ---------------------------------------------------------------------------
 def test_search_passes_arguments_verbatim(stub, bridge):  # noqa: F811
     stub.set("POST", SEARCH, {"results": [_hit("/docs/a.docx")], "total": 1})
     bridge.call(
@@ -71,9 +67,6 @@ def test_search_defaults_are_explicit(stub, bridge):  # noqa: F811
     assert body["sources"] == ["files"]
 
 
-# ---------------------------------------------------------------------------
-# Поиск: что возвращается агенту
-# ---------------------------------------------------------------------------
 def test_search_returns_text_and_structured_content(stub, bridge):  # noqa: F811
     stub.set(
         "POST",
@@ -128,8 +121,7 @@ def _long_hit(number, fragments=3, size=900):
 def test_long_documents_do_not_cut_the_list(stub, bridge):  # noqa: F811
     """10 документов с длинными названиями и путями — все 10 заголовков.
 
-    Раньше документ раскладывался целиком: три фрагмента по 600 символов
-    у первых документов съедали бюджет, и хвост списка терялся.
+    Фрагменты первых документов не должны съедать бюджет хвоста списка.
     """
     hits = [_long_hit(i) for i in range(10)]
     stub.set("POST", SEARCH, {"results": hits, "total": 10})
@@ -219,7 +211,7 @@ def test_match_marks_in_text_and_structured(stub, bridge):  # noqa: F811
 
 
 def test_total_counts_documents_of_the_response(stub, bridge):  # noqa: F811
-    """У демонов до «limit = документы» total считал строки, а не документы."""
+    """total — число документов ответа: старые демоны считали в total строки."""
     stub.set("POST", SEARCH, {"results": [_hit("/a.txt"), _hit("/b.txt")], "total": 17})
     response = bridge.call("local_search", {"query": "x"})
     assert response["result"]["structuredContent"]["total"] == 2
@@ -276,9 +268,6 @@ def test_email_hits_are_marked_as_unreadable(stub, bridge):  # noqa: F811
     assert "не файл на диске" in call_text(bridge.call("local_search", {"query": "письмо"}))
 
 
-# ---------------------------------------------------------------------------
-# Валидация: молча править вход нельзя
-# ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "arguments, expected",
     [
@@ -301,9 +290,6 @@ def test_bad_arguments_are_rejected(stub, bridge, arguments, expected):  # noqa:
     assert stub.bodies("POST", SEARCH) == [], "невалидный вызов не должен доходить до API"
 
 
-# ---------------------------------------------------------------------------
-# Деградация: сайдкар отвечает плохо или не отвечает
-# ---------------------------------------------------------------------------
 def test_api_error_becomes_tool_error(stub, bridge):  # noqa: F811
     stub.set("POST", SEARCH, {"detail": "внутренняя ошибка"}, status=500)
     response = bridge.call("local_search", {"query": "x"})
@@ -338,9 +324,6 @@ def test_slow_sidecar_hits_the_timeout(stub, bridge_factory):  # noqa: F811
     assert response["result"]["isError"] is True
 
 
-# ---------------------------------------------------------------------------
-# Статус индекса
-# ---------------------------------------------------------------------------
 def test_index_status_reports_phase(stub, bridge):  # noqa: F811
     stub.set(
         "GET",
@@ -360,9 +343,6 @@ def test_index_status_reports_phase(stub, bridge):  # noqa: F811
     assert response["result"]["structuredContent"]["files_to_index"] == 7
 
 
-# ---------------------------------------------------------------------------
-# Чтение файла: песочница
-# ---------------------------------------------------------------------------
 @pytest.fixture
 def sandbox(tmp_path, stub):  # noqa: F811
     """Индексируемая папка, как её видит мост через GET /config."""
@@ -391,15 +371,23 @@ def test_read_file_outside_indexed_folder_is_refused(sandbox, tmp_path, bridge):
     assert "секрет" not in call_text(response)
 
 
-def test_read_file_follows_no_symlink_out_of_the_sandbox(sandbox, tmp_path, bridge):
-    """Симлинк из индексируемой папки наружу — обход песочницы через abspath."""
-    secret = tmp_path / "секрет.txt"
-    secret.write_text("токен", encoding="utf-8")
-    link = sandbox / "ссылка.txt"
-    link.symlink_to(secret)
-    response = bridge.call("local_read_file", {"absolute_path": str(link)})
+def test_read_file_reads_through_symlinks_like_the_indexer(sandbox, tmp_path, bridge):
+    """Индексатор идёт по ссылкам и хранит путь через ссылку — его absolute_path
+    из выдачи поиска читается. Ссылка со скрытым именем — как скрытый каталог."""
+    projects = tmp_path / "проекты"
+    projects.mkdir()
+    (projects / "план.txt").write_text("план за ссылкой", encoding="utf-8")
+    (sandbox / "Проекты").symlink_to(projects, target_is_directory=True)
+    (sandbox / "ссылка.txt").symlink_to(projects / "план.txt")
+    (sandbox / ".скрытая").symlink_to(projects, target_is_directory=True)
+    for path in (sandbox / "Проекты" / "план.txt", sandbox / "ссылка.txt"):
+        response = bridge.call("local_read_file", {"absolute_path": str(path)})
+        assert response["result"]["isError"] is False, call_text(response)
+        assert "план за ссылкой" in call_text(response)
+    hidden = sandbox / ".скрытая" / "план.txt"
+    response = bridge.call("local_read_file", {"absolute_path": str(hidden)})
     assert response["result"]["isError"] is True
-    assert "токен" not in call_text(response)
+    assert "план за ссылкой" not in call_text(response)
 
 
 def test_read_file_refuses_traversal(sandbox, tmp_path, bridge):
@@ -429,6 +417,30 @@ def test_read_file_refuses_hidden_files(sandbox, bridge):
     assert "скрытые файлы" in call_text(response)
 
 
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "u/.config/gh/hosts.yml",
+        "u/.docker/config.json",
+        "u/.gigacode/settings.json",
+        "u/.wsc/config/wsc.json",
+        "u/.local/share/Trash/files/old.txt",
+        "u/.ssh/notes.txt",
+        "u/node_modules/x/readme.md",
+    ],
+)
+def test_read_file_refuses_files_under_hidden_and_service_dirs(sandbox, bridge, rel):
+    """Корень — как поставочный /home: скрыто не имя файла, а каталог ниже корня.
+    Индексатор такие каталоги не обходит, и мост их не читает."""
+    target = sandbox / rel
+    target.parent.mkdir(parents=True)
+    target.write_text("oauth_token: FAKE_TOKEN_123", encoding="utf-8")
+    response = bridge.call("local_read_file", {"absolute_path": str(target)})
+    assert response["result"]["isError"] is True
+    assert "скрытые файлы" in call_text(response)
+    assert "FAKE_TOKEN_123" not in call_text(response)
+
+
 def test_read_file_fails_closed_without_the_sidecar(tmp_path, bridge_factory):  # noqa: F811
     """Границы песочницы неизвестны — читать нельзя, даже если файл есть."""
     target = tmp_path / "файл.txt"
@@ -456,9 +468,6 @@ def test_read_file_reports_missing_file(sandbox, bridge):
     assert "не найден" in call_text(response)
 
 
-# ---------------------------------------------------------------------------
-# Чтение файла: офисные форматы на чистом stdlib
-# ---------------------------------------------------------------------------
 def test_read_file_opens_docx_without_office_libraries(sandbox, bridge):
     """В поставке мост работает на системном python3 без docx2txt — .docx
     разбирается stdlib-кодом самого моста и обязан читаться одинаково везде."""
@@ -506,9 +515,6 @@ def test_read_file_truncates_huge_xlsx(sandbox, bridge):
     assert "строка 1049" not in text
 
 
-# ---------------------------------------------------------------------------
-# Чтение файла: два слоя — парсеры демона, stdlib-фолбэк моста
-# ---------------------------------------------------------------------------
 def test_read_file_prefers_daemon_parsers_for_office(sandbox, bridge, stub):
     """Офисные форматы мост читает в первую очередь парсерами демона:
     у него в бинаре pymupdf и конвертер Р7, которых у моста нет."""
@@ -522,14 +528,33 @@ def test_read_file_prefers_daemon_parsers_for_office(sandbox, bridge, stub):
     response = bridge.call("local_read_file", {"absolute_path": str(book)})
     assert response["result"]["isError"] is False
     assert "текст из парсеров демона" in call_text(response)
-    # Демону уходит ровно тот путь, что дал агент.
+    # Демону уходит путь, проверенный мостом (здесь он совпадает с путём агента).
+    assert stub.bodies("POST", "/api/v1/read_file") == [{"absolute_path": str(book)}]
+
+
+def test_read_file_sends_the_checked_path_to_the_daemon(stub, bridge_factory, tmp_path):  # noqa: F811
+    """~ раскрывает мост: у демона свой HOME (на SberOS — pw_dir), и путь агента
+    он раскрыл бы в другой каталог."""
+    home = (tmp_path / "дом").resolve()
+    docs = home / "docs"
+    docs.mkdir(parents=True)
+    book = docs / "таблица.xlsx"
+    book.write_bytes(minimal_xlsx([("Отчёт", [["итог", 402]])]))
+    stub.set("GET", CONFIG, {"folders": [str(docs)], "email": {"enabled": False}})
+    stub.set(
+        "POST",
+        "/api/v1/read_file",
+        {"text": "текст из парсеров демона", "total_chars": 24, "truncated": False},
+    )
+    bridge = bridge_factory(stub.url, HOME=str(home))
+    response = bridge.call("local_read_file", {"absolute_path": "~/docs/таблица.xlsx"})
+    assert response["result"]["isError"] is False, call_text(response)
     assert stub.bodies("POST", "/api/v1/read_file") == [{"absolute_path": str(book)}]
 
 
 def test_read_file_propagates_daemon_verdicts(sandbox, bridge, stub):
-    """Ответ демона по существу файла (413 — больше лимита чтения) — это его
-    вердикт, и мост обязан показать его агенту, а не подменять молчаливой
-    локальной попыткой разбора того же файла."""
+    """Ответ демона по существу файла (413 — больше лимита чтения) мост
+    показывает агенту, а не подменяет локальным разбором того же файла."""
     book = sandbox / "таблица.xlsx"
     book.write_bytes(minimal_xlsx([("Отчёт", [["итог", 402]])]))
     stub.set(
@@ -547,9 +572,53 @@ def test_read_file_propagates_daemon_verdicts(sandbox, bridge, stub):
     assert "--- лист Отчёт ---" not in text
 
 
+@pytest.mark.parametrize("name", ["старина.xls", "отчёт.docx"])
+def test_read_file_propagates_daemon_not_found(sandbox, bridge, stub, name):  # noqa: F811
+    """404 «файл не найден» — вердикт демона, а не «ручки нет»: локальный разбор
+    подменил бы его ложным «обновите lib-local-rag» или текстом файла."""
+    document = sandbox / name
+    if name.endswith(".docx"):
+        document.write_bytes(minimal_docx("Итоги квартала"))
+    else:
+        document.write_bytes(b"\xd0\xcf\x11\xe0 legacy")
+    stub.set(
+        "POST",
+        "/api/v1/read_file",
+        {"detail": "файл не найден или не обычный"},
+        status=404,
+    )
+    response = bridge.call("local_read_file", {"absolute_path": str(document)})
+    assert response["result"]["isError"] is True
+    text = call_text(response)
+    assert "файл не найден или не обычный" in text
+    assert "обновите lib-local-rag" not in text
+    assert "Итоги квартала" not in text
+
+
+def test_read_file_reports_slow_daemon_instead_of_local_fallback(
+    sandbox, stub, bridge_factory  # noqa: F811
+):
+    """Таймаут живого демона — не «демон недоступен»: для .xls локальный разбор
+    выдал бы ложный совет обновить пакет."""
+    legacy = sandbox / "старина.xls"
+    legacy.write_bytes(b"\xd0\xcf\x11\xe0 legacy")
+
+    def _slow(_body):
+        time.sleep(3)
+        return 200, {"text": "поздно", "total_chars": 6, "truncated": False}
+
+    stub.set("POST", "/api/v1/read_file", _slow)
+    bridge = bridge_factory(stub.url, LQRAG_TIMEOUT="1")
+    response = bridge.call("local_read_file", {"absolute_path": str(legacy)}, timeout=20)
+    assert response["result"]["isError"] is True
+    text = call_text(response)
+    assert "сбой связи с сайдкаром" in text
+    assert "обновите lib-local-rag" not in text
+
+
 def test_read_file_refuses_huge_files_without_daemon(sandbox, bridge):
     """Больше лимита чтения (как у демона) мост отвергает и без демона:
-    раньше такой файл уходил в неограниченный локальный разбор в память."""
+    иначе файл ушёл бы в неограниченный локальный разбор в память."""
     huge = sandbox / "огромный.txt"
     with open(huge, "wb") as handle:
         handle.seek(64 * 1024 * 1024)
@@ -573,9 +642,6 @@ def test_read_file_legacy_xls_refuses_without_daemon(sandbox, bridge):
     assert "демон" in text and "обновите lib-local-rag" in text
 
 
-# ---------------------------------------------------------------------------
-# Управление индексацией (агент — единственный пульт)
-# ---------------------------------------------------------------------------
 def test_list_paths_marks_missing_folders(stub, write_bridge, tmp_path):  # noqa: F811
     existing = (tmp_path / "есть").resolve()
     existing.mkdir()
@@ -666,11 +732,132 @@ def test_rescan_reposts_the_same_folders(stub, write_bridge):  # noqa: F811
 
 
 def test_rescan_is_refused_while_indexing(stub, write_bridge):  # noqa: F811
-    """POST /config во время индексации — то, на чём hunt_crash.py ловил падения."""
+    """Переиндексация поверх идущей отклоняется: сценарий падений hunt_crash.py."""
     stub.set("GET", STATUS, {"is_indexing": True, "type": "index", "files_to_index": 500})
     stub.set("GET", CONFIG, {"folders": ["/a"]})
     stub.set("POST", CONFIG, None)
     response = write_bridge.call("local_trigger_rescan")
     assert response["result"]["isError"] is True
     assert "уже идёт" in call_text(response)
+    assert stub.bodies("POST", CONFIG) == []
+
+
+# Демон жив, но индексация выключена: POST /deactivate, /reset или
+# autostart_indexing: false. is_indexing при этом тоже false.
+INACTIVE = {"is_indexing": False, "active": False, "type": "idle", "files_to_index": 0}
+
+
+def test_empty_result_when_indexing_is_off_is_not_a_denial(stub, bridge):  # noqa: F811
+    stub.set("POST", SEARCH, {"results": [], "total": 0})
+    stub.set("GET", STATUS, INACTIVE)
+    text = call_text(bridge.call("local_search", {"query": "договор"}))
+    assert "Индексация выключена" in text and "POST /api/v1/activate" in text
+    assert "индекс актуален" not in text
+
+
+def test_hits_when_indexing_is_off_may_be_incomplete(stub, bridge):  # noqa: F811
+    stub.set("POST", SEARCH, {"results": [_hit("/docs/a.txt")], "total": 1})
+    stub.set("GET", STATUS, INACTIVE)
+    text = call_text(bridge.call("local_search", {"query": "x"}))
+    assert "индексация выключена" in text and "может быть неполным" in text
+
+
+def test_index_status_reports_indexing_is_off(stub, bridge):  # noqa: F811
+    stub.set("GET", STATUS, INACTIVE)
+    response = bridge.call("local_index_status")
+    text = call_text(response)
+    assert text.startswith("Индексация: выключена\n")
+    assert "POST /api/v1/activate" in text
+    assert response["result"]["structuredContent"]["active"] is False
+
+
+def test_add_and_remove_path_when_indexing_is_off(stub, write_bridge, tmp_path):  # noqa: F811
+    """На выключенной индексации демон только сохраняет список папок."""
+    first = (tmp_path / "первая").resolve()
+    second = (tmp_path / "вторая").resolve()
+    first.mkdir()
+    second.mkdir()
+    stub.set("GET", STATUS, INACTIVE)
+    stub.set("GET", CONFIG, {"folders": [str(first)]})
+    stub.set("POST", CONFIG, None)
+    added = call_text(write_bridge.call("local_add_path", {"path": str(second)}))
+    assert "список сохранён" in added and "перезапущена" not in added
+    stub.set("GET", CONFIG, {"folders": [str(first), str(second)]})
+    removed = call_text(write_bridge.call("local_remove_path", {"path": str(second)}))
+    assert "список сохранён" in removed and "перезапущена" not in removed
+    assert stub.bodies("POST", CONFIG) == [
+        {"folders": [str(first), str(second)]},
+        {"folders": [str(first)]},
+    ]
+
+
+def test_rescan_is_refused_when_indexing_is_off(stub, write_bridge):  # noqa: F811
+    stub.set("GET", STATUS, INACTIVE)
+    stub.set("GET", CONFIG, {"folders": ["/a"]})
+    stub.set("POST", CONFIG, None)
+    response = write_bridge.call("local_trigger_rescan")
+    assert response["result"]["isError"] is True
+    assert "выключена" in call_text(response)
+    assert stub.bodies("POST", CONFIG) == []
+
+
+@pytest.fixture
+def home_with_nested(tmp_path):
+    """Корень как /home в поставке и пользовательская папка внутри него."""
+    home = (tmp_path / "home").resolve()
+    nested = home / "u" / "Документы"
+    nested.mkdir(parents=True)
+    return home, nested
+
+
+def test_add_nested_path_says_it_was_covered(stub, write_bridge, home_with_nested):  # noqa: F811
+    """Вложенная папка уже входит в индексацию корня — ответ говорит об этом.
+
+    Запись всё равно добавляется: иначе список не сузить с корня до неё
+    (последнюю папку удалить нельзя)."""
+    home, nested = home_with_nested
+    stub.set("GET", CONFIG, {"folders": [str(home)]})
+    stub.set("POST", CONFIG, None)
+    response = write_bridge.call("local_add_path", {"path": str(nested)})
+    assert response["result"]["isError"] is False
+    assert "внутри индексируемой папки %s" % home in call_text(response)
+    assert stub.bodies("POST", CONFIG) == [{"folders": [str(home), str(nested)]}]
+
+
+def test_add_link_out_of_the_root_is_not_called_covered(stub, write_bridge, tmp_path):  # noqa: F811
+    """Вложенность — по realpath: ссылку наружу корень при follow_symlinks: false
+    не обходит, называть её покрытой нельзя."""
+    home = (tmp_path / "home").resolve()
+    outside = (tmp_path / "data").resolve()
+    (home / "u").mkdir(parents=True)
+    outside.mkdir()
+    link = home / "u" / "data"
+    link.symlink_to(outside)
+    stub.set("GET", CONFIG, {"folders": [str(home)]})
+    stub.set("POST", CONFIG, None)
+    text = call_text(write_bridge.call("local_add_path", {"path": str(link)}))
+    assert "внутри индексируемой" not in text
+    assert stub.bodies("POST", CONFIG) == [{"folders": [str(home), str(link)]}]
+
+
+def test_remove_nested_path_says_documents_stay(stub, write_bridge, home_with_nested):  # noqa: F811
+    """Вложенная папка уходит из списка, но её документы покрывает внешний корень."""
+    home, nested = home_with_nested
+    stub.set("GET", CONFIG, {"folders": [str(home), str(nested)]})
+    stub.set("POST", CONFIG, None)
+    response = write_bridge.call("local_remove_path", {"path": str(nested)})
+    text = call_text(response)
+    assert response["result"]["isError"] is False
+    assert "внутри индексируемой папки %s" % home in text
+    assert "сняты с индекса" not in text
+    assert stub.bodies("POST", CONFIG) == [{"folders": [str(home)]}]
+
+
+def test_remove_covered_path_names_the_root(stub, write_bridge, home_with_nested):  # noqa: F811
+    home, nested = home_with_nested
+    stub.set("GET", CONFIG, {"folders": [str(home)]})
+    stub.set("POST", CONFIG, None)
+    response = write_bridge.call("local_remove_path", {"path": str(nested)})
+    assert response["result"]["isError"] is True
+    assert "внутри индексируемой папки %s" % home in call_text(response)
     assert stub.bodies("POST", CONFIG) == []

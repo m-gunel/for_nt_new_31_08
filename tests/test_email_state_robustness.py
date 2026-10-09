@@ -1,7 +1,4 @@
-"""Устойчивость почтового состояния: битый offsets.json, новые папки, смена корня.
-
-Регрессии на устойчивость состояния почтового тракта.
-"""
+"""Устойчивость почтового состояния: битый offsets.json, новые папки, смена корня."""
 
 import json
 
@@ -57,9 +54,6 @@ def _write_state(tmp_path, payload):
     return p
 
 
-# ------------------------------------------------ битый offsets.json --------
-
-
 @pytest.mark.parametrize(
     "payload",
     [
@@ -73,11 +67,10 @@ def _write_state(tmp_path, payload):
     ],
 )
 def test_corrupt_state_does_not_raise(email_config, mail_root, tmp_path, payload):
-    """Битый offsets.json роняет старт демона — а не должен.
+    """Битый offsets.json не роняет старт демона.
 
-    Файл переживает обрыв процесса в полузаписанном виде, и раньше
-    JSONDecodeError отсюда поднимался до конструктора Index, убивая
-    индексацию и обычных файлов тоже.
+    Запись атомарна, но файл бывает испорчен вручную или достаётся от старой
+    версии, а JSONDecodeError из конструктора Index убил бы и индексацию файлов.
     """
     _write_state(tmp_path, payload)
     scanner = _scanner(email_config, mail_root, tmp_path)
@@ -97,15 +90,9 @@ def test_valid_v2_state_is_loaded(email_config, mail_root, tmp_path):
     assert scanner.folder_state["INBOX"] == FolderState(offset=42, size=100, mtime=7)
 
 
-# ------------------------------------------------- новые папки --------------
-
-
 def test_new_folder_is_picked_up(email_config, mail_root, tmp_path):
-    """Папка, созданная после прошлого прохода, должна попасть в состояние.
-
-    Раньше folder_state брался ТОЛЬКО из offsets.json, и новая папка не
-    индексировалась никогда — даже после рестарта демона.
-    """
+    """Папка, созданная после прошлого прохода, попадает в состояние, хотя её
+    нет в offsets.json."""
     _write_state(
         tmp_path,
         {"version": 2, "folders": {"INBOX": {"offset": 42, "size": 100, "mtime": 7}}},
@@ -121,9 +108,8 @@ async def test_folder_created_while_running_is_picked_up(
 ):
     """Папка, созданная при работающем демоне, индексируется без рестарта.
 
-    Сканер создаётся один раз на весь процесс, поэтому список папок нельзя
-    читать только в конструкторе: на живом поллинге новая папка иначе
-    невидима до перезапуска.
+    Сканер создаётся один раз на процесс, поэтому список папок читается не
+    только в конструкторе.
     """
     from tests.mbox_fixture import write_mbox
 
@@ -151,6 +137,23 @@ def test_detect_stale_sees_new_folders(email_config, mail_root, tmp_path):
     assert "Новая" in scanner.folder_state
 
 
+def test_dangling_unindexed_folder_is_dropped(email_config, mail_root, tmp_path):
+    """Исчезнувшая папка, из которой ничего не индексировали (так их хранил
+    offsets.json прежних версий), уходит из состояния на первом же детекте:
+    удалять нечего, а ключ давал бы WARNING на каждом поллинге."""
+    _write_state(
+        tmp_path,
+        {
+            "version": 2,
+            "folders": {"Старая": {"offset": 0, "size": -1, "mtime": -1}},
+        },
+    )
+    scanner = _scanner(email_config, mail_root, tmp_path)
+    assert "Старая" in scanner.folder_state
+    assert scanner.detect_stale_folders() == []
+    assert "Старая" not in scanner.folder_state
+
+
 def test_state_written_atomically(email_config, mail_root, tmp_path):
     scanner = _scanner(email_config, mail_root, tmp_path)
     scanner._save_state()
@@ -158,9 +161,6 @@ def test_state_written_atomically(email_config, mail_root, tmp_path):
     assert target.exists()
     assert not (tmp_path / "storage" / "offsets.json.tmp").exists()
     assert json.loads(target.read_text())["version"] == 2
-
-
-# ------------------------------------------- смена почтового корня ----------
 
 
 @pytest.mark.asyncio
@@ -188,11 +188,7 @@ async def test_scanner_recreated_on_root_change(email_config, tmp_path, monkeypa
 async def test_scanner_retried_when_root_appears_later(
     config: Config, tmp_path, monkeypatch
 ):
-    """Профиль Thunderbird появился после старта — почта всё равно заработает.
-
-    Раньше start_emails_polling при неразрешимом корне не создавал задачу,
-    и повторить попытку было уже некому.
-    """
+    """Профиль Thunderbird появился после старта — почта всё равно заработает."""
     monkeypatch.setattr(config, "lsm_root", str(tmp_path / "storage"))
     monkeypatch.setattr(config, "lsm_path", str(tmp_path / "storage" / "lsm.ldb"))
     monkeypatch.setattr(config, "ld_db_path", str(tmp_path / "storage" / "lance"))
@@ -223,9 +219,6 @@ async def test_scanner_retried_when_root_appears_later(
         config.__dict__.pop("lance", None)
         config.__dict__.pop("user_conf_path", None)
         config.__dict__.pop("data_directory_path", None)
-
-
-# ------------------------------------------------ user_conf.yml -------------
 
 
 def test_broken_user_conf_does_not_break_config(email_config: Config):

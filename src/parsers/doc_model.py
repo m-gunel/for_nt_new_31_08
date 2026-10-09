@@ -7,11 +7,10 @@
 и повторов. Блоки `whole` — готовые чанки: их не режут и не склеивают с соседями.
 
 Полный текст: блоки через перевод строки, а на границе страницы, слайда, готового
-чанка и перед заголовком — через пустую строку. Это граница абзаца, по которой сплиттер режет в первую
-очередь (как раньше: страница PDF кончалась переводом строки); без неё он перебирал
-бы строки всего документа — вдвое больше вызовов токенизатора. Заголовок PDF — только
-метка раздела: текст и границы чанков те же, что без него (граница абзаца перед
-заголовком PDF ухудшала поиск: офлайн-A/B 02.10.2026, nDCG@10 PDF −0,004).
+чанка и перед заголовком — через пустую строку. По границе абзаца сплиттер режет
+в первую очередь; без неё он перебирает строки всего документа — вдвое больше
+вызовов токенизатора. Заголовок PDF — только метка раздела, границу абзаца не
+ставит: с ней поиск по PDF хуже.
 """
 
 import bisect
@@ -24,14 +23,15 @@ from .normalize import normalize_field, normalize_text
 SECTION_SEP = " › "
 # Чанк, где меньше трёх слов из букв («—», «1», «Стр. 2»), — не содержание.
 _WORD = re.compile(r"[^\W\d_]{2,}")
-# Страница из одного номера («12», «- 12 -», «Стр. 3») — не содержание.
+# Страница PDF из одного номера («12», «- 12 -», «Стр. 3») — не содержание. На слайде
+# так выглядят KPI («85%», «2025»), а номер слайда отсеивает src/parsers/pptx.py.
 _PAGE_NUMBER = re.compile(r"^\W*(стр\.?|с\.|page)?\s*\d{1,4}\W*$", re.I)
 
 
 @dataclass(slots=True)
 class Block:
     text: str
-    kind: str = "text"  # text / table / table_row / notes / ocr
+    kind: str = "text"  # text / table / table_row / notes / ocr / footnote
     page: int | None = None  # страница PDF, слайд, лист — с 1
     line: int | None = None  # строка исходного txt — с 1
     heading: int | None = None  # уровень заголовка, если блок — заголовок раздела
@@ -55,13 +55,12 @@ class ParsedDoc:
     # PDF: управляющий символ между буквами — дефис; переносы и заголовки
     # чистит src/parsers/pdf_clean.py.
     pdf: bool = False
-    toc: list[tuple[int, str, int]] = field(
-        default_factory=list
-    )  # закладки: уровень, название, страница
+    # Закладки: уровень, название, страница.
+    toc: list[tuple[int, str, int]] = field(default_factory=list)
 
 
 def prepare(doc: ParsedDoc) -> ParsedDoc:
-    """Нормализовать блоки и поля; убрать пустые блоки и страницы из одного номера."""
+    """Нормализовать блоки и поля; убрать пустые блоки и страницы PDF из одного номера."""
     for b in doc.blocks:
         b.text = normalize_text(b.text, pdf=doc.pdf)
     source = doc.blocks
@@ -76,7 +75,12 @@ def prepare(doc: ParsedDoc) -> ParsedDoc:
             if b.line is not None and blocks and blocks[-1].text:
                 blocks.append(b)
             continue
-        if b.page is not None and not b.whole and _PAGE_NUMBER.match(b.text):
+        if (
+            doc.pdf
+            and b.page is not None
+            and not b.whole
+            and _PAGE_NUMBER.match(b.text)
+        ):
             continue
         b.section = normalize_field(b.section)
         blocks.append(b)
@@ -179,10 +183,18 @@ def chunk_document(doc: ParsedDoc, splitter) -> list[dict]:
         j = i
         while j + 1 < len(blocks) and not blocks[j + 1].whole:
             j += 1
-        if j + 1 < len(blocks) and all(b.heading for b in blocks[i : j + 1]):
-            # Одни заголовки перед таблицей: они уже в её названии и пути раздела.
-            i = j + 1
-            continue
+        nxt = j + 1
+        if (
+            nxt < len(blocks)
+            and all(b.heading for b in blocks[i:nxt])
+            and blocks[nxt].text.startswith(blocks[j].text + "\n")
+        ):
+            # Одни заголовки перед таблицей или заметками: последний уже стоит
+            # первой строкой их чанка, остальные — текстом (section не индексируется).
+            j -= 1
+            if j < i:
+                i = nxt
+                continue
         flow_start, flow_end = starts[i], starts[j] + len(blocks[j].text)
         flow = text[flow_start:flow_end]
         prev = -1
@@ -192,9 +204,8 @@ def chunk_document(doc: ParsedDoc, splitter) -> list[dict]:
             at = flow.find(piece, prev + 1)
             if at < 0:
                 at = flow.find(piece)
-            if (
-                at < 0
-            ):  # сплиттер переписал текст — место неизвестно, берём начало потока
+            if at < 0:
+                # Сплиттер переписал текст — место неизвестно, берём начало потока.
                 at = max(prev, 0)
             prev = at
             start, end = flow_start + at, flow_start + at + len(piece)
@@ -205,7 +216,7 @@ def chunk_document(doc: ParsedDoc, splitter) -> list[dict]:
                 max(block_at(start), i),
                 min(block_at(max(start, end - 1)), j),
             )
-        i = j + 1
+        i = nxt
     return _filter(raw)
 
 

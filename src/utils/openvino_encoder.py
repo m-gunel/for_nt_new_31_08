@@ -27,17 +27,16 @@ _cfg = {
     op.hint.performance_mode(): op.hint.PerformanceMode.LATENCY  # type: ignore
 }
 
-# Ровно по числу каналов инференса: search и index. Одного stream на оба мало —
-# потоки Python есть, но исполняются по очереди, и живой поисковый запрос ждёт
-# конца текущего батча индексации. Больше двух тоже плохо: каждый stream
-# получает по одному потоку, и индексация замедляется в разы.
+# Ровно по числу каналов инференса: search и index. С одним stream поисковый
+# запрос ждёт конца батча индексации; с большим числом каждый stream получает
+# по одному потоку, и индексация замедляется в разы.
 DEFAULT_INFERENCE_STREAMS = 2
 
 # Под LATENCY плагин отдаёт инференсу все ядра машины, а фоновый демон на
 # рабочей станции так занимает её целиком. Модель крошечная, и на всех ядрах
 # заметная часть процессорного времени уходит на конкуренцию потоков, а не на
-# счёт, поэтому по умолчанию берём половину ядер. OV_NUM_THREADS перекрывает
-# дефолт, значение 0 возвращает решение плагину.
+# счёт, поэтому по умолчанию берём половину ядер. RAG_OV_NUM_THREADS (старое
+# имя OV_NUM_THREADS) перекрывает дефолт, значение 0 возвращает решение плагину.
 DEFAULT_INFERENCE_THREADS = max(2, (os.cpu_count() or 4) // 2)
 
 
@@ -47,15 +46,16 @@ def _resolve_num_threads() -> int | None:
     RAG_OV_NUM_THREADS — каноничное имя (в проекте все переменные под
     префиксом RAG_); OV_NUM_THREADS остаётся для совместимости.
     """
-    requested = (
-        os.environ.get("RAG_OV_NUM_THREADS") or os.environ.get("OV_NUM_THREADS", "")
-    ).strip()
+    name = "RAG_OV_NUM_THREADS"
+    if not os.environ.get(name):
+        name = "OV_NUM_THREADS"
+    requested = os.environ.get(name, "").strip()
     if not requested:
         return DEFAULT_INFERENCE_THREADS
     if requested.isdigit():
         value = int(requested)
         return value if value > 0 else None
-    lg.warning("OV_NUM_THREADS=%r — не число, лимит потоков не применён", requested)
+    lg.warning("%s=%r — не число, лимит потоков не применён", name, requested)
     return None
 
 
@@ -114,9 +114,10 @@ class _InferChannel:
         self._model_inf: ov.InferRequest | None = None
         self._lock = threading.Lock()
         self._counter = 0
-        # Канал индексации — фоновая работа: его поток уступает CPU
-        # интерактивным задачам пользователя. Канал поиска — нет: он
-        # обслуживает живой запрос.
+        # nice потока канала index понижен, но в нём только ожидание, копия
+        # результата и gc: инференс считают общие для обоих каналов потоки
+        # плагина OpenVINO с обычным приоритетом. Нагрузку индексации на CPU
+        # ограничивают RAG_OV_NUM_THREADS и index_throttle_seconds.
         initializer = background_pool_initializer if name == "index" else None
         self.executor = concurrent.futures.ThreadPoolExecutor(
             1, thread_name_prefix=f"ov_{name}", initializer=initializer
@@ -163,9 +164,8 @@ class _InferChannel:
             model_inf = self.model_inf
             model_inf.start_async(inputs=toks)
             model_inf.wait()
-            # Копия обязательна: .data — это view на буфер infer-request'а,
-            # который переиспользуется следующим вызовом. Без копии вызывающий
-            # код может получить данные уже другого батча.
+            # Копия обязательна: .data — view на буфер infer-request'а, который
+            # перепишет следующий батч.
             return np.array(model_inf.output_tensors[0].data, copy=True)
 
     def shutdown(self):
@@ -186,7 +186,6 @@ class OpenVINOEmbedder:
         self.model = self.core.compile_model(Path(model_path) / openvino, device, _cfg)
         self.tokenizer = self.core.compile_model(tokenizer_path, device, _cfg)
 
-        # Отдельные каналы: интерактивный поиск не должен ждать фоновую индексацию.
         self._channels: dict[Role, _InferChannel] = {
             "search": _InferChannel("search", self.model, self.tokenizer),
             "index": _InferChannel("index", self.model, self.tokenizer),
@@ -224,9 +223,9 @@ class OpenVINOEmbedder:
         return None
 
     def _apply_prefix(self, texts: list[str], task: Literal["query", "document"]):
-        # Вход модели — в нижнем регистре: rubert-tiny2 различает регистр, и запрос
-        # ЗАГЛАВНЫМИ ставил правильный документ первым в 3% запросов вместо 50%
-        # (стенд, 01.10.2026). Хранимый текст, BM25 и count_tokens не меняются.
+        # Вход модели — в нижнем регистре: rubert-tiny2 различает регистр, и
+        # запрос ЗАГЛАВНЫМИ почти не находит нужный документ. Хранимый текст,
+        # BM25 и count_tokens не меняются.
         texts = [x.lower() for x in texts]
         if self.prefix:
             return [f"{self.prefix[task]}{x}" for x in texts]
@@ -251,11 +250,10 @@ class OpenVINOEmbedder:
         task: Literal["query", "document"] = "query",
         role: Role = "search",
     ):
-        """Инференс в отдельном потоке своей роли.
+        """Инференс в потоке канала своей роли.
 
         `role="search"` — интерактивные запросы, `role="index"` — фоновая
-        индексация. Каналы независимы, поэтому долгий батч индексации не
-        задерживает поисковый запрос.
+        индексация (см. `_InferChannel`).
         """
         texts = self._apply_prefix(texts, task)
         channel = self._channels[role]

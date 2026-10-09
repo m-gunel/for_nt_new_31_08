@@ -10,8 +10,6 @@ from tests.mbox_fixture import (
     make_plain_email,
 )
 
-# ------------------------------------------------------ extract_unique_body -
-
 
 def test_signature_is_cut():
     body = "Задачу закрыл.\n\nС уважением,\nИванов Иван"
@@ -24,7 +22,7 @@ def test_signature_kept_when_disabled():
 
 
 def test_regards_mid_sentence_not_cut():
-    """Регресс: раньше любое совпадение паттерна в начале строки резало тело."""
+    """«с уважением» посреди предложения — не подпись."""
     body = "Мы относимся с уважением к срокам.\nПродолжение письма."
     assert extract_unique_body(body) == body
 
@@ -63,7 +61,17 @@ def test_dashes_separator_cuts_but_arrow_does_not():
     assert extract_unique_body(body) == body
 
 
-# ----------------------------------------------------------- process_message -
+def test_line_start_regards_cuts_even_mid_letter():
+    """Подпись ищется по началу строки, а не по месту в письме.
+
+    Абзац «С уважением к …» посреди текста тоже обрывает письмо — так и
+    описано в extract_unique_body.
+    """
+    body = (
+        "Коллеги, добрый день.\nС уважением к вашему решению, предлагаю ещё\nвариант."
+    )
+    assert extract_unique_body(body) == "Коллеги, добрый день."
+    assert extract_unique_body(body, skip_signature=False) == body
 
 
 def _roundtrip(msg):
@@ -71,7 +79,7 @@ def _roundtrip(msg):
 
 
 def test_alternative_yields_single_body():
-    """Регресс P2: plain и html версии одного текста — один Body, не два."""
+    """plain и html версии одного текста — один Body, не два."""
     msg = _roundtrip(
         make_alternative_email("Встреча", "Перенос встречи на четверг.", msg_id="alt@t")
     )

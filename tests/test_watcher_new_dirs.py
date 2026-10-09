@@ -1,24 +1,12 @@
 """Появление и перемещение каталогов внутри наблюдаемого дерева.
 
-Перенос каталога — это ОДИН rename: ядро шлёт единственный `IN_MOVED_TO` по
-самому каталогу, событий по вложенным файлам не приходит вовсе. До доработки
-на этом терялось сразу три вещи:
+Перенос каталога — один rename: ядро шлёт единственный `IN_MOVED_TO` по
+самому каталогу, событий по вложенным файлам нет. Поэтому появившийся каталог
+надо подписать (DirCreatedEvent), обойти и поставить на него watch вручную, а
+переименование — обработать как снятие старого пути и обход нового.
 
-* `DirCreatedEvent` не был подписан в `event_filter`, поэтому факт «в дереве
-  возник каталог» до адаптера не доходил в принципе;
-* даже дойдя, событие никем не обрабатывалось — содержимое перенесённого
-  каталога оставалось непроиндексированным до перезапуска демона;
-* у `IN_MOVED_TO` нет бита `IN_CREATE`, поэтому watchdog не ставит watch на
-  ПЕРЕМЕЩЁННЫЙ каталог (на созданный обычным `mkdir` — ставит), и файлы,
-  появившиеся в нём уже после переноса, тоже не замечались;
-* переименование каталога при `max_depth != None` приходило одним
-  `DirMovedEvent` — старый путь сносился `delete_prefix`, а под новым именем
-  поддерево никто не возвращал, то есть переименование папки просто удаляло
-  её из поиска.
-
-Живой inotify здесь не нужен и на macOS невоспроизводим (там FSEvents с
-другой склейкой событий), поэтому обработчики зовутся напрямую — так же, как
-в tests/test_indexing_live.py.
+Живой inotify на macOS невоспроизводим (FSEvents склеивает события иначе),
+поэтому обработчики зовутся напрямую, как в tests/test_indexing_live.py.
 """
 
 import errno
@@ -58,10 +46,9 @@ class _RecordingWatcher(AbstractFilesWatcher):
         self.deleted.append(file.path)
 
     async def on_delete_dir(self, path: str) -> None:
-        # Как боевой Watcher.on_delete_dir: delete_prefix сносит ВСЁ поддерево,
-        # и со слэшем на конце — иначе снятие /a/b задело бы и /a/bc. Без этого
-        # перестановка обработчиков в run() не имела бы никаких последствий,
-        # кроме журнала вызовов.
+        # Как боевой Watcher.on_delete_dir: delete_prefix сносит всё поддерево,
+        # со слэшем на конце, чтобы снятие /a/b не задело /a/bc. Без этого
+        # порядок обработчиков в run() ни на что не влиял бы.
         self.deleted_dirs.append(path)
         prefix = path.rstrip(os.sep) + os.sep
         self.upserted = [p for p in self.upserted if not p.startswith(prefix)]
@@ -114,9 +101,8 @@ def _adapter(monkeypatch, *paths, **kwargs) -> tuple[WatchDogAdapter, _KwargsObs
     """WatchDogAdapter с подменённым Observer: настоящий inotify не поднимаем.
 
     Подменяется символ в модуле, а не поле после конструктора: иначе
-    `Observer()` всё-таки создаётся (на Linux это InotifyObserver — поток,
-    который никто не стартует и не останавливает). Тот же приём в
-    tests/test_watcher_max_depth.py и tests/test_watcher_resilience.py.
+    `Observer()` всё-таки создаётся (на Linux — поток InotifyObserver, который
+    никто не останавливает).
     """
     import src.indexer.watcher.watchdog_adapter as mod
 
@@ -129,11 +115,9 @@ def _adapter(monkeypatch, *paths, **kwargs) -> tuple[WatchDogAdapter, _KwargsObs
 def pinned_scan_cfg(config, monkeypatch):
     """Закрепить правила обхода, которые _collect_dir_files читает из конфига.
 
-    Конфиг в тестах один на всю сессию, а `serve_indexer`
-    (src/indexer/utils.py) присваивает `file_scan_cfg.filter_files` и
-    `filter_meta` НАВСЕГДА, без monkeypatch, — и поднимается он в других
-    файлах тестов, которые по алфавиту идут раньше этого. Без явной фиксации
-    проверки на точное равенство списков зависели бы от порядка прогона.
+    Конфиг один на сессию, а `serve_indexer` (src/indexer/utils.py) в тестах,
+    идущих раньше, присваивает `filter_files` и `filter_meta` без monkeypatch:
+    без фиксации сравнение списков зависело бы от порядка прогона.
     """
     monkeypatch.setattr(config.file_scan_cfg, "filter_files", None)
     monkeypatch.setattr(config.file_scan_cfg, "filter_meta", None)
@@ -152,21 +136,16 @@ def _make_dir_with_files(root) -> tuple[str, list[str]]:
     return str(root), sorted([str(top), str(deep)])
 
 
-# ---------------------------------------------------- дефект 1: подписка ----
-
-
 def test_dir_created_event_is_subscribed():
-    """Без DirCreatedEvent появление каталога не доходило до адаптера вообще.
+    """DirCreatedEvent подписан.
 
-    Раньше список типов событий писался прямо в вызове observer.schedule и
-    содержал только файловые события плюс DirDeleted/DirMoved. Каталог,
-    перенесённый снаружи внутрь наблюдаемого дерева, не порождал ни одного
-    события, которое прошло бы фильтр, — индексировать было нечего.
+    Иначе каталог, перенесённый внутрь дерева, не порождает ни одного события,
+    прошедшего фильтр.
     """
     assert DirCreatedEvent in WatchDogAdapter.EVENT_FILTER, (
         "появление каталога не подписано — событие не дойдёт до адаптера"
     )
-    # Заодно: из прежнего списка ничего не потеряно.
+    # Остальные типы событий на месте.
     for event_type in (
         FileModifiedEvent,
         FileMovedEvent,
@@ -179,12 +158,10 @@ def test_dir_created_event_is_subscribed():
 
 
 def test_event_filter_with_dir_created_reaches_schedule(tmp_path, monkeypatch):
-    """Список типов должен реально уходить в observer.schedule, а не лежать рядом.
+    """Список типов уходит в observer.schedule — и на старте, и в watch_dir.
 
-    Атрибут класса появился как раз затем, чтобы фильтр не разошёлся между
-    стартовой постановкой наблюдения и watch_dir: подписка на DirCreatedEvent,
-    забытая в одном из двух мест, снова оставила бы перенесённые каталоги
-    незамеченными — но уже избирательно, что заметить ещё труднее.
+    Фильтр, разошедшийся между этими местами, оставил бы перенесённые каталоги
+    незамеченными избирательно.
     """
     root = tmp_path / "docs"
     (root / "sub").mkdir(parents=True)
@@ -192,7 +169,7 @@ def test_event_filter_with_dir_created_reaches_schedule(tmp_path, monkeypatch):
     adapter, observer = _adapter(monkeypatch, root, max_depth=1)
     adapter._start_observer()
 
-    # ...и то же самое для каталога, появившегося уже после старта.
+    # И для каталога, появившегося после старта.
     late = tmp_path / "docs" / "late"
     late.mkdir()
     assert adapter.watch_dir(str(late)) is True
@@ -206,18 +183,12 @@ def test_event_filter_with_dir_created_reaches_schedule(tmp_path, monkeypatch):
         )
 
 
-# ------------------------------- дефект 2: содержимое нового каталога -------
-
-
 @pytest.mark.asyncio
 async def test_moved_in_dir_is_indexed_without_file_events(tmp_path, pinned_scan_cfg):
     """Появившийся каталог обходится сам — событий по его файлам не будет.
 
-    Раньше обработчика _handle_new_dirs не существовало: единственный
-    IN_MOVED_TO по каталогу ничего не индексировал, и перенесённая снаружи
-    папка со всем содержимым отсутствовала в поиске до перезапуска демона.
     Несуществующий путь в той же пачке — забота _handle_missing_dirs, здесь он
-    должен быть просто пропущен.
+    пропускается.
     """
     moved, expected = _make_dir_with_files(tmp_path / "moved_in")
     ghost = str(tmp_path / "gone_forever")
@@ -236,24 +207,19 @@ async def test_moved_in_dir_is_indexed_without_file_events(tmp_path, pinned_scan
 async def test_new_dir_scan_uses_same_filters_as_full_pass(
     tmp_path, config, monkeypatch
 ):
-    """Обход появившегося каталога обязан идти ПО КОНФИГУ, как полный проход.
+    """Обход появившегося каталога идёт по конфигу, как полный проход.
 
-    Стережём именно проброс правил в iter_file_metadata, а не её собственные
-    умолчания (исключения по имени и отсутствие парсера покрыты в
-    tests/test_scan_dir_coverage.py и остались бы зелёными даже при голом
-    `iter_file_metadata(path)`):
+    Проверяется проброс правил в iter_file_metadata, а не её умолчания (они —
+    в tests/test_scan_dir_coverage.py):
 
-    * `filter_files` — им serve_indexer отбирает файлы по расширению;
-    * `filter_meta` — им же применяется `max_size`, иначе перенос каталога с
-      образом диска внутри отправил бы его прямо в парсер;
-    * `follow_symlinks` — в конфиге True, а в самой iter_file_metadata по
-      умолчанию False: потеряв его, перенесённый каталог тихо перестал бы
-      ходить по ссылкам, в отличие от полного прохода.
+    * `filter_files` — отбор по расширению из serve_indexer;
+    * `filter_meta` — `max_size`, иначе образ диска ушёл бы прямо в парсер;
+    * `follow_symlinks` — в конфиге True, а в iter_file_metadata по умолчанию
+      False.
     """
     root = tmp_path / "project"
     root.mkdir()
-    # Цель ссылки лежит ВНЕ обходимого каталога намеренно: внутри файл нашёлся
-    # бы и по настоящему пути, и follow_symlinks ничего не решал бы.
+    # Цель ссылки вне каталога: внутри файл нашёлся бы и по настоящему пути.
     outside = tmp_path / "снаружи"
     outside.mkdir()
     (outside / "по-ссылке.txt").write_text("за ссылкой", encoding="utf-8")
@@ -293,18 +259,13 @@ async def test_new_dir_scan_uses_same_filters_as_full_pass(
     )
 
 
-# ---------------------------- дефект 3: наблюдение за перенесённой папкой ---
-
-
 @pytest.mark.asyncio
 async def test_moved_in_dir_gets_watch(tmp_path, pinned_scan_cfg):
-    """На появившийся каталог ставится наблюдение вручную.
+    """На появившийся каталог наблюдение ставится вручную.
 
-    У IN_MOVED_TO нет бита IN_CREATE, поэтому watchdog добавляет watch на
-    каталог, созданный mkdir, но НЕ на перемещённый внутрь. Расхождение
-    незаметное: файлы, положенные в такую папку уже после переноса, не
-    индексировались до перезапуска демона. На несуществующий путь наблюдение
-    ставить не за что.
+    У IN_MOVED_TO нет бита IN_CREATE: watchdog ставит watch на каталог из
+    mkdir, но не на перемещённый внутрь, и файлы, положенные туда после
+    переноса, не замечались бы.
     """
     moved, expected = _make_dir_with_files(tmp_path / "moved_in")
     ghost = str(tmp_path / "gone_forever")
@@ -322,10 +283,9 @@ async def test_moved_in_dir_gets_watch(tmp_path, pinned_scan_cfg):
 def test_watch_dir_is_idempotent(tmp_path, monkeypatch):
     """Повторный watch_dir по тому же пути не плодит второе наблюдение.
 
-    watch_dir зовётся на КАЖДЫЙ появившийся каталог в каждой пачке событий, и
-    без учёта уже поставленных путей один и тот же каталог получал бы по
-    эмиттеру на событие — то есть дубли событий и лишний расход
-    fs.inotify.max_user_watches.
+    watch_dir зовётся на каждый появившийся каталог в каждой пачке, и без учёта
+    поставленных путей каталог получал бы по эмиттеру на событие — дубли
+    событий и лишний расход fs.inotify.max_user_watches.
     """
     root = tmp_path / "docs"
     root.mkdir()
@@ -343,9 +303,8 @@ def test_watch_dir_returns_false_on_oserror(tmp_path, monkeypatch):
     """Отказ inotify — это False, а не исключение наружу.
 
     Упор в fs.inotify.max_user_watches (ENOSPC) и каталог без прав (EACCES)
-    штатны на домашнем дереве. Пробросив OSError, watch_dir оборвал бы обход
-    всей пачки появившихся каталогов — из-за одной недоступной папки не
-    проиндексировались бы все остальные.
+    штатны на домашнем дереве; исключение оборвало бы обход всей пачки
+    появившихся каталогов.
     """
     root = tmp_path / "docs"
     root.mkdir()
@@ -357,9 +316,8 @@ def test_watch_dir_returns_false_on_oserror(tmp_path, monkeypatch):
     observer.fail = OSError(errno.EACCES, "Permission denied")
     assert adapter.watch_dir(str(root / "secret")) is False
 
-    # Отказавший путь не помечен наблюдаемым, поэтому повтор после того, как
-    # лимит освободился, ещё может удаться. Само состояние `_watched` проверено
-    # в tests/test_watcher_resilience.py, здесь важен результат повтора.
+    # Отказавший путь не помечен наблюдаемым: повтор после освобождения лимита
+    # ещё может удаться.
     observer.fail = None
     assert adapter.watch_dir(str(root)) is True, (
         "после снятия отказа наблюдение обязано встать: иначе путь потерян "
@@ -370,12 +328,7 @@ def test_watch_dir_returns_false_on_oserror(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_watch_failure_does_not_stop_indexing(tmp_path, pinned_scan_cfg):
-    """Сорванное наблюдение не должно отменять индексацию каталога.
-
-    Наблюдение и обход — разные задачи: даже если watch поставить не удалось,
-    содержимое появившегося каталога обязано попасть в индекс. Раньше на этом
-    месте не было ни того, ни другого.
-    """
+    """Сорванное наблюдение не отменяет индексацию каталога: это разные задачи."""
     moved, expected = _make_dir_with_files(tmp_path / "moved_in")
 
     watcher = _RecordingWatcher()
@@ -386,9 +339,6 @@ async def test_watch_failure_does_not_stop_indexing(tmp_path, pinned_scan_cfg):
     await watcher._handle_new_dirs({moved})
 
     assert sorted(watcher.upserted) == expected
-
-
-# ------------------------------------ дефект 4: переименование каталога -----
 
 
 def _emitted(event) -> list[tuple[Change, str, bool]]:
@@ -402,14 +352,10 @@ def _emitted(event) -> list[tuple[Change, str, bool]]:
 
 
 def test_dir_rename_arrives_as_two_directory_events(tmp_path):
-    """Переименование каталога — это deleted по старому пути и added по новому.
+    """Переименование каталога — deleted по старому пути и added по новому.
 
-    На этом стоит вся пара _handle_missing_dirs/_handle_new_dirs: оба пути
-    приходят ОДНОЙ пачкой и оба с is_directory=True. Потеряв признак каталога,
-    они ушли бы в файловую ветку (_handle_files), где нет ни снятия
-    поддерева, ни обхода нового пути. Для файлов это покрыто
-    tests/test_watcher_resilience.py, для каталогов — не было, а теряли
-    поддерево именно они.
+    Оба приходят одной пачкой с is_directory=True: без признака каталога они
+    ушли бы в _handle_files, где нет ни снятия поддерева, ни обхода нового пути.
     """
     old = tmp_path / "отчёты"
     new = tmp_path / "отчёты-2024"
@@ -422,12 +368,11 @@ def test_dir_rename_arrives_as_two_directory_events(tmp_path):
 
 @pytest.mark.asyncio
 async def test_renamed_dir_returns_under_new_path(tmp_path, pinned_scan_cfg):
-    """Переименование каталога — снятие старого пути И обход нового.
+    """Переименование каталога — снятие старого пути и обход нового.
 
     При max_depth != None наблюдение нерекурсивное, и watchdog отдаёт один
-    DirMovedEvent без под-событий. Старый путь уходил в on_delete_dir и
-    delete_prefix сносил всё поддерево, а вернуть его под новым именем было
-    некому: папка просто исчезала из поиска до следующего полного прохода.
+    DirMovedEvent без под-событий: delete_prefix снимает поддерево, и вернуть
+    его под новым именем больше некому.
     """
     old = str(tmp_path / "old_name")  # переименован — на диске его уже нет
     new, expected = _make_dir_with_files(tmp_path / "new_name")
@@ -450,12 +395,11 @@ async def test_run_handles_new_dirs_right_after_missing(
     pinned_scan_cfg,
     monkeypatch,
 ):
-    """run() обязан звать _handle_new_dirs, иначе обработчик мёртв.
+    """run() зовёт _handle_new_dirs, и строго после _handle_missing_dirs.
 
-    Порядок важен: сначала снимаем исчезнувшие пути, потом обходим
-    появившиеся. При обратном порядке переименование каталога внутри дерева
-    (старый и новый путь приходят одной пачкой) закончилось бы тем, что
-    delete_prefix снёс бы только что проиндексированное поддерево.
+    При обратном порядке переименование каталога внутри дерева (старый и новый
+    путь в одной пачке) кончилось бы тем, что delete_prefix снёс бы только что
+    проиндексированное поддерево.
     """
     from src.indexer.watcher import base_watcher
 
@@ -510,3 +454,60 @@ async def test_run_handles_new_dirs_right_after_missing(
     assert _OneBatchAdapter.last.watched == [os.path.abspath(appeared)], (
         "run() не отдал адаптер обработчику — наблюдение поставить нечем"
     )
+
+
+@pytest.mark.asyncio
+async def test_run_keeps_events_under_root_named_like_excluded_dir(
+    watcher_config,  # noqa: F811
+    monkeypatch,
+):
+    """Корень с «мусорным» именем (~/Build) не глушит события под собой.
+
+    Полный проход сверяет исключения только ниже корня и такой корень
+    индексирует; watcher обязан так же, иначе изменения и удаления под ним
+    доходили бы до поиска только с часовым полным проходом.
+    """
+    from src.indexer.watcher import base_watcher
+
+    cfg, live = watcher_config
+    root = live.parent / "Build"
+    root.mkdir()
+    monkeypatch.setattr(cfg.file_scan_cfg, "paths", [str(root)])
+    report = root / "report.txt"
+    report.write_text("отчёт", encoding="utf-8")
+    junk = root / "venv" / "lib.txt"
+    junk.parent.mkdir()
+    junk.write_text("пакет", encoding="utf-8")
+    gone = root / "old.txt"  # удалён: на диске его уже нет
+
+    class _OneBatchAdapter:
+        """Адаптер, отдающий одну пачку событий по файлам под корнем."""
+
+        def __init__(self, *paths, **kwargs):
+            pass
+
+        async def start_async(self):
+            return self
+
+        def close(self):
+            return None
+
+        def watch_dir(self, path):
+            return True
+
+        async def __aiter__(self):
+            yield [
+                WatchEvent(Change.added, str(report), False),
+                WatchEvent(Change.deleted, str(gone), False),
+                WatchEvent(Change.added, str(junk), False),
+            ]
+
+    monkeypatch.setattr(base_watcher, "WatchDogAdapter", _OneBatchAdapter)
+
+    watcher = _RecordingWatcher()
+    await watcher.run()
+
+    assert watcher.upserted == [str(report)], (
+        "событие под корнем Build потеряно — или прошёл мусор ниже корня"
+    )
+    assert watcher.deleted == [str(gone)], "удаление под корнем Build потеряно"

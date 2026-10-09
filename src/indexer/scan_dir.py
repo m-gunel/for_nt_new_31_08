@@ -12,11 +12,11 @@ from .exclude import exclude_pattern
 
 lg = get_logger("app.scanner")
 
-# Типы файловых систем, которые считаем сетевыми. Индексировать сетевые
-# ресурсы не нужно (решение по объёму работ), и это же снимает риск, что обход
-# повиснет на таймауте недоступного сервера: домашний каталог с примонтированной
-# сетевой шарой иначе останавливал бы весь проход. autofs здесь тоже: спуск в
-# него ТРИГГЕРИТ монтирование, то есть обход сам создаёт себе сетевой ввод-вывод.
+# Сетевые шары внутри обходимого дерева не индексируем (вне объёма работ):
+# иначе обход домашнего каталога с примонтированной шарой мог бы повиснуть на
+# таймауте недоступного сервера. autofs тоже: спуск в него сам запускает
+# монтирование. Корень и дом пользователя на сетевой ФС — исключение, см.
+# _excluded_network_mounts.
 NETWORK_FS_TYPES = frozenset(
     {
         "nfs",
@@ -43,8 +43,7 @@ _PROGRESS_EVERY_FILES = 1000
 def network_mount_points() -> tuple[str, ...]:
     """Точки монтирования сетевых ФС по данным /proc/mounts.
 
-    Вне Linux файла нет — тогда ограничение просто не действует и обход
-    ведёт себя как раньше.
+    Вне Linux файла нет, и ограничение не действует.
     """
     try:
         with open("/proc/mounts", encoding="utf-8", errors="replace") as fh:
@@ -69,6 +68,69 @@ def _is_under(path: str, roots: tuple[str, ...]) -> bool:
         if path == root or path.startswith(root.rstrip(os.sep) + os.sep):
             return True
     return False
+
+
+def _user_homes() -> tuple[str, ...]:
+    """Домашние каталоги пользователя демона: $HOME, pw_dir и пара SberOS.
+
+    У доменного пользователя SberOS два дома: pw_dir `/home/ДОМЕН@ЛОГИН` и
+    `/home/work/ЛОГИН@ДОМЕН` (HOME терминала) — то же правило, что у
+    `_sberos_pair` в scripts/register_mcp.py.
+    """
+    homes = [os.path.expanduser("~")]
+    try:
+        import pwd
+
+        record = pwd.getpwuid(os.getuid())
+    except (ImportError, KeyError):
+        return tuple(homes)
+    homes.append(record.pw_dir)
+    name = record.pw_name
+    if name and "/" not in name and name not in (".", ".."):
+        homes.append(os.path.join("/home/work", name))
+        if name.count("@") == 1:
+            login, domain = name.split("@")
+            if login and domain:
+                homes.append(os.path.join("/home", f"{domain}@{login}"))
+    return tuple(homes)
+
+
+def _excluded_network_mounts(root: Path) -> tuple[str, ...]:
+    """Сетевые точки монтирования, в которые обход не спускается.
+
+    Точка, на которой лежит сам корень или дом пользователя (сетевой /home под
+    autofs, дом на NFS), не исключается: под ней всё дерево, и обход отбросил
+    бы каждый подкаталог. Шара, примонтированная внутри дерева, исключается.
+    Сверяются и настоящие пути: корень или дом бывает ссылкой на сетевой
+    каталог (/home/u -> /net/srv/home/u).
+    """
+    points = network_mount_points()
+    if not points:
+        return ()
+    keep = (os.path.abspath(root), *_user_homes())
+    keep += tuple(os.path.realpath(path) for path in keep)
+    return tuple(
+        point for point in points if not any(_is_under(path, (point,)) for path in keep)
+    )
+
+
+def _link_leads_under(path: str, roots: tuple[str, ...]) -> bool:
+    """Ведёт ли символьная ссылка под одну из точек монтирования `roots`.
+
+    Абсолютная цель сверяется строкой, без обращения к ней: stat цели на
+    недоступной шаре повис бы. realpath нужен для относительных целей и
+    цепочек ссылок; к цели он обращается не больше, чем последующий stat.
+    """
+    try:
+        target = os.readlink(path)
+    except OSError:
+        return False
+    if os.path.isabs(target) and _is_under(os.path.normpath(target), roots):
+        return True
+    try:
+        return _is_under(os.path.realpath(path), roots)
+    except OSError:
+        return False
 
 
 def iter_file_metadata(
@@ -105,8 +167,8 @@ def iter_file_metadata(
         return
 
     # Счётчики, а не строка в лог на каждый пропуск: подкаталог без прав —
-    # штатное явление, и предупреждение на каждый превратило бы лог в шум
-    # (см. tests/test_scan_paths_diagnostics.py). Итог печатается один раз.
+    # штатное явление, и предупреждение на каждый превратило бы лог в шум.
+    # Итог печатается один раз.
     found = 0
     dirs = 0
     denied = 0
@@ -114,11 +176,10 @@ def iter_file_metadata(
     on_network = 0
     revisited = 0
 
-    network_roots = network_mount_points()
+    network_roots = _excluded_network_mounts(root_path)
     # Каталоги, уже побывавшие в обходе, по (устройство, inode).
     visited_dirs: set[tuple[int, int]] = set()
 
-    # Use a stack to avoid recursion overhead; scandir is efficient per entry
     stack = [root_path]
     # Каталоги, найденные ЧЕРЕЗ символьную ссылку, откладываются до конца
     # обхода настоящих. Иначе выигрывает тот, кто попался первым, и в индекс
@@ -150,15 +211,23 @@ def iter_file_metadata(
             try:
                 with os.scandir(current) as it:
                     for entry in it:
-                        # Push subdirectories for traversal
                         try:
+                            if (
+                                follow_symlinks
+                                and network_roots
+                                and entry.is_symlink()
+                                and _link_leads_under(entry.path, network_roots)
+                            ):
+                                # До stat цели: на недоступной шаре он повис
+                                # бы, а дальше обход ушёл бы на шару целиком.
+                                on_network += 1
+                                continue
                             is_dir = entry.is_dir(follow_symlinks=follow_symlinks)
                         except OSError:
-                            # Permission or race condition; skip
+                            # нет прав или запись уже исчезла
                             denied += 1
                             continue
                         if is_dir:
-                            # исключаем мусор
                             if exclude_patt is not None and exclude_patt.match(
                                 Path(entry.path).name
                             ):
@@ -187,15 +256,13 @@ def iter_file_metadata(
                         ):
                             excluded += 1
                             continue
-                        # Build absolute path once; DirEntry.path is already absolute if given absolute root
                         abs_path = os.path.abspath(entry.path)
 
-                        # Apply custom filter if specified (before expensive stat call)
+                        # Сначала дешёвые фильтры, потом stat (системный вызов).
                         if filter_func and not filter_func(abs_path):
                             continue
                         if check_parsers and not check_has_parser(Path(abs_path)):
                             continue
-                        # Single stat call per entry; efficient with scandir
                         try:
                             st = entry.stat(follow_symlinks=follow_symlinks)
                         except OSError:
@@ -222,7 +289,6 @@ def iter_file_metadata(
                             )
                         yield meta
             except OSError:
-                # Skip directories that can't be opened
                 denied += 1
                 continue
             except Exception:

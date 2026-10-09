@@ -1,16 +1,17 @@
 import os
 
-# DEV=1 должен быть выставлен ДО импорта src.config: пути хранилища
-# вычисляются на уровне модуля. Без этого прогон тестов пишет индексы
-# в реальный ~/.files-search пользователя.
+# DEV=1 — до импорта src.config: пути хранилища вычисляются при импорте,
+# иначе тесты пишут индексы в реальный ~/.files-search.
 os.environ.setdefault("DEV", "1")
-# Страховка: тесты никогда не должны сносить хранилище.
-os.environ["RESET"] = "0"
-# Здесь, а не только в [tool.pytest_env]: плагина pytest-env в зависимостях
-# нет. Без CONFIG_PATH из цепочки настроек выпадает init_settings, kwargs
-# конструктора Config игнорируются, и тесты читают реальный ~/.ragsearch.
+os.environ["RESET"] = "0"  # тесты никогда не сносят хранилище
+# Дублирует [tool.pytest_env]: плагина pytest-env в зависимостях нет. Без
+# CONFIG_PATH kwargs конструктора Config игнорируются и тесты читают общий
+# user_conf.yml.
 os.environ.setdefault("CONFIG_PATH", "cfg/dev.yml")
 os.environ.setdefault("TESTING", "Y")
+# TestClient шлёт Host: testserver, а API принимает только loopback
+# (src/server/loopback_guard.py). Тесты самой проверки переменную снимают.
+os.environ.setdefault("RAG_ALLOWED_HOSTS", "testserver")
 
 from pytest import fixture
 

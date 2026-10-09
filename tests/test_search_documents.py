@@ -1,14 +1,15 @@
 """Выдача поиска — документы, а не чанки.
 
-limit в /search — число ДОКУМЕНТОВ на источник. Индексатор берёт из таблицы
-пул чанков на канал (`search_pool`), SearchResponse собирает из него
-документы: порядок — по лучшей строке, до трёх фрагментов на документ,
-карточка документа — не фрагмент, а отметка "card" в `match`.
-
-Раньше limit резал чанки: 10 чанков давали в среднем 6,2 документа, потому
-что длинный документ занимал места соседей.
+limit в /search — число документов на источник, иначе длинный документ
+занимал бы места соседей. Индексатор берёт из таблицы пул чанков на канал
+(`search_pool`), SearchResponse собирает из него документы: порядок — по
+лучшей строке, до трёх фрагментов на документ, карточка документа — не
+фрагмент, а отметка "card" в `match`.
 """
 
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -55,9 +56,6 @@ def _frame(rows: list[tuple]) -> pl.DataFrame:
             "_score": [float(s) * 10 for _, s, _, _ in full],
         }
     )
-
-
-# --------------------------------------------------------- сборка выдачи ----
 
 
 def test_limit_counts_documents_even_if_pool_starts_with_one_document():
@@ -194,9 +192,6 @@ def test_each_source_gets_its_own_document_limit():
     assert scores == sorted(scores, reverse=True)
 
 
-# ------------------------------------------------------- запросы к LanceDB ----
-
-
 def test_pool_follows_limit_with_floor_and_ceiling():
     assert search_pool(1) == SEARCH_POOL_MIN == 50
     assert search_pool(10) == 50  # лучший пул по замеру на стенде
@@ -315,9 +310,6 @@ async def test_email_source_gets_its_own_pool():
         assert ("limit", (search_pool(20),)) in builder.calls
 
 
-# ------------------------------------------------- живой индекс (LanceDB) ----
-
-
 def _rows_table(rows: list[tuple[str, str, str]], embed) -> pa.Table:
     """(путь, kind, текст) → строки таблицы файлов с векторами модели."""
     vecs = np.asarray(embed([t for _, _, t in rows]), dtype=np.float32)
@@ -388,7 +380,7 @@ async def test_live_card_near_by_vector_is_not_a_match(index: Index, query_type)
     """Отметка card — только когда запрос совпал с карточкой словами.
 
     В векторный пул карточки попадают и просто ближайшими соседями, а в
-    маленьком индексе — все до одной: раньше каждый документ выдачи нёс
+    маленьком индексе — все до одной: иначе каждый документ выдачи нёс бы
     «совпало по имени», даже на запрос, ни с одним именем не связанный.
     """
     rows = []
@@ -421,9 +413,8 @@ async def test_live_card_near_by_vector_is_not_a_match(index: Index, query_type)
 async def test_live_quoted_phrase_does_not_break_fts(index: Index, query_type):  # noqa: F811
     """Запрос целиком в кавычках — не синтаксис фразы.
 
-    Строку LanceDB разбирал как фразу, а FTS-индекс без позиций: поиск падал,
-    гибрид молча уходил в чистый вектор (в его кадре нет _score), text
-    отдавал 500.
+    LanceDB разбирает такую строку как фразу, а FTS-индекс без позиций: поиск
+    падал бы, гибрид молча уходил бы в чистый вектор, text отдавал бы 500.
     """
     rows = [
         (
@@ -443,3 +434,26 @@ async def test_live_quoted_phrase_does_not_break_fts(index: Index, query_type): 
     assert frame.filter(pl.col("_score").is_not_null())["path"].to_list() == [
         "/docs/риск.txt"
     ], "FTS нашёл фразу словами"
+
+
+@pytest.mark.asyncio
+async def test_search_does_not_wait_for_busy_default_pool():
+    """Запрос к LanceDB не стоит в очереди дефолтного пула asyncio.
+
+    В дефолтный пул (asyncio.to_thread) идут и долгие задачи: сверка путей с
+    диском, постановка наблюдения, /read_file с конвертацией до 120 с. Если
+    они займут все воркеры, поиск ждал бы дольше таймаута агента.
+    """
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(2))
+    release = threading.Event()
+    busy = [loop.run_in_executor(None, release.wait, 30) for _ in range(2)]
+    try:
+        table = _Table(_frame([("/docs/a.txt", 0.9)]))
+        frames = await asyncio.wait_for(
+            Index.search(_index(table), "договор", top_k=3), 5
+        )
+        assert len(frames) == 1 and len(table.searches) == 1
+    finally:
+        release.set()
+        await asyncio.gather(*busy)

@@ -1,9 +1,8 @@
 """Почта не должна быть способна уронить индексацию файлов.
 
-Регрессии на баг с прода: при включённой почте и отсутствующей локально
-папке (например, «Входящие» не синхронизированы) индексация не стартовала
-вообще — FileNotFoundError из обхода mbox убивал задачу scan_all до того,
-как она доходила до уже собранных в очередь файлов.
+Папка, которой нет локально (например, «Входящие» не синхронизированы), не
+должна обрывать scan_all FileNotFoundError'ом до обработки уже собранных в
+очередь файлов.
 
 Все почтовые данные — синтетические mbox из tests/mbox_fixture.py, реальный
 Thunderbird не нужен.
@@ -31,8 +30,8 @@ def mail_root(tmp_path):
 def email_config(config: Config, mail_root, tmp_path, monkeypatch):
     """Конфиг с включённой почтой, явным корнем и «висячей» папкой в offsets.
 
-    Ровно сценарий бага: offsets ссылается и на существующий INBOX, и на
-    папку, файла которой на диске нет.
+    offsets ссылается и на существующий INBOX, и на папку, файла которой на
+    диске нет.
     """
     monkeypatch.setattr(config, "lsm_root", str(tmp_path / "storage"))
     monkeypatch.setattr(config, "lsm_path", str(tmp_path / "storage" / "lsm.ldb"))
@@ -77,15 +76,8 @@ async def index(email_config: Config):
             await idx.stop_emails_polling()
 
 
-# --------------------------------------------------------------- find root --
-
-
 def test_find_email_root_without_sent_folder(tmp_path):
-    """Корень находится по INBOX, даже когда «Отправленных» нет локально.
-
-    Старый поиск был привязан к mUTF-7-имени папки «Отправленные»: без её
-    локальной копии почта молча не индексировалась.
-    """
+    """Корень находится по INBOX, даже когда «Отправленных» нет локально."""
     expected = make_profile(
         tmp_path / ".thunderbird" / "abc.default",
         {"INBOX": default_inbox_messages()},
@@ -108,13 +100,104 @@ def test_find_email_root_prefers_corporate_host(tmp_path):
     assert find_email_root(tmp_path) == corp
 
 
+_PROFILES_INI = """\
+[Install4F96D1932A9F858E]
+Default={active}
+Locked=1
+
+[Profile1]
+Name=default
+IsRelative=1
+Path={legacy}
+Default=1
+
+[Profile0]
+Name=default-release
+IsRelative=1
+Path={active}
+
+[General]
+StartWithLastProfile=1
+Version=2
+"""
+
+
+def _two_profiles(tmp_path, **hosts):
+    """Два профиля с почтой: aaaa.default и zzzz.default-release."""
+    tb = tmp_path / ".thunderbird"
+    roots = {
+        name: make_profile(
+            tb / name,
+            {"INBOX": default_inbox_messages()},
+            imap_host=hosts.get(name.split(".")[0], "imap.sberbank.ru"),
+        )
+        for name in ("aaaa.default", "zzzz.default-release")
+    }
+    return tb, roots
+
+
+@pytest.mark.parametrize("active", ["aaaa.default", "zzzz.default-release"])
+def test_find_email_root_prefers_installed_profile(tmp_path, active):
+    """Профиль, который открывает Thunderbird, выигрывает у прежнего с тем же
+    хостом, в каком бы порядке файловая система ни отдавала каталоги."""
+    tb, roots = _two_profiles(tmp_path)
+    legacy = next(name for name in roots if name != active)
+    (tb / "profiles.ini").write_text(_PROFILES_INI.format(active=active, legacy=legacy))
+    assert find_email_root(tmp_path) == roots[active]
+
+
+def test_find_email_root_reads_installs_ini(tmp_path):
+    tb, roots = _two_profiles(tmp_path)
+    (tb / "installs.ini").write_text(
+        "[4F96D1932A9F858E]\nDefault=zzzz.default-release\nLocked=1\n"
+    )
+    assert find_email_root(tmp_path) == roots["zzzz.default-release"]
+
+
+def test_find_email_root_uses_default_flag(tmp_path):
+    """Без секций [Install…] — профиль с Default=1."""
+    tb, roots = _two_profiles(tmp_path)
+    (tb / "profiles.ini").write_text(
+        "[Profile0]\nName=new\nIsRelative=1\nPath=zzzz.default-release\nDefault=1\n"
+        "\n[Profile1]\nName=old\nIsRelative=1\nPath=aaaa.default\n"
+    )
+    assert find_email_root(tmp_path) == roots["zzzz.default-release"]
+
+
+@pytest.mark.parametrize("ini", [None, "не ini вовсе"])
+def test_find_email_root_without_usable_ini_is_deterministic(tmp_path, ini):
+    """Нет profiles.ini или он битый — профиль по имени каталога."""
+    tb, roots = _two_profiles(tmp_path)
+    if ini is not None:
+        (tb / "profiles.ini").write_text(ini)
+    assert find_email_root(tmp_path) == roots["aaaa.default"]
+
+
+def test_corporate_host_outranks_installed_profile(tmp_path):
+    """Корпоративный хост по-прежнему главнее выбора профиля."""
+    tb, roots = _two_profiles(tmp_path, zzzz="imap.other.ru")
+    (tb / "profiles.ini").write_text(
+        _PROFILES_INI.format(active="zzzz.default-release", legacy="aaaa.default")
+    )
+    assert find_email_root(tmp_path) == roots["aaaa.default"]
+
+
+def test_profile_choice_is_logged_once(tmp_path, monkeypatch, caplog):
+    import src.thunderbird.find_files as ff
+
+    monkeypatch.setattr(ff, "_reported_root", None)
+    _two_profiles(tmp_path)
+    with caplog.at_level("INFO", logger="app.email"):
+        first = find_email_root(tmp_path)
+        find_email_root(tmp_path)
+    lines = [r for r in caplog.records if "почта берётся из" in r.getMessage()]
+    assert len(lines) == 1 and str(first) in lines[0].getMessage()
+
+
 def test_list_email_folders_requires_pair(mail_root):
     # .msf без mbox рядом не считается папкой
     (mail_root / "Черновики.msf").write_bytes(b"")
     assert list_email_folders(mail_root) == ["INBOX"]
-
-
-# --------------------------------------------------------------- toc scan ---
 
 
 def test_toc_of_missing_file_is_empty():
@@ -128,9 +211,6 @@ def test_toc_offset_beyond_eof_is_empty(mail_root, caplog):
         toc = list(_generate_toc_lazy(str(mbox), start_offset=10**9))
     assert toc == []
     assert any("compacted" in r.message for r in caplog.records)
-
-
-# --------------------------------------------------------------- email_root -
 
 
 def test_email_root_prefers_explicit_path(email_config: Config, mail_root):
@@ -154,9 +234,6 @@ def test_email_root_missing_explicit_path(email_config: Config, monkeypatch):
     assert email_config.email_root is None
 
 
-# ---------------------------------------------------------------- scanner ---
-
-
 @pytest.mark.asyncio
 async def test_preindex_skips_missing_folder(email_config: Config, tmp_path):
     """Висячая папка в offsets пропускается, существующая обходится."""
@@ -173,17 +250,9 @@ async def test_preindex_skips_missing_folder(email_config: Config, tmp_path):
     assert all(m.path.startswith("email_INBOX:") for m in metas)
 
 
-# ------------------------------------------------------- главный регресс ---
-
-
 @pytest.mark.asyncio
 async def test_missing_mbox_does_not_break_file_indexing(index: Index):
-    """Висячая почтовая папка не срывает индексацию файлов.
-
-    FileNotFoundError из почтовой ветки убивал scan_all после сбора файлов в
-    очередь, но до их обработки — снаружи это выглядело как «индексация не
-    стартовала».
-    """
+    """Висячая почтовая папка не срывает индексацию файлов."""
     await index.scan_all()
 
     paths = {

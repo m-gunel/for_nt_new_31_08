@@ -7,13 +7,14 @@
 только когда меняется версия таблицы.
 """
 
+from pathlib import PurePath
 from types import SimpleNamespace
 
 import polars as pl
 import pyarrow as pa
 import pytest
 
-from src.common import CARD_KIND
+from src.common import CARD_KIND, norm_words
 from src.indexer.indexer import Index
 from src.indexer.name_codes import (
     MAX_FILES_PER_CODE,
@@ -27,8 +28,6 @@ from src.server.model import SearchRequest, SearchResponse
 from src.server.router import search as search_endpoint
 from tests.test_indexing_live import index, isolated_config  # noqa: F401
 from tests.test_search_documents import _frame, _rows_table
-
-# ------------------------------------------------------------ код в запросе ----
 
 
 @pytest.mark.parametrize(
@@ -86,7 +85,27 @@ def test_doc_name_prefers_original_name():
     assert doc_name("/docs/Отчёт 5348-У.docx", None) == "отчет 5348 у"
 
 
-# ----------------------------------------------------- словарь имён таблицы ----
+@pytest.mark.parametrize(
+    "subject, name",
+    [
+        ("Ф.0409 за 01.10.2026 по 5348-У", "ф 0409 за 01 10 2026 по 5348 у"),
+        ("Приказ 12/ЦБ_21 от 01.10.2026", "приказ 12 цб 21 от 01 10 2026"),
+    ],
+)
+def test_doc_name_keeps_email_subject_whole(subject, name):
+    """Тема письма — не путь: точки в датах и «/» её не режут."""
+    assert doc_name("email_INBOX:1:2:body", {"original_name": subject}) == name
+
+
+@pytest.mark.parametrize(
+    "file_name",
+    ["ЦБ_21.pdf", "Отчёт 5348-У.DOCX", "ф.0409 v1.2.xlsx", ".черновик.txt"],
+)
+def test_doc_name_of_a_file_is_its_stem(file_name):
+    """У имени файла срезается только расширение — ровно как PurePath.stem."""
+    assert doc_name(f"/docs/{file_name}", {"original_name": file_name}) == (
+        norm_words(PurePath(file_name).stem)
+    )
 
 
 class _CardTable:
@@ -152,6 +171,12 @@ def test_code_matches_whole_words_of_the_name():
     assert names.hits(table, query_codes("obs_286")) == []
 
 
+def test_code_after_date_in_email_subject_finds_the_letter():
+    path = "email_INBOX:1:2:body"
+    table = _CardTable({path: "Ф.0409 за 01.10.2026 по 5348-У"})
+    assert NameIndex().hits(table, query_codes("найди письмо 5348-У")) == [path]
+
+
 def test_code_shared_by_more_than_three_files_is_ignored():
     shared = {f"/a/v2 отчёт {i}.pdf": f"v2 отчёт {i}.pdf" for i in range(4)}
     table = _CardTable({**shared, "/a/obs_286.txt": "obs_286.txt"})
@@ -168,9 +193,9 @@ def test_code_shared_by_more_than_three_files_is_ignored():
 def test_copies_of_one_document_count_once():
     """Копии одного содержимого (тот же sha256) — один документ, а не четыре.
 
-    Выдача схлопывает их в один результат (duplicates); считай порог пути,
-    четвёртая копия — «Загрузки», «Документы», «(1)» от браузера — отключала
-    бы закрепление единственного документа.
+    Выдача схлопывает их в один результат (duplicates); при подсчёте по путям
+    четвёртая копия («Загрузки», «Документы», «(1)» от браузера) отключала бы
+    закрепление единственного документа.
     """
     copies = {
         "/Загрузки/5348-У.pdf": "5348-У.pdf",
@@ -182,7 +207,7 @@ def test_copies_of_one_document_count_once():
     assert len(copies) > MAX_FILES_PER_CODE
     assert NameIndex().hits(table, query_codes("Найди файл 5348-У")) == sorted(copies)
 
-    # Разные документы под тем же кодом по-прежнему считаются порознь.
+    # Разные документы под тем же кодом считаются порознь.
     table = _CardTable(copies, {p: str(i) for i, p in enumerate(copies)})
     assert NameIndex().hits(table, query_codes("Найди файл 5348-У")) == []
 
@@ -210,9 +235,6 @@ def test_query_without_codes_does_not_read_names():
     table = _CardTable({"/a/ЦБ_21.pdf": "ЦБ_21.pdf"})
     assert NameIndex().hits(table, query_codes("найди положение")) == []
     assert table.loads == 0
-
-
-# --------------------------------------------------------- порядок выдачи ----
 
 
 def _pool_and_pinned_tail(score_col: str = "_relevance_score") -> pl.DataFrame:
@@ -305,7 +327,7 @@ def test_more_pinned_than_limit_keeps_the_best_pinned():
 
 @pytest.mark.asyncio
 async def test_search_without_pinned_list_does_not_look_for_codes():
-    """Старые вызовы Index.search (без pinned) работают как раньше."""
+    """Index.search без pinned не ищет коды и не дочитывает строки."""
 
     class _Table:
         searches = 0
@@ -337,9 +359,6 @@ async def test_search_without_pinned_list_does_not_look_for_codes():
     )
     assert await Index.search(fake, "Найди файл ЦБ_21") == [None]
     assert _Table.searches == 1, "ни словаря имён, ни дочитывания"
-
-
-# ------------------------------------------------- живой индекс (LanceDB) ----
 
 
 async def _add(rag: Index, rows: list[tuple[str, str, str]]) -> None:
@@ -459,9 +478,8 @@ async def test_live_pinned_document_found_only_by_its_card_gets_fragments(
 ):
     """«Найди файл …» обычно совпадает с карточкой, а не с текстом файла.
 
-    Дочитывались только документы, которых в пуле нет вовсе, и закреплённый
-    документ, от которого в пуле одна карточка, шёл первым без единого
-    фрагмента — меньше, чем получил бы, не найдись он вовсе.
+    Закреплённый документ, от которого в пуле одна карточка, тоже дочитывается:
+    иначе он шёл бы первым без единого фрагмента.
     """
     path = "/docs/obs_286 журнал.txt"
     rows = [(path, "text", f"Мушкетёры, глава {i}") for i in range(PINNED_CHUNKS + 2)]

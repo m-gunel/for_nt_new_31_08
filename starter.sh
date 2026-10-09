@@ -1,3 +1,4 @@
+#!/bin/sh
     bash_check()
     {
       echo Проверка при помощи bash
@@ -55,11 +56,13 @@
       echo "Ожидание закончилось."
     }
 
-    if [[ "$ISTIO" -eq "TRUE"  &&  "$WAIT_ENVOY" -eq "TRUE" ]]
+    # Строки сравниваем через =: -eq арифметический, и TRUE, FALSE и пустое
+    # значение для него одинаково равны 0.
+    if [ "$ISTIO" = "TRUE" ] && [ "$WAIT_ENVOY" = "TRUE" ]
     then
       waiting_istio
     fi
-    if [[ "$SECMAN" -eq "TRUE" ]]; then
+    if [ "$SECMAN" = "TRUE" ]; then
       waiting_secman
     fi
     $COMMAND

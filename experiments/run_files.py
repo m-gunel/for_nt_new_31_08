@@ -11,7 +11,6 @@ allowed_extentions = list(get_parsers_registry())
 
 
 def filter_files(path: str | Path) -> bool:
-    """Filter files based on allowed extensions."""
     *_, ext = Path(path).name.split(".")
     if ext in {"xlsx", "xls"}:
         return path.startswith("/Users/admin/projects/work/files-search/data/to_index")

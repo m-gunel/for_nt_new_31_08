@@ -13,6 +13,10 @@ AsyncEmbedder: TypeAlias = Callable[[list[str]], Awaitable[np.ndarray]]
 
 lg = get_logger(__name__)
 
+# Как embed_model_cfg.batch_size (индексатор передаёт его явно): с большим
+# батчем индексация зависает (CPU 0 %).
+DEFAULT_BATCH_SIZE = 8
+
 
 def _process_batch(
     current_batch: list[ChunkWithMeta],
@@ -62,13 +66,9 @@ def embed_documents_into_batches(
     data: Iterable[ChunkWithMeta],
     embedder: Embedder,
     text_field: str = "text",
-    batch_size: int = 256,
+    batch_size: int = DEFAULT_BATCH_SIZE,
     schema: pa.Schema | None = None,
 ):
-    """
-    Embed the text in the batches.
-    """
-    # current_token_cnt = 0
     current_batch: list[ChunkWithMeta] = []
     for row in data:
         if len(current_batch) >= batch_size:
@@ -79,7 +79,6 @@ def embed_documents_into_batches(
                 schema=schema,
             )
             current_batch.clear()
-            # current_token_cnt = 0
         current_batch.append(row)
     if current_batch:
         yield _process_batch(
@@ -94,14 +93,10 @@ async def async_embed_documents_into_batches(
     data: AsyncIterable[ChunkWithMeta],
     embedder: AsyncEmbedder,
     text_field: str = "text",
-    batch_size: int = 256,
+    batch_size: int = DEFAULT_BATCH_SIZE,
     schema: pa.Schema | None = None,
     callback: Callable[[list[ChunkWithMeta]], None] | None = None,
 ):
-    """
-    Embed the text in the batches.
-    """
-    # current_token_cnt = 0
     current_batch: list[ChunkWithMeta] = []
     try:
         async for row in data:
@@ -114,7 +109,6 @@ async def async_embed_documents_into_batches(
                     callback=callback,
                 )
                 current_batch.clear()
-                # current_token_cnt = 0
             current_batch.append(row)
         if current_batch:
             yield await _async_process_batch(

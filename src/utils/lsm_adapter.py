@@ -27,14 +27,11 @@ lg = get_logger(__name__, slice=-1)
 
 # Единственный поток, которому разрешено работать с lsm_db.
 #
-# Хендл lsm_db однопоточный: он хранит собственный номер читателя (iReader),
-# список открытых курсоров (pCsr) и глубину транзакций (nTransOpen), а на входе
-# в каждую операцию проверяет их согласованность (assert_db_state,
-# lsm_main.c:43). Обращение из нескольких потоков это состояние рассогласует —
-# в отладочной сборке процесс убивается через abort(), в release состояние
-# портится молча.
+# Хендл lsm_db однопоточный: состояние читателя, курсоров и транзакций
+# сверяется на входе в каждую операцию (assert_db_state в lsm_main.c), и доступ
+# из нескольких потоков даёт abort() в отладочной сборке и тихую порчу в release.
 #
-# Поэтому инвариант модуля: к self.lsm обращаются либо из этого executor'а
+# Инвариант модуля: к self.lsm обращаются либо из этого executor'а
 # (через to_thread ниже), либо синхронно под LSMTable._lock. Дефолтный пул
 # asyncio (asyncio.to_thread), _ITER_EXECUTOR и _INDEX_BUILD_EXECUTOR к LSM
 # не допускаются.
@@ -54,10 +51,11 @@ _RETRYABLE_ERRORS = (RuntimeError, OSError)
 def retry_read(foo: Callable[[], R]) -> R:
     """Повторить чтение LSM при транзиентном сбое.
 
-    Вызывается уже внутри worker-потока `executor`, поэтому блокирующий
-    `time.sleep` здесь не задевает event loop. Блокировку таблицы берёт сам
-    `foo` — на время паузы между попытками она отпущена, иначе десять секунд
-    ретраев запирали бы все остальные обращения к БД.
+    Вызывается внутри worker-потока `executor`, поэтому блокирующий
+    `time.sleep` не задевает event loop. Но поток у LSM один: пока идут паузы
+    между попытками, ждут и все остальные async-обращения к LSM (check_meta,
+    async_set, keys_snapshot). `_lock` берёт сам `foo` и на паузу отпускает —
+    это развязывает только синхронные вызовы из других потоков.
     """
     for attempt in range(LSM_READ_RETRIES):
         try:
@@ -85,13 +83,11 @@ async def to_thread(foo: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R
 async def wait_idle() -> None:
     """Дождаться, пока в LSM-потоке не останется незавершённой работы.
 
-    Отмена корутины НЕ отменяет уже отданный в executor вызов: он доигрывает
-    в потоке, пока вызывающая сторона считает, что всё остановлено. Барьер
-    нужен там, где следующий шаг рассчитывает на покой БД — в первую очередь
-    в POST /config (stop_index -> clear -> start_reindex).
-
-    Executor однопоточный, поэтому пустая задача выполняется строго после
-    всего, что было поставлено в очередь раньше.
+    Отмена корутины не отменяет вызов, уже отданный в executor: он доигрывает
+    в потоке. Барьер — для шагов, рассчитывающих на БД в покое, прежде всего
+    POST /config (stop_index -> clear -> start_reindex). Executor
+    однопоточный, поэтому пустая задача выполнится после всего, что
+    поставлено раньше.
     """
     await to_thread(lambda: None)
 
@@ -109,14 +105,29 @@ async def check_meta_changed(
         stored = await table.async_get(meta.path)
         if stored is None:
             return True
-        return stored.size != meta.size or stored.mtime_seconds != meta.mtime_seconds
+        return stored.size != meta.size or stored.mtime_seconds != _lsm_mtime(
+            meta.mtime_seconds
+        )
     except Exception as e:
         lg.error("Error checking metadata for %s: %s", meta.path, e, exc_info=True)
         return True
 
 
+# mtime в записи LSM — беззнаковые 32 бита (формат `<QL`). Дата до 1970 года
+# или после 2106-го (копии с SMB, tar-архивы, `touch -d`) туда не помещается,
+# и struct.error на отметке обрывал бы весь проход. Такой mtime пишется
+# зажатым к краю диапазона, и check_meta_changed сравнивает тоже зажатый —
+# иначе файл «менялся» бы на каждом проходе.
+_MTIME_MAX = 2**32 - 1
+
+
+def _lsm_mtime(mtime_seconds: int) -> int:
+    """mtime в том виде, в каком его хранит LSM."""
+    return min(max(mtime_seconds, 0), _MTIME_MAX)
+
+
 def _encode_file_meta(meta: FileMetadata) -> bytes:
-    return struct.pack("<QL", meta.size, meta.mtime_seconds)
+    return struct.pack("<QL", meta.size, _lsm_mtime(meta.mtime_seconds))
 
 
 def _decode_file_meta(key: str, data: bytes) -> FileMetadata:
@@ -150,10 +161,8 @@ class LSMTable[T](AbstractContextManager):
         self.path = path
         self.decoder = decoder
         self.exit_stack = ExitStack()
-        # RLock, а не Lock: методы класса вызывают друг друга (delete_prefix
-        # держит блокировку и внутри неё удаляет ключи).
-        #
-        # Создаётся ДО connect(): открытие БД тоже идёт под блокировкой.
+        # RLock: методы вызывают друг друга под блокировкой (delete_prefix).
+        # Создаётся до connect(): открытие БД тоже идёт под ней.
         self._lock = threading.RLock()
         self.lsm = self.connect()
 
@@ -242,23 +251,12 @@ class LSMTable[T](AbstractContextManager):
     def _keys_with_prefix(self, b_prefix: bytes) -> list[bytes]:
         """Ключи с этим префиксом. Курсора после себя не оставляет.
 
-        Полный обход `keys()`, а не курсор с `seek`, хотя seek и дешевле:
-        на ПУСТОЙ базе lsm вообще не даёт открыть курсор
-        (`RuntimeError: Invalid cursor`), а пустая база — штатное состояние
-        (свежая установка, только что очищенный индекс). `keys()` этот случай
-        переживает.
-
-        Прежний вариант — срез `self.lsm[b_prefix:]` с выходом по `break` —
-        оставлял курсор открытым на неопределённый срок, а следующая же
-        строка открывала на том же хендле транзакцию: ровно та пара
-        «курсор + транзакция», согласованность которой проверяет
-        assert_db_state. Здесь генератор вычитывается до конца, поэтому
-        курсор закрывается сразу.
-
-        Цена — обход всех ключей вместо только совпавших. Это допустимо:
-        delete_prefix зовут при смене списка папок и при выключении почты,
-        а полный обход по таблице и так делает keys_snapshot() на каждом
-        проходе индексации.
+        Полный обход `keys()`, а не курсор с `seek`: на пустой базе lsm не даёт
+        открыть курсор (`RuntimeError: Invalid cursor`), а пустая база — штатное
+        состояние. Генератор вычитывается до конца, чтобы курсор закрылся до
+        транзакции в delete_prefix: пару «курсор + транзакция» на одном хендле
+        assert_db_state не допускает. Обход всех ключей терпим: delete_prefix
+        зовут только при смене папок и выключении почты.
         """
         with self._lock:
             return [key for key in self.lsm.keys() if key.startswith(b_prefix)]  # type: ignore

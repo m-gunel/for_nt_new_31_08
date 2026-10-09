@@ -65,7 +65,7 @@ def test_disabled_write_tool_is_refused_with_a_reason(bridge_factory):  # noqa: 
     """Спрятанный инструмент должен объяснять, почему он недоступен."""
     bridge = bridge_factory(LQRAG_ALLOW_WRITE="0")
     error = bridge.call("local_add_path", {"path": "/tmp"})["error"]
-    assert error["code"] == -32601
+    assert error["code"] == -32602
     assert "LQRAG_ALLOW_WRITE" in error["message"]
 
 
@@ -85,7 +85,7 @@ def test_tool_schemas_are_well_formed(bridge_factory):  # noqa: F811
 
 
 def test_search_contract_speaks_of_documents(bridge):
-    """limit, total и match — в документах, как у демона после «limit = документы»."""
+    """limit, total и match считаются в документах, как у демона."""
     (search,) = [tool for tool in bridge.tools() if tool["name"] == "local_search"]
     assert search["inputSchema"]["properties"]["limit"]["description"] == (
         "Сколько документов вернуть"
@@ -136,8 +136,10 @@ def test_notifications_get_no_response(bridge):
 
 
 def test_unknown_method_and_unknown_tool(bridge):
+    """Метода нет — -32601; инструмента нет — неверный параметр name
+    существующего метода tools/call, -32602 (MCP, Tools → Error Handling)."""
     assert bridge.request("resources/list")["error"]["code"] == -32601
-    assert bridge.call("local_nonexistent")["error"]["code"] == -32601
+    assert bridge.call("local_nonexistent")["error"]["code"] == -32602
 
 
 def test_broken_json_does_not_kill_the_bridge(bridge):
@@ -163,3 +165,63 @@ def test_batch_is_answered_per_message(bridge):
 def test_eof_terminates_the_process(bridge):
     bridge.proc.stdin.close()
     assert bridge.proc.wait(timeout=5) == 0
+
+
+@pytest.mark.parametrize(
+    "method, params",
+    [
+        ("tools/call", [1]),
+        ("tools/call", "local_search"),
+        ("tools/call", {"name": ["local_search"]}),
+        ("initialize", ["2025-06-18"]),
+    ],
+)
+def test_malformed_params_do_not_kill_the_bridge(bridge, method, params):
+    """params-массив или name-список — ошибка вызова, а не падение моста."""
+    bridge.send({"jsonrpc": "2.0", "id": 900, "method": method, "params": params})
+    response = bridge.read()
+    assert response["id"] == 900 and response["error"]["code"] == -32602
+    assert bridge.request("ping")["result"] == {}
+
+
+def test_unexpected_failure_answers_internal_error(monkeypatch):
+    """Непредусмотренный сбой разбора — -32603 на запрос, нотификации — тишина."""
+    import mcp_server
+
+    def boom(msg):
+        raise RuntimeError("сбой разбора")
+
+    monkeypatch.setattr(mcp_server, "_handle", boom)
+    response = mcp_server._safe_handle({"jsonrpc": "2.0", "id": 7, "method": "ping"})
+    assert response["id"] == 7 and response["error"]["code"] == -32603
+    assert mcp_server._safe_handle({"jsonrpc": "2.0", "method": "x"}) is None
+
+
+def test_bridge_scripts_stay_on_python36():
+    """Нижней границы python3 в debian/control нет: мост и register_mcp.py
+    работают на любом системном python3, конструкции новее 3.6 им нельзя."""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    for name in ("mcp_server.py", "scripts/register_mcp.py"):
+        tree = ast.parse((root / name).read_text(encoding="utf-8"))
+        newer = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.NamedExpr, ast.Match))
+            # date/datetime.fromisoformat — с 3.7.
+            or (isinstance(node, ast.Attribute) and node.attr == "fromisoformat")
+        ]
+        assert newer == [], (name, newer)
+
+
+def test_dates_accept_only_ascii_digits():
+    """strptime, в отличие от date.fromisoformat, читает и «２０２４»: такие
+    даты по-прежнему отвергаются, обычные разбираются как раньше."""
+    import mcp_server
+
+    assert mcp_server._optional_date({"d": "2024-02-29"}, "d") == "2024-02-29"
+    for value in ("２０２４-01-01", "٢٠٢٤-01-01", "2023-02-29", "2024-13-01"):
+        with pytest.raises(mcp_server.InvalidParams):
+            mcp_server._optional_date({"d": value}, "d")

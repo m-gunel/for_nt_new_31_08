@@ -2,23 +2,24 @@
 
 Страница идёт в OCR, если на ней меньше 50 непробельных символов, а картинки
 покрывают не меньше половины её площади: сканы целиком и вставленные в цифровые
-отчёты сканы (аудиторские заключения). На актах ЦБ, аналитике и ZX Bank правило
-не срабатывает ни разу (замер на корпусе стенда); суммарная площадь, а не одна
-большая картинка, — из-за сканов, нарезанных на десятки полос.
+отчёты сканы (аудиторские заключения). Площадь суммарная, а не одной картинки, —
+из-за сканов, нарезанных на десятки полос.
 
 Распознаёт отдельный процесс (src/ocr_worker.py) — один на файл, с таймаутом;
 при остановке индексации он убивается (kill_running). Результат кэшируется по
-sha256 файла в <lsm_root>/ocr: повторная индексация не распознаёт заново, а
-чтение файла по запросу (/read_file) берёт только кэш — ждать OCR минутами там
-нельзя.
+sha256 файла в <lsm_root>/ocr; чтение файла по запросу (/read_file) берёт только
+кэш — ждать OCR минутами там нельзя.
 """
 
 import contextlib
 import contextvars
 import hashlib
 import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -39,6 +40,11 @@ _cache_only: contextvars.ContextVar[bool] = contextvars.ContextVar(
 _running: set[subprocess.Popen] = set()
 _lock = threading.Lock()
 _warned: set[str] = set()
+# Поколение индексации: kill_running начинает новое, и разбор, начатый в
+# старом, воркер уже не запускает (started_in).
+_generation = 0
+_local = threading.local()
+CACHE_DIR = "ocr"
 
 
 def needs_ocr(page: pymupdf.Page, text: str) -> bool:
@@ -67,12 +73,33 @@ def cache_only():
 
 
 def kill_running() -> None:
-    """Остановка индексации: воркеры OCR не дорабатывают файл."""
+    """Остановка индексации: воркеры OCR не дорабатывают файл, новые не стартуют."""
+    global _generation
     with _lock:
+        _generation += 1
         procs = list(_running)
     for proc in procs:
         with contextlib.suppress(OSError):
             proc.kill()
+
+
+def generation() -> int:
+    return _generation
+
+
+@contextlib.contextmanager
+def started_in(gen: int | None):
+    """Разбор, начатый в поколении `gen`: после kill_running воркер для него не стартует.
+
+    Отмена задачи индексации не прерывает поток разбора, и без метки он
+    запустил бы воркер уже после остановки. None — без привязки (стенд, тесты).
+    """
+    prev = getattr(_local, "gen", None)
+    _local.gen = gen
+    try:
+        yield
+    finally:
+        _local.gen = prev
 
 
 def _warn_once(key: str, msg: str, *args) -> None:
@@ -106,16 +133,21 @@ def _worker_cmd() -> tuple[list[str], str | None]:
 def _run_worker(request: dict, timeout: float) -> tuple[dict[int, str], list[str]]:
     """Распознанные страницы и жалобы: ошибки страниц, таймаут, падение воркера."""
     cmd, cwd = _worker_cmd()
-    proc = subprocess.Popen(
-        cmd,
-        cwd=cwd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-    )
+    # Проверка и запуск — под замком kill_running: иначе воркер, запущенный в
+    # момент остановки, не попал бы в _running и доработал бы файл.
     with _lock:
+        gen = getattr(_local, "gen", None)
+        if gen is not None and gen != _generation:
+            return {}, ["индексация остановлена"]
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
         _running.add(proc)
     problems: list[str] = []
     try:
@@ -156,7 +188,12 @@ def _sha256(file: BinaryIO) -> str:
 
 
 def _cache_file(sha: str) -> Path:
-    return Path(get_config().lsm_root) / "ocr" / f"{sha}.json"
+    return Path(get_config().lsm_root) / CACHE_DIR / f"{sha}.json"
+
+
+def clear_cache(lsm_root: str | os.PathLike[str]) -> None:
+    """Удалить кэш целиком: в нём распознанный текст сканов (сброс индекса)."""
+    shutil.rmtree(Path(lsm_root) / CACHE_DIR, ignore_errors=True)
 
 
 def _load(sha: str) -> dict[int, str]:
@@ -170,9 +207,17 @@ def _load(sha: str) -> dict[int, str]:
 def _save(sha: str, pages: dict[int, str]) -> None:
     path = _cache_file(sha)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(pages, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
+    # Своё имя временного файла на запись: один файл могут распознать два
+    # прохода сразу (полный и watcher).
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f"{sha}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(pages, ensure_ascii=False))
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def recognize(file: BinaryIO, pages: list[int]) -> dict[int, str]:
@@ -186,7 +231,6 @@ def recognize(file: BinaryIO, pages: list[int]) -> dict[int, str]:
         return {}
     path = getattr(file, "name", None)
     if not isinstance(path, str) or not Path(path).is_file():
-        # Вложение письма живёт только в памяти: воркеру нечего открыть.
         _warn_once("memory", "OCR пропускает PDF без файла на диске (вложения писем)")
         return {}
     sha = _sha256(file)
@@ -205,7 +249,13 @@ def recognize(file: BinaryIO, pages: list[int]) -> dict[int, str]:
         texts, problems = _run_worker(request, cfg.max_seconds_per_file)
         if texts:
             cached.update(texts)
-            _save(sha, cached)
+            try:
+                _save(sha, cached)
+            except OSError as exc:
+                # Распознанное не выбрасываем: файл проиндексируется и без кэша.
+                lg.warning(
+                    "OCR %s: кэш не записан (%s: %s)", path, type(exc).__name__, exc
+                )
         lg.info(
             "OCR %s: %d стр. за %.1f с",
             path,

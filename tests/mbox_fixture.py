@@ -20,18 +20,11 @@ from zipfile import ZipFile
 # Thunderbird на диске и так она захардкожена в src/thunderbird/find_files.py.
 SENT_FOLDER_MUTF7 = "&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-"
 
-# Даты писем относительные, а не абсолютные.
-#
-# Индексатор отбирает письма окном `index_last_n_days` от «сейчас», поэтому
-# фикстура с зашитыми датами живёт ровно до того дня, когда окно уползёт за
-# них: 28 августа 2026 набор был зелёным, 2 сентября те же семь тестов падали
-# с «assert 1 == 4», хотя код между этими датами не менялся.
-#
-# Все письма лежат в интервале от 5 до 2 суток назад. Это одновременно:
-#   - внутри рабочих окон (30 дней в cfg/dev.yml, 90 в test_config_reload) —
-#     значит вся фикстура доходит до очереди;
-#   - снаружи окна в 1 день, на котором test_skipped_by_date_is_reported
-#     проверяет, что по дате отсекается ВСЯ фикстура.
+# Даты относительные: индексатор берёт письма окном `index_last_n_days` от
+# «сейчас», и зашитые даты со временем выпали бы из окна. Интервал 2–5 суток
+# назад лежит внутри рабочих окон (30 дней в cfg/dev.yml, 90 в
+# test_config_reload) и снаружи окна в 1 день, которым
+# test_skipped_by_date_is_reported отсекает всю фикстуру.
 _NOW = datetime.now(UTC)
 _DEFAULT_DATE = _NOW - timedelta(days=2)
 
@@ -77,8 +70,8 @@ def make_alternative_email(
 ) -> EmailMessage:
     """multipart/alternative: один и тот же текст как text/plain и text/html.
 
-    Ровно этот случай даёт дубли тела в индексе (см. P2 в плане): обе версии
-    проходят через `process_message` как отдельные `Body`.
+    Ровно этот случай даёт дубли тела в индексе: обе версии проходят через
+    `process_message` как отдельные `Body`.
     """
     msg = _base_email(subject, msg_id=msg_id, date=date, **kwargs)
     msg.set_content(body)
@@ -343,7 +336,7 @@ def make_profile(
 
 
 def default_inbox_messages() -> list[EmailMessage]:
-    """Стандартный набор писем, покрывающий сценарии из плана."""
+    """Стандартный набор: обычное, alternative, с вложением, с подписью, без Date."""
     return [
         make_plain_email(
             "Отчёт по кварталу",

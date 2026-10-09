@@ -2,19 +2,14 @@
 # -*- coding: utf-8 -*-
 """Скачать .deb инструментов сборки из зеркала Debian — без apt и без root.
 
-Зачем. scripts/build_deb_nosudo.sh сначала пробует `apt-get download`. На
-SberOS это не работает у обычного пользователя: файлы с адресами репозиториев
-(/etc/apt/sources.list.d/*) закрыты для чтения, и apt «не знает», откуда
-качать. Этот скрипт идёт в то же корпоративное зеркало Debian, которым
-пользуется Dockerfile (SberOSC, debian_yandex), напрямую по HTTPS с токеном
-из .secret.
+scripts/build_deb_nosudo.sh сначала пробует `apt-get download`, но на SberOS у
+обычного пользователя /etc/apt/sources.list.d/* закрыты для чтения, и apt не
+знает, откуда качать. Скрипт идёт в то же зеркало, что и Dockerfile (SberOSC,
+debian_yandex), напрямую по HTTPS с токеном из .secret.
 
-Проверки — те же, что делает apt:
-  1. подпись dists/<suite>/Release (Release.gpg) ключом архива Debian —
-     через gpgv или sqv (в Debian 13 apt проверяет подписи именно sqv), если
-     они есть в системе; иначе предупреждение, опора на HTTPS и хэши ниже;
-  2. SHA256 индекса Packages.xz — по Release;
-  3. SHA256 каждого .deb — по Packages.
+Проверки — как у apt: подпись Release ключом архива Debian (gpgv или sqv — им
+apt проверяет подписи в Debian 13; если их нет — только предупреждение),
+SHA256 Packages.xz по Release и SHA256 каждого .deb по Packages.
 
 Только stdlib, совместимо с python3.6.
 

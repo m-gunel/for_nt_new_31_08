@@ -1,9 +1,8 @@
 """Watcher переживает несуществующий путь в конфиге.
 
 inotify отказывает по отсутствующему каталогу при старте эмиттера, и падает
-весь observer — вместе с наблюдением за живыми папками. На АРМ один
-сохранённый мусорный путь ("string" из Swagger) оставил демон вообще без
-слежения за файловой системой до конца сессии.
+весь observer — вместе с наблюдением за живыми папками: одного мусорного пути
+("string" из Swagger) хватило бы, чтобы остаться без слежения до конца сессии.
 """
 
 import asyncio
@@ -62,7 +61,7 @@ def watcher_config(config: Config, tmp_path, monkeypatch):
     live.mkdir()
     dead = tmp_path / "нет-такого"
     # data_directory во временный каталог: иначе scan_paths прочитает
-    # настоящий ~/.ragsearch/user_conf.yml разработчика
+    # общий user_conf.yml
     monkeypatch.setattr(config, "data_directory", str(tmp_path / "ragsearch"))
     config.__dict__.pop("user_conf_path", None)
     config.__dict__.pop("data_directory_path", None)
@@ -127,16 +126,11 @@ async def test_run_survives_disappearing_path(watcher_config, monkeypatch):
     await _NoopWatcher().run()  # не должно бросить
 
 
-# --------------------------------------- настоящий WatchDogAdapter, не заглушка -
-
-
 class _FailingObserver:
     """Observer, падающий на start() — как inotify при ENOSPC или ENOTDIR.
 
-    Нужен, потому что на macOS реальный отказ невоспроизводим: там FSEvents,
-    и наблюдение за несуществующим путём поднимается без единой ошибки. Без
-    такой подмены ветка обработки OSError не исполняется ни одним тестом и
-    ломается незаметно до самого АРМ.
+    На macOS (FSEvents) наблюдение за несуществующим путём поднимается без
+    ошибки, и без подмены ветка обработки OSError не исполнялась бы.
     """
 
     def __init__(self):
@@ -195,9 +189,8 @@ async def test_start_async_does_not_block_event_loop(tmp_path):
     """Постановка наблюдения не должна занимать цикл событий.
 
     Для inotify observer.start() обходит всё дерево и делает системный вызов на
-    каждый каталог, причём в потоке вызывающего. Пока это выполнялось в
-    корутине, на старте демона и на каждом POST /config не отвечали ни /health,
-    ни /status, ни /search.
+    каждый каталог в потоке вызывающего: в корутине это заморозило бы /health,
+    /status и /search на старте демона и на каждом POST /config.
     """
     import threading
     import time

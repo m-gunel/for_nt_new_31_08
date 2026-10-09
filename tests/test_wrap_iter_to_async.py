@@ -1,8 +1,11 @@
 """wrap_iter_to_async: синхронный итератор → асинхронный без потери элементов."""
 
 import asyncio
+import logging
 import queue
 import time
+
+import pytest
 
 from src.utils import tools
 
@@ -44,3 +47,42 @@ def test_producer_error_reaches_consumer():
         return out, False
 
     assert asyncio.run(collect()) == ([1], True)
+
+
+def test_producer_oserror_is_left_to_consumer(caplog):
+    """Штатный OSError производителя (файл исчез, нет прав) обёртка не пишет
+    в журнал ERROR со стеком: исключение уходит потребителю, а что писать в
+    журнал, решает он (_process_path — одна строка WARNING)."""
+
+    def vanished():
+        raise FileNotFoundError(2, "No such file or directory", "/нет/отчёт.txt")
+        yield  # pragma: no cover — это генератор
+
+    async def collect():
+        async for _ in tools.wrap_iter_to_async(vanished()):
+            pass
+
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(collect())
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+@pytest.mark.asyncio
+async def test_vanished_file_gives_one_warning_without_traceback(tmp_path, caplog):
+    """Файл, удалённый между обходом и разбором: одна строка WARNING от
+    _process_path, без ERROR и трассировки; повтор на следующем проходе."""
+    from src.common import FileMetadata
+    from src.parsers import _process_path
+
+    meta = FileMetadata(path=str(tmp_path / "отчёт.txt"), size=10, mtime_seconds=1)
+    fails = []
+
+    async def fail_cb(m, *, permanent):
+        fails.append(permanent)
+
+    caplog.set_level(logging.DEBUG)
+    assert [c async for c in _process_path(meta, fail_cb)] == []
+    assert fails == [False]
+    loud = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert [(r.levelno, r.exc_info) for r in loud] == [(logging.WARNING, None)]

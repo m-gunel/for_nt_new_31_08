@@ -69,8 +69,8 @@ _DELETE_BATCH = 100
 # прохода. disk_usage — системный вызов, на каждый батч он лишний.
 _DISK_CHECK_EVERY_BATCHES = 32
 
-# Отдельный поток под перестройку индексов: она долгая, и её нельзя пускать
-# в общий пул, через который ходят поисковые запросы.
+# Отдельный поток под перестройку индексов: она долгая и в общем пуле заняла
+# бы воркеры остальных вызовов asyncio.to_thread.
 _INDEX_BUILD_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     1,
     thread_name_prefix="index_build",
@@ -78,22 +78,28 @@ _INDEX_BUILD_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     initializer=background_pool_initializer,
 )
 
+# Свой пул для запросов /search к LanceDB. В дефолтный (asyncio.to_thread) идут
+# и долгие задачи — сверка путей с диском, постановка наблюдения, /read_file с
+# конвертацией до 120 с, — и при их наложении запрос ждал бы в очереди дольше
+# таймаута агента. Четыре потока — как у дефолтного пула (asyncio_num_workers).
+# Без background_pool_initializer: поиск интерактивный.
+_SEARCH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(4, thread_name_prefix="search")
 
-# Источники поиска. Дефолт — только файлы: письма попали в индекс позже, и
-# смешивать их в общую выдачу по умолчанию значит вытеснять ими документы.
+
+# Источники поиска. По умолчанию — только файлы: письма в общей выдаче
+# вытесняли бы документы.
 FILES_SOURCE = "files"
 EMAIL_SOURCE = "email"
 SearchSource = Literal["files", "email"]
 
-# starts_with, а не LIKE: в LIKE `_` — «любой символ», и `path like 'email_%'`
-# матчит заодно пути вроде `emailX...`.
+# starts_with, а не LIKE: в LIKE `_` — любой символ, и `path like 'email_%'`
+# матчит заодно `emailX...`.
 EMAIL_ROWS_PREDICATE = f"starts_with(path, '{EMAIL_PREFIX}')"
 
 
-# Маркеры ошибки «полнотекстовый индекс ещё не создан». Формулировка у LanceDB
-# менялась от версии к версии, поэтому проверяем несколько вариантов, а не одну
-# фразу: узкое условие на апгрейде библиотеки молча превратило бы штатную
-# деградацию поиска в 500. Кортеж внутри — все подстроки должны совпасть.
+# Маркеры ошибки «полнотекстовый индекс ещё не создан». Формулировка меняется
+# между версиями LanceDB, и одна фраза после обновления превратила бы штатный
+# откат поиска в 500. Внутри кортежа должны совпасть все подстроки.
 _MISSING_FTS_MARKERS: tuple[tuple[str, ...], ...] = (
     ("full text search", "index"),
     ("inverted index",),
@@ -109,15 +115,12 @@ def _is_missing_fts_index(exc: BaseException) -> bool:
     return any(all(part in msg for part in markers) for markers in _MISSING_FTS_MARKERS)
 
 
-# Пул чанков на канал поиска, из которого собирается выдача limit ДОКУМЕНТОВ.
-# Канал — вектор и FTS гибрида по отдельности (их сливает RRF), а также
-# чисто векторный и чисто текстовый поиск. Пул по limit чанков отдавал меньше
-# документов, чем просили (10 чанков — в среднем 6,2 документа: длинный
-# документ занимает места соседей), а копии одного файла съедали места ещё
-# и сверху. Замер на стенде (1332 запроса): пул 50 при limit=10 — лучший
-# (Hit@1 +0,039, MRR +0,020 против 10 чанков), 100 не лучше. Кратность — чтобы
-# на больших limit документов в пуле хватало; потолок — чтобы limit=1000 не
-# собирал тысячи строк на канал.
+# Пул чанков на канал поиска (вектор и FTS гибрида по отдельности, чистый
+# вектор, чистый текст), из которого собирается выдача limit ДОКУМЕНТОВ.
+# Пул в limit чанков дал бы меньше документов: длинный документ и копии файла
+# занимают места соседей. 50 при limit=10 — лучшее по замеру (100 не лучше);
+# кратность — запас документов на больших limit, потолок — чтобы limit=1000
+# не тянул тысячи строк на канал.
 SEARCH_POOL_MIN = 50
 SEARCH_POOL_PER_DOC = 5
 SEARCH_POOL_MAX = 500
@@ -128,18 +131,40 @@ SEARCH_POOL_MAX = 500
 VECTOR_NPROBES = 64
 
 # Во сколько раз больше кандидатов, чем просили, пересчитывается по полным
-# векторам. Без refine порядок задают PQ-коды (39 подвекторов по 8 бит), и
-# из 50 чанков пула точный поиск совпадал лишь на 0,689. Замер на стенде
-# (40 тыс. строк, 1982 запроса, против точного перебора): вектор nDCG@10
-# −0,024 и Hit@1 −0,042, гибрид −0,011 / −0,022. Число разделов почти ни при
-# чём (все 200 без refine — +0,001); refine 10 при nprobes 64 снимает ≈97%
-# потери ценой ≈3 мс на запрос.
+# векторам. Без refine порядок задают грубые PQ-коды, и пул заметно расходится
+# с точным поиском; число разделов этого не лечит, а refine 10 при nprobes 64
+# снимает почти всю потерю ценой ≈3 мс на запрос.
 VECTOR_REFINE_FACTOR = 10
 
 
 def search_pool(limit: int) -> int:
     """Чанков на канал поиска при выдаче limit документов."""
     return min(SEARCH_POOL_MAX, max(SEARCH_POOL_MIN, limit * SEARCH_POOL_PER_DOC))
+
+
+async def _await_stopped(
+    task: asyncio.Task, what: str, timeout: float | None = None
+) -> None:
+    """Дождаться остановленной задачи, не поднимая её собственную ошибку.
+
+    Задача могла упасть ещё до отмены, и await поднял бы её исключение
+    заново: остановка обрывалась бы на полпути, а /config, /deactivate и
+    /reset отвечали бы 500 до рестарта. Стек упавшего прохода уже записал
+    scan_all, здесь хватает строки.
+
+    Отмену самой ожидающей задачи пробрасываем: иначе остановка поллинга,
+    пришедшая, пока он сворачивает почтовый этап, терялась бы, и
+    stop_emails_polling ждал бы вечно.
+    """
+    current = asyncio.current_task()
+    cancelling = current.cancelling() if current else 0
+    try:
+        await asyncio.wait_for(task, timeout)
+    except asyncio.CancelledError:
+        if current is not None and current.cancelling() > cancelling:
+            raise
+    except Exception as exc:
+        lg.warning("%s: ошибка при остановке — %r", what, exc)
 
 
 class Index(AbstractAsyncContextManager):
@@ -156,16 +181,17 @@ class Index(AbstractAsyncContextManager):
         self.queued_emails = 0
         self.main_index = False
         self.emails_task: asyncio.Task | None = None
-        # Периодический полный проход — страховка поверх watcher'а (шаг 15).
+        # Почтовый этап идущего прохода (_run_email_stage): его обрывают
+        # выключение почты и смена корня, не трогая сам проход.
+        self._email_stage: asyncio.Task | None = None
+        # Периодический полный проход — страховка поверх watcher'а.
         self.rescan_task: asyncio.Task | None = None
-        # инициализируем здесь, иначе stop_index() до старта lifespan()
-        # падает с AttributeError вместо тихого no-op
+        # Здесь, а не в lifespan(): stop_index() до старта иначе падает с
+        # AttributeError.
         self.task: asyncio.Task | None = None
-        # Включена ли индексация — БТ Библиотеки §5.1/§5.2. Отдельно от
-        # self.task: задача завершается сама после каждого прохода, и по ней
-        # нельзя отличить «прошли и ждём watcher'а» от «остановлено насовсем».
-        # Начальное значение — из конфига, чтобы поведение существующих
-        # установок не изменилось (autostart_indexing=True по умолчанию).
+        # Включена ли индексация (БТ Библиотеки §5.1/§5.2). По self.task не
+        # понять: задача завершается после каждого прохода, и «ждём watcher'а»
+        # не отличить от «остановлено».
         self.active: bool = cfg.autostart_indexing
         # Ровно один проход на процесс. Два потребителя одной очереди
         # заклинивают друг друга: iter(endless=False) проверяет пустоту до
@@ -180,13 +206,11 @@ class Index(AbstractAsyncContextManager):
         # Имена таблиц, которым нужен пересбор индексов.
         self._dirty_stores: set[str] = set()
         self._index_task: asyncio.Task | None = None
-        # Сколько файлов сейчас разбирает watcher (для честного /status)
+        # Сколько файлов сейчас разбирает watcher (для /status).
         self.watch_pending = 0
-        # Итоги последнего завершённого прохода. Без них /status обнуляет
-        # files_indexed и progress в тот же момент, когда снимается
-        # main_index, и клиент, дождавшийся конца индексации, читает
-        # «проиндексировано 0» (НТ 27.08: bulk_index_end indexed=0 на прогоне,
-        # где реально обработано 680 файлов).
+        # Итоги последнего завершённого прохода: без них /status обнулял бы
+        # files_indexed и progress вместе с main_index, и клиент, дождавшийся
+        # конца индексации, читал бы «проиндексировано 0».
         self.last_pass_total = 0
         self.last_pass_indexed = 0
         # Когда последний раз выполнялась компакция — по таблице отдельно
@@ -205,7 +229,7 @@ class Index(AbstractAsyncContextManager):
             reset=True,
         )
         # Вошли ли мы в exit_stack: сканер, созданный лениво после этого,
-        # надо регистрировать в стеке самостоятельно.
+        # надо открыть самостоятельно.
         self._entered = False
         # Поиск почтового корня — обход ~/.thunderbird. При выключенной почте
         # он не нужен; включение через API подхватит _ensure_emails_scanner.
@@ -228,11 +252,10 @@ class Index(AbstractAsyncContextManager):
     async def _ensure_emails_scanner(self) -> EmailsScanner | None:
         """Актуальный почтовый сканер: досоздать или пересоздать при смене корня.
 
-        Пересоздание нужно, потому что EmailsScanner фиксирует путь и список
-        папок в конструкторе. Без него смена `email.path_to_email_folder`
-        через API вступала бы в силу только после рестарта демона, а сканер,
-        не созданный из-за ещё не появившегося профиля Thunderbird, не
-        создавался бы уже никогда.
+        EmailsScanner фиксирует путь и список папок в конструкторе: без
+        пересоздания смена `email.path_to_email_folder` через API ждала бы
+        рестарта, а сканер, не созданный до появления профиля Thunderbird,
+        не появился бы никогда.
         """
         root = self.cfg.email_root
         if root is None:
@@ -245,20 +268,36 @@ class Index(AbstractAsyncContextManager):
                 self.emails_scanner.path,
                 root,
             )
-            # Сохраняем состояние старого сканера: exit_stack закроет его
-            # только на остановке демона, а offsets.json нужен уже сейчас.
+            # Почтовый этап идущего прохода читает очередь этого сканера —
+            # обрываем его, пока она открыта.
+            await self._stop_email_stage()
+            # Новый сканер читает offsets.json в конструкторе.
             self.emails_scanner._save_state()
-        self.emails_scanner = self._create_emails_scanner()
+        old, self.emails_scanner = self.emails_scanner, self._create_emails_scanner()
+        if old is not None:
+            # Очередь прежнего закрываем сразу, а не на остановке демона: новый
+            # открывает тот же каталог. Без __aexit__ — он записал бы
+            # offsets.json ещё раз, поверх сброса, если почту тем временем
+            # выключили.
+            await old.stack.aclose()
         if self.emails_scanner is not None and self._entered:
-            await self.exit_stack.enter_async_context(self.emails_scanner)
+            await self.emails_scanner.__aenter__()
         return self.emails_scanner
 
     async def __aenter__(self):
         self.exit_stack.enter_context(self.lsm_collection)
         await self.exit_stack.enter_async_context(self.files_scanner)
         if self.emails_scanner is not None:
-            await self.exit_stack.enter_async_context(self.emails_scanner)
+            await self.emails_scanner.__aenter__()
+        # Почтовый сканер стек закрывает по текущей ссылке, а не по записи на
+        # объект: при смене корня прежний закрывается сразу, и повторное
+        # закрытие на остановке переписало бы offsets.json его состоянием.
+        self.exit_stack.push_async_callback(self._close_emails_scanner)
         self._entered = True
+
+    async def _close_emails_scanner(self) -> None:
+        if self.emails_scanner is not None:
+            await self.emails_scanner.__aexit__(None, None, None)
 
     async def __aexit__(
         self,
@@ -266,10 +305,12 @@ class Index(AbstractAsyncContextManager):
         exc_value: BaseException | None,
         traceback,
     ) -> bool | None:
-        # Периодический проход мог быть поднят из activate(), а не из
-        # lifespan(): без этого задача переживает закрытие индекса и потом
-        # ходит в уже закрытые LSM и LanceDB.
+        # Фоновые задачи могли быть подняты из activate() или POST /config, а
+        # не из lifespan(): без этого они переживают закрытие индекса и потом
+        # ходят в уже закрытые LSM и LanceDB.
         await self.stop_periodic_rescan()
+        await self.stop_emails_polling()
+        await self._stop_index_refresh()
         try:
             await asyncio.wait_for(self.exit_stack.aclose(), 5)
         except TimeoutError:
@@ -326,38 +367,37 @@ class Index(AbstractAsyncContextManager):
                 await self.stop_periodic_rescan()
                 if self.task is not None:
                     self.task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await asyncio.wait_for(self.task, 5)
+                    await _await_stopped(self.task, "проход индексации", timeout=5)
 
     async def stop_index(self):
         if self.task is not None:
             self.task.cancel()
             # Воркер OCR — отдельный процесс: отмена задачи его не останавливает.
             ocr.kill_running()
-            with suppress(asyncio.CancelledError):
-                await self.task
-            # Вне suppress: внутри строка печаталась только когда задача НЕ
-            # была отменена, то есть ровно в тех прогонах, где останавливать
-            # было нечего. По логу это читалось как «остановка не дошла».
+            await _await_stopped(self.task, "проход индексации")
             lg.info("indexing stopped")
+        # Проход идёт и в периодическом проходе, и в поллинге почты: тот
+        # доигрывает вытесненный полный. Гасим их до clear(): живой проход
+        # обходит прежний список папок и дописал бы его в пересозданную
+        # очередь. Поллинг — последним: конец прохода поднимает его заново.
+        # Периодический проход поднимает обратно start_reindex().
+        await self.stop_periodic_rescan()
+        await self.stop_emails_polling()
         lg.info("clear index queue")
         await self.files_scanner.clear()
         lg.info("stop indexing")
-        await self.stop_emails_polling()
-        # Отмена задачи не отменяет уже отданную в LSM-поток работу: она
-        # доигрывает, пока вызывающая сторона считает, что всё остановлено.
-        # Ждём явно — дальше POST /config перезапускает индексацию, и её
-        # первый шаг снова идёт в ту же БД.
+        # Отмена задачи не отзывает работу, уже отданную в LSM-поток. Ждём её:
+        # следом POST /config перезапускает индексацию в ту же БД.
         await lsm_wait_idle()
 
     async def start_reindex(self):
         """Запустить проход. Идемпотентно: вторую задачу не плодит.
 
-        Прежде каждый вызов создавал новую задачу, и ссылка на предыдущую
-        терялась — stop_index() отменил бы только последнюю. Штатный путь
-        (POST /config) всегда зовёт stop_index() первым, поэтому его поведение
-        не меняется; защита нужна для /activate, который приходит когда угодно.
+        Иначе ссылка на прежнюю задачу терялась бы, и stop_index() отменил бы
+        только последнюю. Нужно для /activate, который приходит когда угодно.
         """
+        # stop_index() гасит и периодический проход — поднимаем его обратно.
+        await self.start_periodic_rescan()
         if self.task is not None and not self.task.done():
             lg.debug("индексация уже запущена, повторный старт пропущен")
             return
@@ -391,11 +431,9 @@ class Index(AbstractAsyncContextManager):
         was_active = self.active
         self.active = True
         await self.start_reindex()
-        # ТОЛЬКО если поллинг не жив: start_emails_polling внутри себя зовёт
-        # stop_emails_polling, и на повторной активации это оборвало бы идущий
-        # почтовый проход — ровно то, чего обещает не делать докстринг.
-        # immediate=True: после остановки ждать целый email_poll_interval
-        # (в поставке — час) до первых писем незачем.
+        # Только если поллинг не жив: start_emails_polling сначала гасит
+        # текущий и оборвал бы идущий почтовый проход. immediate=True — не
+        # ждать email_poll_interval (в поставке час) до первых писем.
         if self.emails_task is None or self.emails_task.done():
             await self.start_emails_polling(immediate=True)
         # Пересборка индексов, отложенная на момент деактивации.
@@ -448,8 +486,8 @@ class Index(AbstractAsyncContextManager):
         await self.stop_index()
         # До дропа таблиц: иначе отложенная пересборка проснётся уже без них.
         await self._stop_index_refresh(clear_dirty=True)
-        # И периодический проход — по той же причине: он проснулся бы уже
-        # после дропа и завёл бы таблицы обратно, отменив сброс.
+        # И периодический проход: проснувшись после дропа, он завёл бы
+        # таблицы обратно.
         await self.stop_periodic_rescan()
         # stop_index чистит только файловую очередь. clear() почтового сканера
         # снимает и очередь, и offsets.json, и позиции в памяти.
@@ -464,10 +502,13 @@ class Index(AbstractAsyncContextManager):
                 shutil.rmtree, root / "emails", ignore_errors=True
             )
             (root / "offsets.json").unlink(missing_ok=True)
-        # ПОРЯДОК ВАЖЕН: сначала LSM, потом таблицы. Обрыв посередине оставит
-        # «LSM пуст, таблицы полны» — следующий проход переиндексирует всё и
-        # вычистит старые чанки. Обратный порядок дал бы «таблицы пусты, LSM
-        # полон», где проход считает всё сделанным и индекс не восстановится.
+        # Кэш OCR — распознанный текст сканов, тоже данные индекса. Чистится
+        # после stop_index: убитый воркер к этому моменту уже сохранил своё.
+        await asyncio.to_thread(ocr.clear_cache, self.cfg.lsm_root)
+        # Сначала LSM, потом таблицы. Обрыв посередине оставит «LSM пуст,
+        # таблицы полны» — следующий проход переиндексирует всё и вычистит
+        # старые чанки. Обратный порядок дал бы «таблицы пусты, LSM полон»:
+        # проход сочтёт всё сделанным, и индекс не восстановится.
         await lsm_to_thread(self.lsm_collection.indexed.reset)
         # Дроп таблиц, а не удаление по фильтру: не остаётся ни deletion
         # vectors, ни партиций IVF-PQ с мёртвыми PQ-кодами.
@@ -520,6 +561,9 @@ class Index(AbstractAsyncContextManager):
                 # Компакция или исчезновение mbox: старые offset-ключи
                 # указывают на чужие байты. Сносим папку, scan() перечитает.
                 await self.delete_prefix(f"{EMAIL_PREFIX}{folder}:")
+                # Состояние — только после удаления: при сбое или отмене папка
+                # останется протухшей, и следующий проход повторит удаление.
+                self.emails_scanner.forget_folder(folder)
             await self.emails_scanner.scan()
         except Exception:
             # Почта не должна быть способна уронить индексацию файлов.
@@ -534,7 +578,7 @@ class Index(AbstractAsyncContextManager):
         """Снять с индекса всё, что лежит под этим префиксом пути.
 
         `starts_with`, а не `LIKE`: в LIKE `_` и `%` — подстановочные знаки,
-        и удаление `/home/u/a_b/` задевало бы `/home/u/aXb/`.
+        и удаление `/home/u/a_b/` задело бы `/home/u/aXb/`.
         """
         store = self.store_for(prefix)
         await self.lsm_collection.indexed.async_delete_prefix(prefix=prefix)
@@ -554,9 +598,9 @@ class Index(AbstractAsyncContextManager):
         if not pending:
             return 0
         lg.info("миграция: %s почтовых строк в таблице файлов", pending)
-        # Почтовая таблица сейчас либо пуста, либо содержит остаток прерванной
-        # миграции: авторитетная копия всё ещё в files. Дроп даёт идемпотентность.
-        await asyncio.to_thread(self.email_store.drop)
+        # Без дропа почтовой таблицы: в ней могут быть письма, записанные после
+        # прошлой неудачной миграции, — LSM их уже отметил, и заново они не
+        # придут. Остаток прерванного переноса move_rows_to заменяет сам.
         moved = await asyncio.to_thread(
             self.files_store.move_rows_to, self.email_store, EMAIL_ROWS_PREDICATE
         )
@@ -574,11 +618,10 @@ class Index(AbstractAsyncContextManager):
     async def migrate_fts_config(self) -> list[str]:
         """Пересобрать FTS-индексы, построенные не с параметрами `fts_cfg`.
 
-        Например, пресетом ru_stem, который терял слова длиннее 40 байт.
-        Пересобирается только FTS: `create_index` ещё компактирует таблицу и
-        дообучает вектор, а миграции это не нужно. Зовётся до первого прохода,
-        поэтому записи параллельно нет; при сбое остаётся старый индекс, поиск
-        по нему работает. Возвращает имена пересобранных таблиц.
+        Только FTS: `create_index` ещё компактирует таблицу и дообучает вектор,
+        а миграции это не нужно. Зовётся до первого прохода, поэтому записи
+        параллельно нет; при сбое остаётся рабочий старый индекс. Возвращает
+        имена пересобранных таблиц.
         """
         rebuilt = []
         loop = asyncio.get_running_loop()
@@ -620,21 +663,19 @@ class Index(AbstractAsyncContextManager):
         """Дописать карточки документам, проиндексированным до их появления.
 
         Карточку пишет разбор файла (document_chunks), а неизменённый файл
-        проход заново не разбирает: решает только size/mtime в LSM. Без этой
-        миграции индекс, собранный до карточек (1.0.8), так и оставался без
-        них — поиск по имени и свойствам и отметка "card" работали лишь для
-        новых и изменённых файлов, а сброса индекса никто не требовал.
+        проход заново не разбирает (решает size/mtime в LSM), и без миграции
+        старый индекс остался бы без карточек. Переразбирать не нужно:
+        карточка собирается из meta первого чанка, считаем только её вектор.
+        Признак «мигрировать нечего» — карточка есть у каждого документа,
+        поэтому прерванная миграция доделается следующим проходом. Только
+        таблица файлов: у тела письма карточки нет.
 
-        Переразбирать файлы не нужно: карточка собирается из meta, и та уже
-        в индексе — у первого чанка документа. Считаем только вектор карточки.
-        Признак «мигрировать нечего» — у каждого документа есть карточка, так
-        что прерванная миграция просто доделается следующим проходом.
-        Только таблица файлов: почта выключена, а у тела письма карточки нет.
-
-        Зовётся из прохода индексации, до его записи. Watcher параллельно
-        писать может: файл, переписанный между чтением и записью миграции,
-        получит вторую карточку — вреда в этом нет, выдача собирает строки
-        по пути, а следующее изменение файла снесёт обе.
+        Зовётся из прохода до его записи. Файл, переписанный watcher'ом между
+        чтением и записью миграции, получит вторую карточку — безвредно:
+        выдача собирает строки по пути, а следующее изменение снесёт обе.
+        Векторы карточек считаются минутами, и watcher успевает снять с
+        индекса удалённый за это время файл. Его карточку миграция убирает
+        сама: сверка удалённых ходит по ключам LSM и такую строку не найдёт.
         """
         store = self.files_store
         if not store.has_table:
@@ -686,6 +727,21 @@ class Index(AbstractAsyncContextManager):
             for row in rows:
                 yield row
 
+        def _quoted(paths) -> str:
+            return ", ".join(f"'{sql_quote(p)}'" for p in paths)
+
+        def _orphans(paths: set[str]) -> list[str]:
+            """Пути без чанков: файл сняли с индекса, пока считались векторы."""
+            alive = (
+                store.table.search()
+                .where(f"idx = 0 AND path IN ({_quoted(paths)})")
+                .select(["path"])
+                .to_arrow()
+                .column("path")
+                .to_pylist()
+            )
+            return sorted(paths - set(alive))
+
         batches = async_embed_documents_into_batches(
             _cards(),
             embedder=partial(
@@ -693,27 +749,41 @@ class Index(AbstractAsyncContextManager):
             ),
             batch_size=self.cfg.embed_model_cfg.batch_size,
         )
+        dropped = 0
         async for batch in async_merge_batches(
             batches, target_size=self.cfg.parquet_record_batch_size
         ):
             await store.add_batch(batch)
+            # Проверка после записи, а не до неё: удаление, пришедшее позже,
+            # снимет карточку вместе с остальными строками пути.
+            paths = set(batch.column("path").to_pylist())
+            if orphans := await asyncio.to_thread(_orphans, paths):
+                await store.delete_where(
+                    f"kind = '{CARD_KIND}' AND path IN ({_quoted(orphans)})"
+                )
+                dropped += len(orphans)
         # Иначе карточки до следующего прохода живут вне FTS и вектора.
         await self.create_index(store)
         lg.info("миграция: карточки дописаны за %.1f с", time.monotonic() - started)
-        return len(rows)
+        return len(rows) - dropped
 
     async def drop_email_index(self) -> None:
         """Убрать почту из поиска целиком — вместе с очередью и состоянием.
 
-        Дроп таблицы, а не удаление по фильтру: не остаётся ни deletion
-        vectors, ни партиций IVF-PQ с мёртвыми PQ-кодами.
+        Дроп таблицы, а не удаление по фильтру — как в reset_index.
         """
+        # Как clear_dirty в reset_index: иначе отложенная пересборка раз в
+        # index_refresh_delay падала бы на удалённой таблице.
+        self._dirty_stores.discard(self.email_store.table_name)
+        # stop_emails_polling() гасит только поллинг, а почтовый этап мог идти
+        # внутри полного или периодического прохода: живой, он дописал бы
+        # письма в пересозданную таблицу, а позиции папок — в сброшенный
+        # offsets.json.
+        await self._stop_email_stage()
         if self.emails_scanner is None and not self.email_store.has_table:
-            # Сбрасывать нечего: почту не включали, таблицы нет. Выходим до
-            # обращения к LSM и Lance — клиенты шлют конфиг целиком, то есть
-            # с email.enabled=false на КАЖДЫЙ POST /config, и без этой
-            # проверки каждое обновление папок тянуло за собой обход всей
-            # таблицы состояния и дроп несуществующей таблицы.
+            # Выходим до обращения к LSM и Lance: клиенты шлют конфиг целиком,
+            # с email.enabled=false на каждый POST /config, и иначе каждое
+            # обновление папок обходило бы всю таблицу состояния.
             lg.debug("почтовый индекс уже пуст, сбрасывать нечего")
             return
         if self.emails_scanner is not None:
@@ -743,33 +813,49 @@ class Index(AbstractAsyncContextManager):
                 await self.lsm_collection.indexed.async_delete(path)
 
     @staticmethod
-    def _filter_stale(paths: list[str]) -> list[str]:
-        """Из снимка ключей LSM оставить те, которых больше нет на диске.
+    def _filter_stale(
+        paths: list[str],
+        filter_meta: typing.Callable[[FileMetadata], bool] | None = None,
+    ) -> list[str]:
+        """Из снимка ключей LSM оставить те, которых больше нет на диске или
+        которые не проходят filter_meta (файл вырос сверх max_size).
 
-        Снимок берётся отдельно, на LSM-потоке: тысячи `os.path.exists` —
-        это тысячи syscall'ов, и держать на них блокировку таблицы нельзя.
+        Снимок берётся отдельно, на LSM-потоке: тысячи `os.stat` — это тысячи
+        syscall'ов, и держать на них блокировку таблицы нельзя.
         """
-        return [
-            path
-            for path in paths
-            # у писем нет файла на диске — их состояние живёт своей жизнью
-            if not is_email_path(path) and not os.path.exists(path)
-        ]
+        stale = []
+        for path in paths:
+            if is_email_path(path):  # у писем нет файла на диске
+                continue
+            try:
+                st = os.stat(path)
+            except (OSError, ValueError):  # как os.path.exists
+                stale.append(path)
+                continue
+            # Обход и watcher такой файл отсеивают до очереди, и прежние
+            # строки, кроме сверки, снять некому.
+            meta = FileMetadata(
+                path=path, size=st.st_size, mtime_seconds=int(st.st_mtime)
+            )
+            if filter_meta is not None and not filter_meta(meta):
+                stale.append(path)
+        return stale
 
     async def reconcile_deleted(self) -> int:
-        """Снять с индекса файлы, которых больше нет на диске.
+        """Снять с индекса файлы, которых больше нет на диске или которые
+        больше не индексируются (выросли сверх max_size).
 
-        Realtime-событий watcher'а недостаточно: файл могли удалить при
-        выключенном демоне, событие могло потеряться при переполнении очереди,
-        а перемещение каталога приходит одним rename. Полный проход такие
-        записи не замечает — он умеет только добавлять, — поэтому без сверки
-        удалённый файл продолжает находиться поиском сколько угодно долго.
+        Событий watcher'а недостаточно: файл могли удалить при выключенном
+        демоне, событие могло потеряться при переполнении очереди, а
+        перемещение каталога приходит одним rename. Полный проход умеет только
+        добавлять, и без сверки удалённый файл так и находился бы поиском.
         """
-        # Именно lsm_to_thread, а не asyncio.to_thread: обращаться к lsm_db
-        # можно только из выделенного потока (см. src/utils/lsm_adapter.py).
-        # Через дефолтный пул этот обход шёл параллельно записям в ту же БД.
+        # lsm_to_thread, а не asyncio.to_thread: к lsm_db можно обращаться
+        # только из выделенного потока (src/utils/lsm_adapter.py).
         indexed_paths = await lsm_to_thread(self.lsm_collection.indexed.keys_snapshot)
-        stale = await asyncio.to_thread(self._filter_stale, indexed_paths)
+        stale = await asyncio.to_thread(
+            self._filter_stale, indexed_paths, self.cfg.file_scan_cfg.filter_meta
+        )
         if not stale:
             lg.debug("reconcile: nothing to remove")
             return 0
@@ -807,21 +893,14 @@ class Index(AbstractAsyncContextManager):
             # Не ждём в очереди: поллинг почты повторит через
             # email_poll_interval, а POST /config сначала зовёт stop_index().
             if not emails_only:
-                # А вот полный проход повторять некому. POST /activate
-                # поднимает файловый и почтовый проходы одновременно, и тот,
-                # кто не успел взять лок, раньше терялся молча: активация не
-                # индексировала ни одного файла до следующего события
-                # watcher'а. Запоминаем и доигрываем на выходе из лока.
+                # Полный проход повторить некому (POST /activate поднимает
+                # файловый и почтовый разом): доигрываем на выходе из лока.
                 self._rescan_requested = True
             lg.debug("проход индексации уже идёт, пропускаем запуск")
             return
         async with self._scan_lock:
-            # Падение текущего прохода не должно съедать отложенный.
-            # scan_all обёрнут @wrap_exception_logger, а тот ПРОБРАСЫВАЕТ
-            # исключение — до цикла доигрывания управление просто не доходило,
-            # и запрошенный полный проход терялся до следующего вызова.
-            # Исходную ошибку сохраняем и поднимаем после доигрывания, чтобы
-            # она не исчезла из виду.
+            # Падение прохода не должно съедать отложенный: ошибку запоминаем
+            # и поднимаем после доигрывания.
             error: Exception | None = None
             try:
                 await self._scan_all(emails_only=emails_only)
@@ -875,11 +954,41 @@ class Index(AbstractAsyncContextManager):
                 self._preindex_files, self.files_scanner, self.files_store
             )
         if self.cfg.email_enabled and self.emails_scanner is not None:
-            await self._run_pass(
-                self._preindex_emails, self.emails_scanner, self.email_store
-            )
+            await self._run_email_stage()
         if self.emails_task is None:
             await self.start_emails_polling()
+
+    async def _run_email_stage(self) -> None:
+        """Почтовый этап прохода — отдельной задачей.
+
+        Этап идёт внутри любого прохода (полного, периодического, поллинга), а
+        выключение почты и смена корня обрывают именно его (_stop_email_stage),
+        не трогая сам проход.
+        """
+        stage = asyncio.create_task(
+            self._run_pass(self._preindex_emails, self.emails_scanner, self.email_store)
+        )
+        self._email_stage = stage
+        try:
+            await stage
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is None or current.cancelling():
+                # Отменяют сам проход (stop_index), а не только этап.
+                raise
+            # Хвост очереди писем остался в счётчике: без сброса /status
+            # рапортовал бы «индексация идёт» до следующего прохода.
+            self.counter.reset()
+            lg.info("почтовый этап прохода прерван")
+        finally:
+            self._email_stage = None
+
+    async def _stop_email_stage(self) -> None:
+        """Оборвать почтовый этап идущего прохода и дождаться его."""
+        stage = self._email_stage
+        if stage is not None and not stage.done():
+            stage.cancel()
+            await _await_stopped(stage, "почтовый этап прохода")
 
     async def _run_pass(self, collect, scanner, store: LanceWrapper) -> None:
         """Один проход: собрать очередь источника и записать её в свою таблицу."""
@@ -892,25 +1001,23 @@ class Index(AbstractAsyncContextManager):
         lg.info("collected %s items, start indexing into %s", total, store.table_name)
         self.main_index = True
         started = time.monotonic()
-        # Генератор держим в переменной, чтобы закрыть его явно. При отмене
-        # задачи (её делает POST /config) он иначе остаётся подвешенным на
-        # yield и финализируется когда-нибудь потом — уже после clear(),
-        # когда scanner.queue указывает на НОВУЮ очередь. Его task_done()
-        # уходил бы не в ту очередь: «task_done() called too many times»
-        # либо порча счётчика unfinished_tasks.
+        # Генератор закрываем явно: при отмене (POST /config) он висел бы на
+        # yield и финализировался после clear(), отправляя task_done() уже в
+        # НОВУЮ очередь («task_done() called too many times» или порча
+        # unfinished_tasks).
         stream = scanner.iter(endless=False)
         try:
             lg.info("begin indexing")
-            self.counter.clear_cache()  # очищаем кеш потому что дальше будем вычитать из счетчика
+            # Дальше счётчик вычитает: файлы, оставшиеся в seen, не вычлись бы.
+            self.counter.clear_cache()
             # Обновляем индексы и во время прохода: иначе на холодном скане
             # свежие строки до самого конца вне индексов, и поиск идёт перебором.
             await self.ensure_index(store)
             await self.process_stream(stream, store=store)
         finally:
-            # CancelledError — не Exception, а BaseException: без него отмена
-            # прохода (её делает stop_index, то есть POST /config и
-            # /deactivate) вылетала бы из finally прямо здесь, и main_index
-            # оставался бы взведённым навсегда — /status вечно «индексирую».
+            # CancelledError — BaseException: без него отмена прохода
+            # (stop_index) вылетала бы отсюда, и main_index остался бы
+            # взведённым навсегда.
             with suppress(Exception, asyncio.CancelledError):
                 await stream.aclose()
             # Итоги прохода запоминаем ДО обнуления preindex_cnt.
@@ -940,9 +1047,8 @@ class Index(AbstractAsyncContextManager):
         """
         if self.cfg.email_enabled:
             if await self._ensure_emails_scanner() is None:
-                # Корня может ещё не быть — Thunderbird не завершил первую
-                # синхронизацию. Это не повод сдаваться навсегда: цикл
-                # поллинга сам повторит попытку через email_poll_interval.
+                # Корня может ещё не быть (Thunderbird не закончил первую
+                # синхронизацию): цикл поллинга повторит попытку сам.
                 lg.warning(
                     "почта включена, но почтовый корень не найден — "
                     "повторим попытку через %s c",
@@ -957,8 +1063,7 @@ class Index(AbstractAsyncContextManager):
         if self.emails_task is not None:
             if not self.emails_task.done():
                 self.emails_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self.emails_task
+            await _await_stopped(self.emails_task, "поллинг почты")
             lg.info("email polling stopped")
             self.emails_task = None
 
@@ -978,26 +1083,21 @@ class Index(AbstractAsyncContextManager):
         if self.rescan_task is not None:
             if not self.rescan_task.done():
                 self.rescan_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self.rescan_task
+            await _await_stopped(self.rescan_task, "периодический полный проход")
             lg.info("периодический полный проход остановлен")
             self.rescan_task = None
 
     async def run_periodic_rescan(self) -> None:
-        """Полный проход по расписанию — то, чего не даёт наблюдение за ФС.
+        """Полный проход по расписанию — страховка от пропущенных событий ФС.
 
-        Событий файловой системы недостаточно по трём независимым причинам:
-        они отбрасываются при переполнении очереди (см. WatchDogAdapter._emit,
-        комментарий там прямо ссылается на периодическое сканирование),
-        не приходят вовсе для каталогов, ставших читаемыми, и оставляют
-        осиротевшие пути после перемещений. scan_all внутри зовёт
-        reconcile_deleted, поэтому проход заодно снимает с индекса то, чего
-        больше нет на диске.
+        События теряются при переполнении очереди (WatchDogAdapter._emit), не
+        приходят для каталогов, ставших читаемыми, и оставляют осиротевшие
+        пути после перемещений. scan_all внутри зовёт reconcile_deleted и
+        заодно снимает с индекса удалённое.
 
-        Запускается ТОЛЬКО в простое. Условие простоя — то же, что у
-        компакции (_maybe_compact): полный обход домашнего каталога идёт
-        часами, и начинать его поверх работающей индексации значит удвоить
-        нагрузку ровно тогда, когда она и так высокая.
+        Запускается только в простое, как компакция (_maybe_compact): полный
+        обход домашнего каталога идёт часами, и поверх работающей индексации
+        удвоил бы нагрузку.
         """
         interval = self.cfg.full_rescan_interval
         while True:
@@ -1036,7 +1136,19 @@ class Index(AbstractAsyncContextManager):
                 status = await self.status()
                 if status.type not in {"preindex", "index"}:
                     lg.debug("begin polling emails")
-                    await self.scan_all(emails_only=True)
+                    try:
+                        await self.scan_all(emails_only=True)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # Как в run_periodic_rescan: поллинг живёт весь срок
+                        # демона, и поднять его заново после сбоя прохода
+                        # некому. Стек сбоя scan_all уже записал.
+                        lg.warning(
+                            "почтовый проход не удался (%r), повторим через %s c",
+                            exc,
+                            cfg.email_poll_interval,
+                        )
             lg.debug(f"waiting for {cfg.email_poll_interval=} to poll emails")
             await asyncio.sleep(cfg.email_poll_interval)
 
@@ -1050,11 +1162,11 @@ class Index(AbstractAsyncContextManager):
             files_to_index=pending,
             queued_files=self.queued_files if pending else 0,
             queued_emails=self.queued_emails if pending else 0,
-            # В простое отдаём итоги последнего прохода, а не нули: клиент,
-            # дождавшийся is_indexing=false, иначе читает «собрано 0».
+            # Здесь и ниже в простое — итоги последнего прохода, а не нули
+            # (см. last_pass_total).
             total_files=self.preindex_cnt if self.main_index else self.last_pass_total,
             # Сбор очереди — тоже работа: обход mbox идёт минутами при нулевом
-            # counter, и без preindex статус врал бы «простаиваю».
+            # counter, и без preindex статус показывал бы простой.
             is_indexing=pending > 0 or self.preindex or self.main_index,
             type="index"
             if self.main_index
@@ -1063,9 +1175,6 @@ class Index(AbstractAsyncContextManager):
             else "update"
             if pending > 0
             else "idle",
-            # Во время прохода — текущий прогресс, после него — результат
-            # последнего прохода. Ноль в простое означал бы «ничего не
-            # проиндексировано», хотя проход только что завершился успешно.
             progress=(1 - (pending / self.preindex_cnt))
             if self.main_index and self.preindex_cnt
             else (1.0 if self.last_pass_total else 0.0),
@@ -1096,17 +1205,14 @@ class Index(AbstractAsyncContextManager):
             if force_fts or not store.fts_created:
                 lg.info("building fts index on %s", store.table_name)
                 store.create_fts(force=force_fts)
-            # Без сторожа по vector_created: метод сам решает, надо ли строить.
-            # Сторож замораживал num_partitions на размере первой сборки.
+            # Без проверки vector_created: метод сам решает, строить ли, а
+            # проверка заморозила бы num_partitions на размере первой сборки.
             store.create_vector_index(force=force_vector)
             # Дёшево и всегда: иначе свежие файлы остаются вне индексов и
             # каждый поиск досматривает их полным перебором.
             store.optimize_indices()
             self._maybe_compact(store)
 
-        # Строим индекс в ОТДЕЛЬНОМ потоке, а не в общем пуле: иначе долгая
-        # перестройка занимает все воркеры, и поисковые запросы, которые тоже
-        # ходят через asyncio.to_thread, висят в очереди до таймаута.
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(_INDEX_BUILD_EXECUTOR, _create)
 
@@ -1157,8 +1263,7 @@ class Index(AbstractAsyncContextManager):
 
     async def _refresh_index_loop(self):
         while True:
-            # Даём накопиться изменениям, чтобы не пересобирать индекс
-            # на каждый чих файловой системы.
+            # Копим изменения, чтобы не пересобирать индекс на каждое событие ФС.
             await asyncio.sleep(self.cfg.index_refresh_delay)
             if not self._dirty_stores:
                 return
@@ -1201,7 +1306,6 @@ class Index(AbstractAsyncContextManager):
         store = store or self.files_store
 
         if not inspect.isasyncgen(batch):
-            # преобразуемм в асинхронный генератор
             def _gen() -> Iterable[FileMetadata]:
                 for b in batch:  # type: ignore
                     yield b
@@ -1210,12 +1314,10 @@ class Index(AbstractAsyncContextManager):
         else:
             wrapped: AsyncGenerator[FileMetadata, Any] = batch
 
-        # Пути, уже взятые в этот проход. Очередь переживает прерванный проход
-        # (сбой, нехватка места; почтовая — ещё и рестарт), и следующий
-        # preindex кладёт тот же путь ещё раз. Повтор отбрасываем до
-        # разбора — тогда чанки пути приходят в проход одним непрерывным
-        # куском, и чистка перед первой записью пути (ниже) не может задеть
-        # строки, записанные этим же проходом. Файл, изменившийся между
+        # Пути, уже взятые в этот проход. Очередь переживает прерванный проход,
+        # и следующий сбор кладёт тот же путь повторно. Повтор отбрасываем до
+        # разбора: чанки пути идут одним куском, и чистка перед первой записью
+        # пути не заденет строк этого же прохода. Файл, изменившийся между
         # постановками, не теряется: в LSM ляжет meta первой постановки, и
         # следующий проход увидит расхождение с диском.
         taken: set[str] = set()
@@ -1227,7 +1329,10 @@ class Index(AbstractAsyncContextManager):
                 if meta.path in taken:
                     lg.debug("skip %s: already queued in this pass", meta.path)
                     if count:
-                        self.counter.count(meta, mode="sub")
+                        # Безусловно, а не count(): тот дедуплицирует по meta,
+                        # и повтор с той же meta не вычелся бы — /status до
+                        # следующего прохода показывал бы «индексация идёт».
+                        self.counter.update(-1)
                     continue
                 taken.add(meta.path)
                 yield meta
@@ -1249,13 +1354,9 @@ class Index(AbstractAsyncContextManager):
                 meta = b.get("file_meta")
                 if meta is None:
                     continue
-                # Прежде здесь в processed попадал КАЖДЫЙ файл батча, и после
-                # первой же записи он считался проиндексированным. Файл, чанки
-                # которого попали в два батча записи, помечался готовым после
-                # первого: обрыв между батчами оставлял в индексе половину
-                # файла с отметкой «сделан», и полный проход к нему больше не
-                # возвращался. Отмечаем только после появления чанка
-                # следующего файла — тогда все чанки предыдущего уже записаны.
+                # Дочитанным файл считаем только по чанку следующего файла:
+                # его чанки могут лечь в два батча записи, и отметка после
+                # первого при обрыве оставила бы в индексе половину файла.
                 if pending_meta is not None and meta != pending_meta:
                     processed.add(pending_meta)
                 pending_meta = meta
@@ -1267,11 +1368,35 @@ class Index(AbstractAsyncContextManager):
                 # Файл разобран, но текста в нём нет — помечаем обработанным,
                 # чтобы не возвращаться. При ошибке разбора (permanent=False)
                 # помечать нельзя: файл выпал бы из индексации навсегда.
-                await self.lsm_collection.indexed.async_set(meta.path, meta)
+                if await _drop_previous_version(meta.path):
+                    await self.lsm_collection.indexed.async_set(meta.path, meta)
             else:
                 failed.add(meta.path)
             if count:
                 self.counter.count(meta, mode="sub")
+
+        async def _drop_previous_version(path: str) -> bool:
+            """Снять строки прежней версии файла, разобранного без текста.
+
+            Чистка в цикле записи видит только пути из батча, а у такого файла
+            батча нет: пустой, битый или зашифрованный файл искался бы по
+            старому тексту, а отметка в LSM не пустила бы проход к нему снова.
+            False — снять не удалось, отмечать файл нельзя.
+            """
+            # Письмо по своему ключу не меняется, а удаление по префиксу
+            # задело бы тело, уже записанное в этом проходе.
+            if is_email_path(path):
+                return True
+            # Строки есть только у пути, который уже индексировали: новый
+            # пустой файл не стоит холостого коммита.
+            if not await self.lsm_collection.indexed.async_is_in(path):
+                return True
+            try:
+                await store.delete_where(f"path = '{sql_quote(path)}'")
+            except Exception:
+                lg.exception("failed to drop previous chunks of %s", path)
+                return False
+            return True
 
         chunks = async_embed_documents_into_batches(
             async_parse_files(
@@ -1287,16 +1412,16 @@ class Index(AbstractAsyncContextManager):
         )
         # Пути, для которых уже удалили прежние чанки в этом проходе.
         purged: set[str] = set()
-        # Порог 1 ГиБ проверяется один раз перед проходом (_scan_all), а сам
-        # проход по домашнему каталогу идёт часами — за это время диск успевает
-        # кончиться. Проверяем и по ходу, но не на каждый батч: disk_usage —
-        # системный вызов, а батчей на большом корпусе тысячи.
+        # Место проверяем и по ходу (раз в _DISK_CHECK_EVERY_BATCHES батчей):
+        # проход по домашнему каталогу идёт часами, и диск успевает кончиться.
         batches_written = 0
         # Проход оборван по месту: хвост последнего файла мог не дойти до записи.
         interrupted = False
-        # На пустой таблице чистить нечего: прежних чанков нет, а повтор пути
-        # в проход не попадает (_once_per_path). Иначе на холодном скане шёл
-        # бы холостой DELETE на каждый батч — тысячи лишних коммитов.
+        # На пустой таблице прежних чанков нет, а повтор пути в проход не
+        # попадает (_once_per_path). Строки там могут быть только у файлов,
+        # которые за время прохода записал watcher, — их он отметил в LSM,
+        # и чистим только их. Иначе на холодном скане шёл бы холостой DELETE
+        # на каждый батч — тысячи лишних коммитов.
         try:
             table_was_empty = await store.count_rows() == 0
         except Exception:
@@ -1305,15 +1430,17 @@ class Index(AbstractAsyncContextManager):
             chunks, target_size=self.cfg.parquet_record_batch_size
         ):
             # Прежние чанки пути чистим один раз — перед его первой вставкой
-            # в этом проходе, иначе в индексе останется старое содержимое
-            # файла. Повторно — нельзя: файл длиннее батча записи продолжается
-            # в следующем батче, и чистка снесла бы его записанное начало.
-            # Отметка «дочитан» тут не помощник: колбэк ставит её, едва
-            # эмбеддер увидел чанк следующего файла, то есть в том же батче
-            # записи, где лежит хвост дочитанного (замер 2026-09-26: из
-            # 30 777 чанков в таблице оставалось 14 281).
-            if not table_was_empty:
-                await self._purge_stale_chunks(_batch, purged, store)
+            # в этом проходе. Повторно нельзя: файл длиннее батча продолжается
+            # в следующем, и чистка снесла бы записанное начало. Отметка
+            # «дочитан» для этого не годится: колбэк ставит её в том же батче
+            # записи, где лежит хвост файла.
+            # Путь, чистка которого не удалась, в LSM не отмечаем: иначе
+            # прежняя версия лежала бы рядом с новой до следующего изменения.
+            failed.update(
+                await self._purge_stale_chunks(
+                    _batch, purged, store, known_only=table_was_empty
+                )
+            )
             await store.add_batch(_batch)
             # Отмечаем файл проиндексированным только ПОСЛЕ успешной записи:
             # иначе упавшая вставка навсегда выкинет его из индексации.
@@ -1343,11 +1470,9 @@ class Index(AbstractAsyncContextManager):
                     )
                     interrupted = True
                     break
-        # Последний файл потока: чанка следующего файла не будет, а цикл выше
-        # дочитал поток до конца — значит всё, что он дал, уже записано. После
-        # обрыва по месту так сказать нельзя: оставшиеся чанки файла ещё в
-        # конвейере. Прежде его отмечали и тогда, и файл навсегда оставался
-        # в индексе наполовину; теперь следующий проход перепишет его целиком.
+        # Последний файл потока: чанка следующего файла не будет, а поток
+        # дочитан до конца — значит, файл записан. После обрыва по месту его
+        # чанки ещё в конвейере: не отмечаем, следующий проход перепишет файл.
         if (
             pending_meta is not None
             and not interrupted
@@ -1358,26 +1483,42 @@ class Index(AbstractAsyncContextManager):
             )
 
     async def _purge_stale_chunks(
-        self, batch, purged: set[str], store: LanceWrapper
-    ) -> None:
+        self,
+        batch,
+        purged: set[str],
+        store: LanceWrapper,
+        known_only: bool = False,
+    ) -> set[str]:
         """Удалить прежние чанки для путей, впервые встреченных в этом проходе.
 
         Удаление идёт одним фильтром на батч, а не запросом на путь: каждый
         `delete` — отдельная транзакция с новой версией таблицы.
+
+        known_only — только пути, уже отмеченные в LSM (холодная таблица, см.
+        process_stream). Возвращает пути, прежние чанки которых снять не
+        удалось.
         """
         try:
             paths = {p for p in batch.column("path").to_pylist() if p}
         except Exception:
-            return
+            return set()
         fresh = sorted(paths - purged)
         if not fresh:
-            return
+            return set()
         purged.update(fresh)
+        if known_only:
+            indexed = self.lsm_collection.indexed
+            known = await lsm_to_thread(lambda: [p for p in fresh if indexed.is_in(p)])
+            if not known:
+                return set()
+            fresh = known
         predicate = "path IN ({})".format(", ".join(f"'{sql_quote(p)}'" for p in fresh))
         try:
             await store.delete_where(predicate)
         except Exception:
             lg.exception("failed to purge stale chunks for %s path(s)", len(fresh))
+            return set(fresh)
+        return set()
 
     def _pin_name_codes(
         self,
@@ -1390,19 +1531,15 @@ class Index(AbstractAsyncContextManager):
     ) -> "pl.DataFrame | None":
         """Найти документы по коду из имени и дочитать тех, кого нет в пуле.
 
-        Сбой здесь поиск не роняет: код из имени — надбавка к выдаче, и без
-        неё ответ остаётся тем же, что был до неё.
+        Сбой поиск не роняет: код из имени — лишь надбавка к выдаче.
 
-        where — фильтр поиска. Пул уже отфильтрован, а дочитывание идёт с тем
-        же условием, поэтому закрепляются только пути, чьи строки есть в
-        кадре: файл по коду, не прошедший фильтр, в выдачу не попадает.
+        where — фильтр поиска: пул уже отфильтрован, дочитывание идёт с тем же
+        условием, поэтому закрепляются только пути со строками в кадре.
         Словарь имён фильтра не знает — «1–3 файла на код» считается по всей
         таблице.
 
-        Дочитываются и документы, от которых в пуле одна карточка: для
-        «найди файл …» это обычный случай (запрос совпал с именем), и без
-        дочитывания такой документ шёл первым без единого фрагмента, тогда
-        как документ вне пула получал первые чанки.
+        Дочитываются и документы, от которых в пуле одна карточка (обычно для
+        «найди файл …»): иначе такой документ шёл бы первым без фрагментов.
         """
         try:
             index = self._name_indexes.setdefault(store.table_name, NameIndex())
@@ -1448,24 +1585,19 @@ class Index(AbstractAsyncContextManager):
     ) -> "list[pl.DataFrame | None]":
         """Искать в каждом запрошенном источнике отдельно, со своим top_k.
 
-        top_k — число ДОКУМЕНТОВ на источник, а не чанков: из таблицы берётся
-        пул чанков `search_pool(top_k)` на канал, а документы из него собирает
-        SearchResponse.from_dataframes. `.limit()` работает по таблице, поэтому
-        общий запрос отдавал бы почте места файлов. Возвращаем кадр на
-        источник, а не склейку: схемы расходятся, если по одной из таблиц
-        гибридный поиск деградировал до векторного.
+        top_k — число ДОКУМЕНТОВ на источник: из таблицы берётся пул
+        `search_pool(top_k)` чанков на канал, документы из него собирает
+        SearchResponse.from_dataframes. `.limit()` работает по таблице, и общий
+        запрос отдавал бы почте места файлов. Кадр на источник, а не склейка:
+        схемы расходятся, если в одной из таблиц гибрид откатился на вектор.
 
-        pinned — список, в который дописываются пути документов, найденных по
-        коду из имени файла (src/indexer/name_codes.py); их строки, если в
-        пуле их нет, дочитываются в кадр источника. Выдача ставит эти
-        документы первыми (SearchResponse.from_dataframes, тот же параметр).
-        None — код из имени не ищется вовсе.
+        pinned — сюда дописываются пути документов, найденных по коду из имени
+        (name_codes.py); их строки дочитываются в кадр, если их нет в пуле, и
+        выдача ставит эти документы первыми. None — код из имени не ищется.
 
-        where — фильтр по метаданным (SearchFilters.where в
-        src/server/model.py). Prefilter: условие отбирает строки ДО пула, а
-        не режет готовый пул — иначе под фильтром оставались бы крохи пула.
-        Действует во всех каналах, в откате гибрида на вектор и в
-        дочитывании файла по коду из имени.
+        where — фильтр по метаданным (SearchFilters.where), prefilter: отбирает
+        строки ДО пула, иначе под фильтром оставались бы крохи пула. Действует
+        во всех каналах, в откате гибрида на вектор и в дочитывании по коду.
         """
         codes = query_codes(query) if pinned is not None else []
         vec = (await self.cfg.ov_model.async_encode([query], role="search"))[0]
@@ -1474,11 +1606,9 @@ class Index(AbstractAsyncContextManager):
             for source in dict.fromkeys(sources)
         ]
         pool = search_pool(top_k)
-        # Запрос в FTS — готовым MatchQuery, а не строкой. Строку LanceDB
-        # разбирает как синтаксис запроса: целиком в кавычках она становится
-        # фразой, а индекс построен без позиций (src/common/fts.py), и поиск
-        # падает — гибрид молча уходил в чистый вектор, text отдавал 500.
-        # На остальных запросах выдача та же (стенд: топ-50 совпал в 200 из 200).
+        # FTS-запрос — готовым MatchQuery, а не строкой: строку в кавычках
+        # LanceDB разбирает как фразу, а индекс построен без позиций
+        # (src/common/fts.py) — гибрид падал бы в вектор, text отдавал бы 500.
         fts_query = MatchQuery(query, "text")
 
         def _filtered(builder):
@@ -1491,14 +1621,10 @@ class Index(AbstractAsyncContextManager):
             builder = builder.refine_factor(VECTOR_REFINE_FACTOR)
             if where is None:
                 return builder.nprobes(VECTOR_NPROBES)
-            # nprobes(n) ставит и минимум, и МАКСИМУМ разделов: с узким
-            # фильтром (автор, папка) строки под ним лежат в немногих
-            # разделах, и если среди VECTOR_NPROBES ближайших к запросу их
-            # нет, векторный канал отдаёт пусто — хотя prefilter обещает
-            # выдачу из всего, что под фильтр подходит. maximum_nprobes(0)
-            # разрешает LanceDB досматривать разделы, пока пул не наберётся.
-            # Замер (70 тыс. строк, 256 разделов, фильтр на 20 строк): 0 из 20
-            # → 20 из 20.
+            # nprobes(n) ставит и минимум, и МАКСИМУМ разделов: строки под
+            # узким фильтром (автор, папка) могут не попасть в VECTOR_NPROBES
+            # ближайших разделов, и канал отдал бы пусто. maximum_nprobes(0)
+            # даёт LanceDB досматривать разделы, пока пул не наберётся.
             return builder.minimum_nprobes(VECTOR_NPROBES).maximum_nprobes(0)
 
         def _vector_search(table):
@@ -1524,15 +1650,12 @@ class Index(AbstractAsyncContextManager):
                         _probed(
                             _filtered(
                                 table.search(
-                                    # vec,
                                     query_type="hybrid",
                                     vector_column_name="vector",
-                                    # FTS-часть — только по тексту чанка.
-                                    # Строковый запрос гибрида без колонок
-                                    # LanceDB ищет по ВСЕМ полям с
-                                    # FTS-индексом: появись второй индекс
-                                    # (заголовок, раздел), он молча вошёл бы
-                                    # в RRF.
+                                    # FTS — только по тексту чанка: без
+                                    # колонок LanceDB ищет по всем полям с
+                                    # FTS-индексом, и новый индекс молча
+                                    # вошёл бы в RRF.
                                     fts_columns="text",
                                 )
                             )
@@ -1541,10 +1664,9 @@ class Index(AbstractAsyncContextManager):
                         .distance_type("cosine")  # type: ignore
                         .vector(vec)
                         .text(fts_query)
-                        # Тот же RRF, что по умолчанию, но с оценками каналов:
-                        # _score не пуст только у строк, найденных FTS. По нему
-                        # выдача отличает карточку, совпавшую с запросом
-                        # словами, от попавшей в пул лишь соседкой по вектору
+                        # RRF по умолчанию, но с оценками каналов: _score есть
+                        # только у строк из FTS, и по нему выдача отличает
+                        # карточку, совпавшую словами, от соседки по вектору
                         # (отметка "card", src/server/model.py).
                         .rerank(RRFReranker(return_score="all"))
                         # Лимит гибрида — и пул каждого канала до RRF, и
@@ -1553,16 +1675,10 @@ class Index(AbstractAsyncContextManager):
                         .to_polars()
                     )
                 except Exception as exc:
-                    # FTS-индекс может быть ещё не построен (свежая база,
-                    # индексация только идёт). Это не повод отдавать 500 —
-                    # деградируем до чисто векторного поиска.
-                    #
-                    # Деградируем на ЛЮБОЙ ошибке гибридного запроса, а не
-                    # только на распознанной: векторный индекс у пользователя
-                    # рабочий, и выдача по нему всегда лучше пятисотки. Но
-                    # незнакомую ошибку пишем на ERROR со стеком — иначе
-                    # настоящая поломка растворилась бы в фоне под видом
-                    # штатной деградации.
+                    # Откат на вектор при любой ошибке: FTS-индекса может ещё
+                    # не быть (свежая база), и выдача по вектору лучше 500.
+                    # Незнакомую ошибку пишем в ERROR со стеком, чтобы
+                    # поломка не пряталась под штатным откатом.
                     if _is_missing_fts_index(exc):
                         lg.warning(
                             "FTS-индекс ещё не готов, гибридный поиск деградирует "
@@ -1602,7 +1718,7 @@ class Index(AbstractAsyncContextManager):
 
         def _search_all():
             # Один поток на запрос независимо от числа источников: поиск ходит
-            # в дефолтный пул на asyncio_num_workers воркеров, и поток на
+            # в свой пул на четыре воркера (_SEARCH_EXECUTOR), и поток на
             # источник вдвое резал бы число одновременных запросов.
             results = []
             for store in stores:
@@ -1612,9 +1728,6 @@ class Index(AbstractAsyncContextManager):
                     # писать в хранилище.
                     lg.debug("таблица %s ещё не создана", store.table_name)
                     continue
-                # Копии одного файла отдельного запроса с запасом больше не
-                # требуют: пул и так в несколько раз глубже выдачи, а
-                # SearchResponse схлопывает копии до отбора документов.
                 table = store.table
                 frame = _search_in(table)
                 if codes:
@@ -1624,4 +1737,5 @@ class Index(AbstractAsyncContextManager):
                 results.append(frame)
             return results
 
-        return await asyncio.to_thread(_search_all)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_SEARCH_EXECUTOR, _search_all)

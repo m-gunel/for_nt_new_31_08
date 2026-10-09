@@ -1,20 +1,4 @@
-"""Фоновые проходы индексатора и фиксация их результата.
-
-Пять независимых дефектов, каждый со своим блоком ниже:
-
-1. периодического полного прохода не было вовсе — события ФС теряются, и
-   индекс расходился с диском до перезапуска демона;
-2. отложенный полный проход исчезал, если текущий падал;
-3. файл помечался проиндексированным после ПЕРВОГО батча своих чанков;
-4. холодный скан оставлял от файла длиннее батча записи только последний
-   батч: чистка повторной постановки пути сносила его начало;
-5. файл, недописанный из-за сбоя разбора или обрыва прохода по месту,
-   отмечался готовым, и проходы к нему больше не возвращались.
-
-Живой Index (LSM + LanceDB + OpenVINO) здесь не нужен: проверяемые методы
-берутся у класса и исполняются на лёгком носителе `_StubIndex`. Именно
-исходные методы, а не их копии — тест обязан ломаться вместе с кодом.
-"""
+"""Фоновые проходы индексатора и момент отметки файла в LSM."""
 
 import asyncio
 from types import SimpleNamespace
@@ -31,8 +15,7 @@ from src.indexer.indexer import Index
 from src.indexer.utils import UniqueCounter
 from src.utils.lance_wrapper import LanceWrapper
 
-# Интервал периодического прохода в тестах. Крошечный намеренно: ждать
-# штатный час нельзя, а логика цикла от величины интервала не зависит.
+# Интервал периодического прохода: логика цикла от его величины не зависит.
 _TICK = 0.01
 
 
@@ -48,11 +31,8 @@ async def _wait_until(predicate, timeout: float = 3.0) -> bool:
 
 
 class _Recorder:
-    """Журнал событий записи.
-
-    Суть тестов ниже — не набор вызовов, а их ПОРЯДОК: отметка в LSM обязана
-    идти после записи всех чанков файла, а не между батчами.
-    """
+    """Журнал событий записи: важен порядок — отметка в LSM идёт после записи
+    всех чанков файла, а не между батчами."""
 
     def __init__(self) -> None:
         self.events: list[tuple] = []
@@ -81,13 +61,22 @@ class _FakeStore:
 
 
 class _FakeIndexed:
-    """Таблица состояния LSM: важен только момент отметки."""
+    """Таблица состояния LSM: важны момент отметки и то, что уже отмечено."""
 
     def __init__(self, recorder: _Recorder) -> None:
         self._recorder = recorder
+        # Пути, проиндексированные раньше (их задаёт тест) и в этом проходе.
+        self.known: set[str] = set()
 
     async def async_set(self, path: str, meta: FileMetadata) -> None:
         self._recorder.events.append(("set", path))
+        self.known.add(path)
+
+    def is_in(self, path: str) -> bool:
+        return path in self.known
+
+    async def async_is_in(self, path: str) -> bool:
+        return self.is_in(path)
 
 
 class _FakeEmbedModel:
@@ -100,11 +89,9 @@ class _FakeEmbedModel:
 
 
 class _StubIndex:
-    """Настоящие методы Index на лёгком носителе.
+    """Настоящие методы Index на лёгком носителе без LSM, LanceDB и модели.
 
-    Полный Index тянет LSM, LanceDB и модель эмбеддингов, а проверяемым здесь
-    методам ничего из этого не нужно. Методы берём у класса, поэтому тест
-    проверяет production-код, а не его пересказ.
+    Методы взяты у класса, а не скопированы: тест ломается вместе с кодом.
     """
 
     scan_all = Index.scan_all
@@ -125,7 +112,7 @@ class _StubIndex:
     ) -> None:
         self.cfg = cfg
         self.recorder = recorder or _Recorder()
-        # Состояние, по которому периодический проход решает, простаиваем ли мы.
+        # Признаки простоя для периодического прохода.
         self.active = True
         self.main_index = False
         self.preindex = False
@@ -141,13 +128,13 @@ class _StubIndex:
         self.files_store = store
         # Отдельный объект: `store is self.email_store` решает, открывать ли mbox.
         self.email_store = object()
-        # Хвосты, которые трогают activate/deactivate.
+        # Что трогают activate/deactivate.
         self.calls: list[str] = []
         self.emails_task: asyncio.Task | None = None
         self._dirty_stores: set[str] = set()
         self._index_task: asyncio.Task | None = None
 
-    # --- заглушки вместо тяжёлых частей ---------------------------------
+    # Заглушки тяжёлых частей.
     async def _scan_all(self, emails_only: bool = False) -> None:
         self.scan_calls.append(emails_only)
 
@@ -188,14 +175,16 @@ def _install_chunk_pipeline(
     embed_batch: int = 1,
     write_batch: int = 2,
     fail_after: dict[str, int] | None = None,
+    no_text: frozenset[str] = frozenset(),
 ) -> None:
     """Предсказуемый конвейер разбора вместо парсера, модели и OpenVINO.
 
     По умолчанию батч эмбеддингов — один чанк, батч записи — две строки:
-    только на таких размерах видно, что происходит на ГРАНИЦЕ батчей записи,
-    ради которой и написаны тесты дефектов 3 и 4.
+    только так видно поведение на границе батчей записи.
 
     `fail_after` — сколько чанков пути отдать, прежде чем разбор упадёт.
+    `no_text` — пути, разбор которых прошёл без текста (пустой, битый или
+    зашифрованный файл): чанков нет, исход окончательный.
     """
     fail_after = fail_after or {}
     monkeypatch.setattr(config.embed_model_cfg, "batch_size", embed_batch)
@@ -209,6 +198,9 @@ def _install_chunk_pipeline(
         # Как настоящий async_parse_files: файлы строго по одному, все чанки
         # файла подряд — именно на этом держится определение «дочитан».
         async for meta in files:
+            if meta.path in no_text:
+                await fail_cb(meta, permanent=True)
+                continue
             for i in range(fail_after.get(meta.path, chunks_by_path[meta.path])):
                 yield {
                     "idx": i,
@@ -225,15 +217,11 @@ def _install_chunk_pipeline(
     monkeypatch.setattr(indexer_module, "async_parse_files", fake_parse)
 
 
-# ---------------------------------------------------------------------------
-# ДЕФЕКТ 1: периодического полного прохода не было
-# ---------------------------------------------------------------------------
 def test_full_rescan_interval_defaults_to_an_hour(config: Config):
-    """Поле конфига существует и по умолчанию даёт проход раз в час.
+    """Периодический полный проход по умолчанию — раз в час.
 
-    Раньше поля не было вовсе: индекс расходился с диском (потерянные при
-    переполнении очереди события, каталоги, ставшие читаемыми, осиротевшие
-    после перемещений пути) и не сходился обратно до перезапуска демона.
+    Он сводит индекс с диском, когда события ФС потеряны: переполнение очереди,
+    каталоги, ставшие читаемыми, осиротевшие после перемещений пути.
     """
     assert config.full_rescan_interval == 3600.0
 
@@ -243,12 +231,11 @@ def test_full_rescan_interval_defaults_to_an_hour(config: Config):
 async def test_periodic_rescan_is_disabled_by_non_positive_interval(
     stub: _StubIndex, config: Config, monkeypatch, interval: float
 ):
-    """Непозитивный интервал обязан выключать проход, а не означать «каждый тик».
+    """Непозитивный интервал выключает проход, а не означает «каждый тик».
 
-    Условие в коде — `<= 0`, и сужение его до `== 0` тест обязан ловить:
-    отрицательное значение из YAML или RAG_FULL_RESCAN_INTERVAL дало бы
-    `asyncio.sleep(-1)`, то есть цикл без единой паузы — бесконечный обход
-    домашнего каталога вместо страховки раз в час.
+    Условие в коде — `<= 0`: при `== 0` отрицательное значение из YAML или
+    RAG_FULL_RESCAN_INTERVAL дало бы `asyncio.sleep(-1)` — обход домашнего
+    каталога без пауз.
     """
     monkeypatch.setattr(config, "full_rescan_interval", interval)
 
@@ -259,11 +246,7 @@ async def test_periodic_rescan_is_disabled_by_non_positive_interval(
 
 @pytest.mark.asyncio
 async def test_periodic_rescan_runs_when_indexer_is_idle(stub: _StubIndex):
-    """В простое проход обязан состояться — и именно полный, а не почтовый.
-
-    Прежде полного прохода по расписанию не было: единственным источником
-    обновлений оставались события файловой системы.
-    """
+    """В простое проход обязан состояться — и именно полный, а не почтовый."""
     calls: list[bool] = []
 
     async def fake_scan_all(emails_only: bool = False) -> None:
@@ -294,13 +277,11 @@ async def test_periodic_rescan_runs_when_indexer_is_idle(stub: _StubIndex):
 async def test_periodic_rescan_skipped_while_indexer_is_busy(
     stub: _StubIndex, attr: str, busy, idle
 ):
-    """Занятый (или выключенный) индексатор второй проход не начинает.
+    """Занятый или выключенный индексатор проход не начинает.
 
-    Полный обход домашнего каталога идёт часами: запуск поверх работающей
-    индексации удваивает нагрузку ровно тогда, когда она и так высокая, а на
-    деактивированном индексе он вдобавок нарушает БТ §5.2. Условие простоя —
-    то же, что у компакции. Вторая половина теста доказывает, что задача при
-    этом ЖИВА, а не тихо умерла на первом же тике.
+    Полный обход идёт часами: поверх работающей индексации он удваивает
+    нагрузку, а на деактивированном индексе нарушает БТ §5.2. Вторая половина
+    теста проверяет, что задача при этом жива.
     """
     calls: list[bool] = []
 
@@ -325,9 +306,8 @@ async def test_periodic_rescan_skipped_while_indexer_is_busy(
 async def test_periodic_rescan_survives_failing_pass(stub: _StubIndex):
     """Сбой одного прохода не убивает задачу: следующий тик снова работает.
 
-    Задача живёт весь срок демона и она же — единственная страховка поверх
-    watcher'а. Вылет исключения из цикла означал бы, что после первой же
-    ошибки индекс больше никогда не сверяется с диском.
+    Задача — единственная страховка поверх watcher'а: без неё после первой
+    ошибки индекс больше не сверялся бы с диском.
     """
     calls: list[bool] = []
 
@@ -350,9 +330,8 @@ async def test_periodic_rescan_survives_failing_pass(stub: _StubIndex):
 async def test_stop_periodic_rescan_cancels_and_clears_task(stub: _StubIndex):
     """Остановка гасит задачу и обнуляет ссылку.
 
-    Без обнуления `rescan_task` следующий start_periodic_rescan видел бы
-    «задача уже есть» по мёртвой ссылке и не поднял бы её заново, а lifespan
-    на выходе ждал бы уже отменённую задачу.
+    Иначе start_periodic_rescan не поднял бы задачу заново по мёртвой ссылке,
+    а lifespan на выходе ждал бы отменённую.
     """
     await stub.start_periodic_rescan()
     task = stub.rescan_task
@@ -368,14 +347,10 @@ async def test_stop_periodic_rescan_cancels_and_clears_task(stub: _StubIndex):
 
 @pytest.mark.asyncio
 async def test_activate_starts_rescan_and_deactivate_stops_it(stub: _StubIndex):
-    """Периодический проход привязан к жизненному циклу индексации.
+    """Периодический проход гаснет и поднимается вместе с индексацией (БТ §5.2).
 
-    БТ §5.2: деактивированный демон пользовательские файлы не трогает —
-    значит, фоновый обход обязан гаснуть вместе с индексацией и подниматься
-    обратно при активации, а не только на старте процесса.
-
-    Проверяем именно переход «выключено → включено»: POST /activate приходит
-    на деактивированный индекс, а на активном activate() идемпотентен.
+    Проверяется переход «выключено → включено»: на активном индексе
+    activate() идемпотентен.
     """
     stub.active = False
     assert stub.rescan_task is None
@@ -385,8 +360,7 @@ async def test_activate_starts_rescan_and_deactivate_stops_it(stub: _StubIndex):
     assert stub.active is True
     task = stub.rescan_task
     assert task is not None and not task.done(), "активация не подняла проход"
-    # Иначе тест не отличит «активация подняла проход» от «проход подняли, а
-    # саму индексацию — нет».
+    # Активация поднимает и саму индексацию, а не только проход.
     assert stub.calls == ["start_reindex", "start_emails_polling"], (
         f"активация подняла проход, но не индексацию: {stub.calls}"
     )
@@ -398,17 +372,13 @@ async def test_activate_starts_rescan_and_deactivate_stops_it(stub: _StubIndex):
     assert task.done()
 
 
-# ---------------------------------------------------------------------------
-# ДЕФЕКТ 2: отложенный полный проход терялся при падении текущего
-# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_failed_pass_still_replays_requested_rescan(stub: _StubIndex):
-    """Упавший проход не съедает отложенный.
+    """Упавший проход не съедает отложенный полный проход.
 
-    Было: `_scan_all` вызывался без try/except, а `@wrap_exception_logger`
-    исключение ПРОБРАСЫВАЕТ — до цикла доигрывания управление не доходило, и
-    полный проход, вытесненный почтовым, терялся до следующего вызова.
-    Ошибку при этом нельзя проглатывать: она поднимается после доигрывания.
+    `@wrap_exception_logger` пробрасывает исключение, и без try/except вокруг
+    `_scan_all` до доигрывания не дойти. Саму ошибку не глотаем: она
+    поднимается после доигрывания.
     """
     boom = RuntimeError("проход упал на середине")
     calls: list[bool] = []
@@ -435,16 +405,12 @@ async def test_failed_pass_still_replays_requested_rescan(stub: _StubIndex):
 
 @pytest.mark.asyncio
 async def test_cancelled_pass_does_not_replay_rescan(stub: _StubIndex):
-    """Отмена прохода доигрывание НЕ запускает.
+    """Отмена прохода доигрывание не запускает.
 
-    ВНИМАНИЕ: этот тест — не регрессия, он зелёный и на коде до правки. Там
-    вокруг `_scan_all` не было try/except вовсе, и отмена улетала наружу ровно
-    так же. Тест фиксирует ФОРМУ нового обработчика — узкий `except Exception`
-    плюс отдельный `except asyncio.CancelledError: raise`, — потому что
-    добавленный блок легко «дочинить» до `except BaseException`. Тогда отмена
-    (её делают stop_index на POST /config и /deactivate) стала бы обычной
-    ошибкой: отменённая задача пошла бы доигрывать полный проход и обходить
-    диск уже после того, как вызывающая сторона считает её мёртвой.
+    Фиксирует форму обработчика: узкий `except Exception` плюс
+    `except asyncio.CancelledError: raise`. С `except BaseException` отмена
+    (stop_index на POST /config и /deactivate) стала бы обычной ошибкой, и
+    отменённая задача пошла бы доигрывать полный проход.
     """
     calls: list[bool] = []
 
@@ -465,25 +431,18 @@ async def test_cancelled_pass_does_not_replay_rescan(stub: _StubIndex):
     )
 
 
-# ---------------------------------------------------------------------------
-# ДЕФЕКТ 3: файл помечался проиндексированным до записи всех своих чанков
-# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_file_split_across_write_batches_is_marked_after_last_batch(
     config: Config, monkeypatch
 ):
     """Файл из двух батчей записи отмечается в LSM только после второго.
 
-    Было: колбэк складывал в `processed` КАЖДЫЙ файл батча эмбеддингов, и
-    после первой же записи файл считался готовым. Обрыв между батчами
-    оставлял в индексе половину файла с отметкой «сделан», и полный проход к
-    нему больше не возвращался — файл навсегда оставался наполовину
-    проиндексированным.
+    Иначе обрыв между батчами оставил бы в индексе половину файла с отметкой
+    «сделан», и проходы к нему не возвращались бы.
 
-    Поток тут предсказуемый: длинный файл даёт три чанка, короткий — один,
-    батч эмбеддингов равен одному чанку, батч записи — двум строкам. Значит
-    первая запись содержит только начало длинного файла, а вторая — его
-    хвост вместе с началом короткого.
+    Длинный файл даёт три чанка, короткий — один; батч эмбеддингов — один
+    чанк, батч записи — две строки. Первая запись — начало длинного файла,
+    вторая — его хвост с началом короткого.
     """
     long_file = FileMetadata(path="/дом/длинный.pdf", size=30, mtime_seconds=1)
     short_file = FileMetadata(path="/дом/короткий.pdf", size=10, mtime_seconds=2)
@@ -513,18 +472,14 @@ async def test_file_split_across_write_batches_is_marked_after_last_batch(
         "второй батч обязан содержать хвост длинного файла и начало короткого"
     )
     assert marks[2] == ("set", long_file.path)
-    # Последний файл потока отмечать тоже надо: чанка следующего файла не
-    # будет, и без явного сброса он остался бы вечно неотмеченным.
+    # Последний файл потока отмечается явно: чанка следующего файла не будет.
     assert marks[3] == ("set", short_file.path), (
         "последний файл потока не отмечен в LSM"
     )
 
 
-# ---------------------------------------------------------------------------
-# ДЕФЕКТ 4: холодный скан терял чанки файлов длиннее батча записи
-# ---------------------------------------------------------------------------
-# Считаем строки в настоящей таблице LanceDB, а не вызовы записи: дефект
-# виден только по тому, что осталось в таблице после удалений.
+# Считаем строки в настоящей таблице LanceDB, а не вызовы записи: потеря
+# чанков видна только по тому, что осталось после удалений.
 _STALE_TEXT = "прежняя версия"
 
 
@@ -584,16 +539,11 @@ async def test_file_split_across_write_batches_keeps_every_chunk(
 ):
     """Файл длиннее батча записи ложится в таблицу целиком.
 
-    Было (замер 2026-09-26, 282 файла): парсеры выдали 30 777 чанков, а в
-    таблице после холодного прохода осталось 14 281 строка — у каждого файла
-    длиннее parquet_record_batch_size выживал только последний батч записи
-    (6406-У: 2714 → 373). Колбэк эмбеддера отмечал файл дочитанным, едва
-    видел чанк следующего; батч записи собирается из нескольких батчей
-    эмбеддингов, поэтому к записи батча с хвостом файла тот уже числился
-    дочитанным. Холодная ветка принимала хвост за повторную постановку пути
-    и удаляла записанное начало.
+    Батч записи собирается из нескольких батчей эмбеддингов, и к записи хвоста
+    файл уже числится дочитанным: хвост нельзя принимать за повторную
+    постановку пути и удалять записанное начало.
 
-    Батч эмбеддингов — три чанка, батч записи — шесть строк: граница файлов
+    Батч эмбеддингов — три чанка, батч записи — четыре строки: граница файлов
     попадает внутрь батча эмбеддингов, а длинные файлы рвутся между батчами
     записи. На тёплой таблице заодно проверено, что прежняя версия файла
     вычищена, а чужие строки целы.
@@ -645,11 +595,9 @@ async def test_path_queued_twice_is_indexed_once(
     """Путь, дважды попавший в очередь прохода, ложится в таблицу один раз.
 
     Очередь переживает прерванный проход (сбой, нехватка места; почтовая —
-    ещё и рестарт), и следующий preindex кладёт тот же путь ещё раз, иногда
-    уже с другим mtime. Раньше повтор чистили удалением строк,
-    записанных этим же проходом, — и та же ветка сносила начало любого файла
-    длиннее батча записи (тест выше). Теперь повтор отбрасывается до разбора:
-    дублей нет, и удалять записанное в проходе не нужно никогда.
+    ещё и рестарт), и следующий preindex кладёт тот же путь ещё раз, иногда с
+    другим mtime. Повтор отбрасывается до разбора, поэтому удалять записанное
+    в этом же проходе не нужно никогда.
     """
     dup = FileMetadata(path="/дом/дважды.pdf", size=50, mtime_seconds=1)
     other = FileMetadata(path="/дом/чужой.pdf", size=20, mtime_seconds=1)
@@ -704,9 +652,6 @@ async def test_purge_cleans_every_new_path_once(config: Config):
     assert recorder.kinds("delete") == [], "повторная чистка тех же путей"
 
 
-# ---------------------------------------------------------------------------
-# ДЕФЕКТ 5: недописанный файл отмечался в LSM готовым
-# ---------------------------------------------------------------------------
 @pytest.mark.parametrize("failed_last", [False, True], ids=["mid-stream", "last"])
 @pytest.mark.asyncio
 async def test_file_failed_mid_parse_is_not_marked_and_redone_next_pass(
@@ -714,12 +659,10 @@ async def test_file_failed_mid_parse_is_not_marked_and_redone_next_pass(
 ):
     """Файл, разбор которого упал посередине, не отмечается готовым.
 
-    Было: `_process_path` гасит исключение парсера и сообщает временный сбой
-    (`permanent=False`) — по замыслу, чтобы следующий проход вернулся к файлу.
-    Но чанки, отданные до сбоя, уже шли по конвейеру, и файл отмечался в LSM
-    как любой другой: колбэком, едва появлялся чанк следующего файла, или
-    отметкой последнего файла потока после цикла. В индексе навсегда
-    оставалось начало файла. Проверены обе позиции упавшего файла.
+    `_process_path` гасит исключение парсера и сообщает временный сбой
+    (`permanent=False`), но чанки до сбоя уже идут по конвейеру. Отметка в LSM
+    оставила бы в индексе только начало файла навсегда. Проверены обе позиции
+    упавшего файла.
     """
     broken = FileMetadata(path="/дом/битая_страница.pdf", size=50, mtime_seconds=1)
     whole = FileMetadata(path="/дом/целый.pdf", size=20, mtime_seconds=1)
@@ -751,13 +694,10 @@ async def test_file_failed_mid_parse_is_not_marked_and_redone_next_pass(
 async def test_pass_cut_by_low_disk_leaves_partial_file_unmarked(
     config: Config, monkeypatch, tmp_path
 ):
-    """Обрыв прохода по месту не отмечает файл, чей хвост не записан.
+    """Обрыв прохода по месту (< 1 ГиБ) не отмечает файл, чей хвост не записан.
 
-    Было: после `break` по нехватке места (< 1 ГиБ) код доходил до отметки
-    последнего файла потока, хотя поток дочитан не был. Файл, который писался
-    в этот момент, отмечался готовым с частью чанков, и следующий проход его
-    пропускал. Файл, записанный до обрыва целиком, отмечаться при этом обязан:
-    иначе после каждого обрыва всё записанное переписывалось бы заново.
+    Файл, записанный до обрыва целиком, отмечается: иначе после каждого обрыва
+    всё записанное переписывалось бы заново.
     """
     whole = FileMetadata(path="/дом/целый.pdf", size=10, mtime_seconds=1)
     cut = FileMetadata(path="/дом/оборванный.pdf", size=100, mtime_seconds=1)
@@ -791,3 +731,211 @@ async def test_pass_cut_by_low_disk_leaves_partial_file_unmarked(
     rows = {path: len(texts) for path, texts in _texts_by_path(store).items()}
     assert rows == chunks, f"файл не дописан или задвоен: {rows}"
     assert recorder.kinds("set") == [("set", cut.path)]
+
+
+def _on_disk(path) -> FileMetadata:
+    stat = path.stat()
+    return FileMetadata(str(path), stat.st_size, int(stat.st_mtime))
+
+
+@pytest.mark.asyncio
+async def test_file_that_lost_its_text_leaves_no_previous_chunks(
+    config: Config, monkeypatch, tmp_path
+):
+    """Файл, ставший пустым, битым или зашифрованным, уходит из поиска.
+
+    Разбор проходит без чанков (`permanent=True`), и файл отмечается в LSM.
+    Чистка в цикле записи видит только пути из батча, а у такого файла батча
+    нет: без отдельного удаления старый текст находился бы поиском, а отметка
+    не пустила бы проход к файлу снова. Парсеры настоящие.
+    """
+    import pymupdf
+
+    monkeypatch.setitem(config.__dict__, "ov_model", _FakeEmbedModel())
+    monkeypatch.setattr(config.embed_model_cfg, "batch_size", 1)
+    monkeypatch.setattr(config, "parquet_record_batch_size", 4)
+    monkeypatch.setattr(config, "index_throttle_seconds", 0.0)
+    empty = tmp_path / "обнулён.txt"
+    empty.write_bytes(b"")
+    locked = tmp_path / "под_паролем.pdf"
+    with pymupdf.open() as doc:
+        doc.new_page().insert_text((72, 72), "секретный текст")
+        doc.save(
+            str(locked),
+            encryption=pymupdf.PDF_ENCRYPT_AES_256,
+            user_pw="u",
+            owner_pw="o",
+        )
+    broken = tmp_path / "испорчен.pptx"
+    broken.write_bytes(b"PK\x03\x04 not really a zip" * 20)
+    files = [empty, locked, broken]
+    untouched = "/дом/вне_прохода.pdf"
+    store = _lance_store(tmp_path)
+    await store.add_batch(_stale_rows({**{str(p): 3 for p in files}, untouched: 2}))
+    recorder = _Recorder()
+    idx = _StubIndex(config, store=store, recorder=recorder)  # type: ignore[arg-type]
+    # Все три файла проиндексированы раньше, когда текст в них был.
+    idx.lsm_collection.indexed.known.update(str(p) for p in files)
+
+    await idx.process_stream(_stream(*map(_on_disk, files)), store=store)
+
+    rows = {path: len(texts) for path, texts in _texts_by_path(store).items()}
+    assert rows == {untouched: 2}, f"прежняя версия файла осталась в поиске: {rows}"
+    assert sorted(recorder.kinds("set")) == sorted(("set", str(p)) for p in files)
+
+
+@pytest.mark.parametrize(
+    "path", ["/дом/новый_пустой.txt", "email_INBOX:0:10"], ids=["new-file", "email"]
+)
+@pytest.mark.asyncio
+async def test_no_text_without_previous_version_costs_no_delete(
+    config: Config, monkeypatch, tmp_path, path: str
+):
+    """Удаление — только для пути, уже лежавшего в индексе, и не для письма.
+
+    Новый пустой файл строк не имеет, а каждый `delete` — коммит с новой
+    версией таблицы. У письма ключ в LSM и путь чанка различаются, и удаление
+    по префиксу задело бы тело, записанное в этом же проходе.
+    """
+    meta = FileMetadata(path=path, size=0, mtime_seconds=1)
+    _install_chunk_pipeline(config, monkeypatch, {}, no_text=frozenset({path}))
+    store = _lance_store(tmp_path)
+    await store.add_batch(_stale_rows({"/дом/другой.pdf": 1}))
+    deletes = _spy_deletes(store, monkeypatch)
+    recorder = _Recorder()
+    idx = _StubIndex(config, store=store, recorder=recorder)  # type: ignore[arg-type]
+    if path.startswith("email_"):
+        idx.lsm_collection.indexed.known.add(path)
+
+    await idx.process_stream(_stream(meta), store=store)
+
+    assert deletes == [], f"холостое удаление: {deletes}"
+    assert recorder.kinds("set") == [("set", path)]
+
+
+@pytest.mark.asyncio
+async def test_file_whose_previous_version_was_not_dropped_stays_unmarked(
+    config: Config, monkeypatch, tmp_path
+):
+    """Не удалось снять прежнюю версию файла без текста — в LSM не отмечаем.
+
+    Иначе старый текст остался бы в поиске навсегда; без отметки следующий
+    проход повторит попытку.
+    """
+    gone = FileMetadata(path="/дом/зашифрован.docx", size=10, mtime_seconds=2)
+    _install_chunk_pipeline(config, monkeypatch, {}, no_text=frozenset({gone.path}))
+    store = _lance_store(tmp_path)
+    await store.add_batch(_stale_rows({gone.path: 3}))
+
+    async def boom(predicate: str) -> None:
+        raise RuntimeError("commit conflict")
+
+    monkeypatch.setattr(store, "delete_where", boom)
+    recorder = _Recorder()
+    idx = _StubIndex(config, store=store, recorder=recorder)  # type: ignore[arg-type]
+    idx.lsm_collection.indexed.known.add(gone.path)
+
+    await idx.process_stream(_stream(gone), store=store)
+
+    assert recorder.kinds("set") == [], "файл отмечен, хотя старый текст в поиске"
+
+
+@pytest.mark.asyncio
+async def test_failed_purge_leaves_file_unmarked_and_next_pass_rewrites_it(
+    config: Config, monkeypatch, tmp_path
+):
+    """Сбой чистки прежних чанков не даёт отметить файл в LSM.
+
+    Иначе старая версия лежала бы рядом с новой до следующего изменения
+    файла: путь уже в `purged`, а LSM сходится с диском. Без отметки
+    следующий проход перепишет файл целиком.
+    """
+    changed = FileMetadata(path="/дом/изменён.pdf", size=10, mtime_seconds=2)
+    _install_chunk_pipeline(config, monkeypatch, {changed.path: 2})
+    store = _lance_store(tmp_path)
+    await store.add_batch(_stale_rows({changed.path: 3}))
+    real_delete = store.delete_where
+
+    async def boom(predicate: str) -> None:
+        raise RuntimeError("commit conflict")
+
+    monkeypatch.setattr(store, "delete_where", boom)
+    recorder = _Recorder()
+    idx = _StubIndex(config, store=store, recorder=recorder)  # type: ignore[arg-type]
+
+    await idx.process_stream(_stream(changed), store=store)
+
+    assert recorder.kinds("set") == [], "файл отмечен поверх неснятой версии"
+
+    # Следующий проход: удаление работает, файл переписан и отмечен.
+    monkeypatch.setattr(store, "delete_where", real_delete)
+    await idx.process_stream(_stream(changed), store=store)
+
+    texts = _texts_by_path(store)[changed.path]
+    assert sorted(texts) == [f"{changed.path} фрагмент {i}" for i in range(2)]
+    assert recorder.kinds("set") == [("set", changed.path)]
+
+
+@pytest.mark.asyncio
+async def test_cold_pass_purges_file_written_by_watcher_meanwhile(
+    config: Config, monkeypatch, tmp_path
+):
+    """Файл, записанный watcher'ом во время холодного прохода, не задваивается.
+
+    На пустой таблице проход не чистит пути, но watcher пишет параллельно:
+    пользователь правит документ, пока первая индексация идёт часами. Когда
+    проход доходит до этого файла, его строки от watcher'а надо снять.
+    """
+    first = FileMetadata(path="/дом/первый.pdf", size=1, mtime_seconds=1)
+    edited = FileMetadata(path="/дом/правленый.pdf", size=1, mtime_seconds=1)
+    _install_chunk_pipeline(config, monkeypatch, {first.path: 3, edited.path: 3})
+    store = _lance_store(tmp_path)
+    deletes = _spy_deletes(store, monkeypatch)
+    recorder = _Recorder()
+    idx = _StubIndex(config, store=store, recorder=recorder)  # type: ignore[arg-type]
+    gate = asyncio.Event()
+
+    async def full_pass():
+        yield first
+        await gate.wait()
+        yield edited
+
+    full = asyncio.create_task(idx.process_stream(full_pass(), store=store))
+    assert await _wait_until(
+        lambda: store.has_table and store.table.count_rows() >= 2
+    ), "проход не записал первый батч"
+    # Watcher: та же таблица, тот же файл, без счётчика прохода.
+    await idx.process_stream([edited], count=False, store=store)
+    gate.set()
+    await full
+
+    rows = {path: len(texts) for path, texts in _texts_by_path(store).items()}
+    assert rows == {first.path: 3, edited.path: 3}, f"дубли или потеря строк: {rows}"
+    assert not any(first.path in predicate for predicate in deletes), (
+        "холодный проход удалил строки, записанные им самим"
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_path_with_same_meta_is_subtracted_from_counter(
+    config: Config, monkeypatch, tmp_path
+):
+    """Повтор пути с той же meta вычитается из счётчика `/status`.
+
+    Повтор даёт вложенный корень (`~/Документы` поверх `/home`) и прерванный
+    проход. `counter.count` дедуплицирует по значению, и без отдельного
+    вычитания счётчик оставался бы больше нуля: `/status` до следующего
+    прохода показывал бы «индексация идёт».
+    """
+    b = FileMetadata(path="/дом/b.pdf", size=1, mtime_seconds=1)
+    c = FileMetadata(path="/дом/c.pdf", size=1, mtime_seconds=1)
+    _install_chunk_pipeline(config, monkeypatch, {b.path: 2, c.path: 2})
+    store = _lance_store(tmp_path)
+    idx = _StubIndex(config, store=store)  # type: ignore[arg-type]
+    # Как count_to_index и _run_pass: счётчик — по размеру очереди с повтором.
+    idx.counter.reset(3)
+    idx.counter.clear_cache()
+
+    await idx.process_stream(_stream(b, c, b), store=store)
+
+    assert idx.counter.cnt == 0, "повтор пути не вычтен — /status застрянет"

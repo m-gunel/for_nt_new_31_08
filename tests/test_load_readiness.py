@@ -1,24 +1,15 @@
-"""Готовность индексатора к нагрузочному тестированию.
+"""Выполнимость сценариев нагрузочного тестирования индексатора.
 
-Здесь не регрессии на конкретные дефекты (для них есть свои файлы), а
-проверки того, что сценарии протокола НТ вообще выполнимы. Каждый тест
-соответствует шагу методики или гипотезе из `scripts/nt/hunt_crash.py`:
-если он краснеет, часовой прогон на стенде даст негодные цифры или
-оборвётся на середине.
-
-Разбивка по вопросам продукта из METHODOLOGY_NT_indexer.md:
-
-  вопрос 2 «деградация под индексацией»  -> поиск во время полного прохода
-  вопрос 3 «нагрузка от доиндексации»    -> файл от watcher'а во время прохода
-  вопрос 5 «влияние на другие приложения»-> предохранители (место на диске)
-  фаза ПОЛЬЗОВАТЕЛЬ                      -> POST /config на ходу, параллельные
-                                            запросы, стресс поиском
+Каждый тест — шаг методики НТ или гипотеза из `scripts/nt/hunt_crash.py`:
+красный тест значит, что часовой прогон на стенде даст негодные цифры или
+оборвётся.
 """
 
 import asyncio
 import shutil
 from collections import namedtuple
 from contextlib import suppress
+from pathlib import Path
 
 import pytest
 import pytest_asyncio as pa_fixture
@@ -88,9 +79,9 @@ async def _search(index: Index, query: str = "договор отчёт"):
 def _slow_stream(index: Index, hold: asyncio.Event, entered: asyncio.Event):
     """Растянуть полный проход, чтобы успеть подать нагрузку параллельно.
 
-    Тормозим ТОЛЬКО полный проход: watcher зовёт `process_stream(count=False)`,
-    и если задержать заодно и его, тест сам себя заблокирует — доиндексация
-    будет ждать события, которое выставляется после неё.
+    Тормозится только полный проход: watcher зовёт `process_stream(count=False)`,
+    и его задержка заблокировала бы тест — доиндексация ждала бы события,
+    которое выставляется после неё.
     """
     real = index.process_stream
 
@@ -103,16 +94,12 @@ def _slow_stream(index: Index, hold: asyncio.Event, entered: asyncio.Event):
     index.process_stream = slow  # type: ignore[method-assign]
 
 
-# ----------------------------------------------- вопрос 2: деградация ----
-
-
 @pytest.mark.asyncio
 async def test_search_works_during_full_pass(nt_index: Index):
-    """Ключевой сценарий фазы ПОЛЬЗОВАТЕЛЬ: человек ищет, пока идёт индексация.
+    """Пользователь ищет, пока идёт индексация.
 
-    Если поиск под индексацией отдаёт ошибки, доля ошибок в отчёте НТ будет
-    характеризовать дефект, а не производительность, — мерить деградацию
-    станет не на чем.
+    Ошибки поиска под индексацией сделали бы долю ошибок в отчёте НТ мерой
+    дефекта, а не производительности.
     """
     hold, entered = asyncio.Event(), asyncio.Event()
     _slow_stream(nt_index, hold, entered)
@@ -136,8 +123,8 @@ async def test_search_works_during_full_pass(nt_index: Index):
 async def test_burst_of_searches_does_not_error(nt_index: Index):
     """Фаза СТРЕСС: пачка одновременных запросов не должна давать ошибок.
 
-    Поиск ходит в общий пул на `asyncio_num_workers` воркеров; запросов
-    заведомо больше, чем воркеров, — очередь должна просто ждать, а не рваться.
+    Поиск ходит в свой пул на четыре воркера (`_SEARCH_EXECUTOR`); запросов
+    больше, чем воркеров, — очередь должна ждать, а не рваться.
     """
     await asyncio.wait_for(nt_index.scan_all(), 120)
 
@@ -152,11 +139,9 @@ async def test_burst_of_searches_does_not_error(nt_index: Index):
 
 @pytest.mark.asyncio
 async def test_search_works_before_indexes_are_built(nt_index: Index):
-    """Строки уже записаны, индексы ещё не пересобраны — стенд уже ищет.
+    """Строки уже записаны, индексы ещё не пересобраны — поиск уже отвечает.
 
-    Именно так выглядит начало фазы: `POST /config` запустил индексацию,
-    поисковые запросы пошли сразу. Пишем в таблицу в обход `_run_pass`: тот
-    строит индексы сам, и на готовой базе проверять было бы нечего.
+    Запись идёт в обход `_run_pass`: тот строит индексы сам.
     """
     await nt_index.files_scanner.scan()
     await nt_index.process_stream(nt_index.files_scanner.iter(endless=False))
@@ -164,16 +149,21 @@ async def test_search_works_before_indexes_are_built(nt_index: Index):
 
     result = await _search(nt_index)
 
-    assert result, "поиск обязан отвечать до пересборки индексов"
+    assert len(result) == 1 and result[0] is not None, (
+        "поиск обязан отвечать до пересборки индексов"
+    )
+    names = [Path(p).name for p in result[0]["path"].to_list()]
+    assert any(n.startswith("документ_") for n in names), (
+        f"в выдаче должны быть документы корпуса: {names}"
+    )
 
 
 def test_missing_fts_error_is_recognized():
-    """Классификатор «FTS-индекса ещё нет» отделяет деградацию от 500-ки.
+    """Классификатор «FTS-индекса ещё нет» отделяет деградацию от 500.
 
-    Если он перестанет узнавать сообщение LanceDB, гибридный поиск начнёт
-    поднимать исключение наружу вместо перехода на векторный, и стенд
-    запишет 100% ошибок в фазе поиска. Сообщение сверяется по тексту, то
-    есть ломается молча при обновлении библиотеки — поэтому тест и нужен.
+    Сообщение LanceDB сверяется по тексту и молча ломается при обновлении
+    библиотеки — тогда гибридный поиск поднимал бы исключение вместо перехода
+    на векторный.
     """
     missing = RuntimeError(
         "Cannot perform full text search unless an INVERTED index "
@@ -185,18 +175,14 @@ def test_missing_fts_error_is_recognized():
     )
 
 
-# --------------------------------------- вопрос 3: доиндексация на ходу ----
-
-
 @pytest.mark.asyncio
 async def test_watcher_indexes_new_file_during_full_pass(
     nt_index: Index, nt_config: Config, corpus
 ):
-    """Середина часа: в папке появляются новые файлы, идёт полный проход.
+    """Новый файл от watcher'а во время полного прохода попадает в индекс.
 
-    Обе ветки записи (полный проход и watcher) работают с одной таблицей
-    состояния и одной таблицей Lance одновременно — это тот самый параллелизм,
-    на котором ловился assert_db_state.
+    Обе ветки записи одновременно работают с одной таблицей состояния и одной
+    таблицей Lance.
     """
     hold, entered = asyncio.Event(), asyncio.Event()
     _slow_stream(nt_index, hold, entered)
@@ -220,9 +206,8 @@ async def test_watcher_indexes_new_file_during_full_pass(
 async def test_status_counts_watcher_work(nt_index: Index, nt_config: Config, corpus):
     """`/status` обязан показывать работу watcher'а.
 
-    Стенд завершает фазу индексации по первому `is_indexing: false`. Если
-    разбор пачки от watcher'а не учитывается, фаза обрывается раньше времени,
-    и замер длительности индексации оказывается занижен.
+    Стенд завершает фазу индексации по первому `is_indexing: false`: без учёта
+    пачки от watcher'а фаза обрывалась бы раньше, и длительность занижалась бы.
     """
     fresh = corpus / "новый.txt"
     fresh.write_text("Ещё один договор поставки", encoding="utf-8")
@@ -242,9 +227,6 @@ async def test_status_counts_watcher_work(nt_index: Index, nt_config: Config, co
     assert seen_busy, "во время разбора пачки от watcher'а статус не может быть idle"
 
 
-# ------------------------------------------ фаза ПОЛЬЗОВАТЕЛЬ: /config ----
-
-
 @pytest.mark.asyncio
 async def test_config_change_during_active_indexing(
     nt_index: Index,
@@ -255,8 +237,7 @@ async def test_config_change_during_active_indexing(
 ):
     """Гипотеза `active_indexing` из hunt_crash: смена папки посреди прохода.
 
-    Штатный шаг протокола НТ — стенд именно так нацеливает индексатор на
-    тестовый корпус, иногда попадая в момент активной индексации.
+    Так стенд нацеливает индексатор на корпус, иногда посреди индексации.
     """
     hold, entered = asyncio.Event(), asyncio.Event()
     _slow_stream(nt_index, hold, entered)
@@ -344,9 +325,6 @@ async def test_repeated_config_on_same_folder_is_stable(
         assert response.status_code == 200
 
 
-# ------------------------------------------------- вопрос 5: предохранители ----
-
-
 @pytest.mark.asyncio
 async def test_indexing_refuses_when_disk_is_low(nt_index: Index, monkeypatch):
     """Меньше 1 ГиБ свободного места — проход не запускается.
@@ -375,11 +353,7 @@ async def test_indexing_refuses_when_disk_is_low(nt_index: Index, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_failed_pass_does_not_wedge_indexing(nt_index: Index):
-    """Сбой одного прохода не должен запирать индексацию до рестарта.
-
-    В часовом прогоне это разница между «одна фаза дала кривые цифры» и
-    «весь оставшийся час индексатор мёртв, а стенд молотит впустую».
-    """
+    """Сбой одного прохода не запирает индексацию до рестарта."""
 
     real_pass = nt_index._run_pass
 

@@ -4,6 +4,8 @@
 lifespan (OpenVINO + LanceDB + watcher) для этих проверок не нужен.
 """
 
+import os
+
 import pytest
 from fastapi import HTTPException
 
@@ -12,6 +14,8 @@ from src.server.model import RequestFilePath, SberchatConfig, UserConfig
 from src.server.router import _merge_user_config, get_file_path, update_config
 from tests.mbox_fixture import (
     default_inbox_messages,
+    make_email_with_attachment,
+    make_plain_email,
     make_profile,
 )
 
@@ -51,16 +55,9 @@ def _email_key(cfg: Config, msg_id: str, suffix: str) -> str:
     raise AssertionError(f"письмо {msg_id} не найдено в фикстуре")
 
 
-# ------------------------------------------------------------ get_file_path -
-
-
 @pytest.mark.asyncio
 async def test_get_file_path_returns_body(email_config: Config):
-    """Регресс на вечный 404: ключ email_INBOX:... должен находить mbox.
-
-    Раньше словарь папок строился по голым именам ("INBOX"), а искалось
-    "email_INBOX:" — ручка не работала никогда.
-    """
+    """Ключ email_INBOX:... находит mbox, хотя папки известны по голым именам."""
     key = _email_key(email_config, "plain-1@fixture", "body")
     resp = await get_file_path(RequestFilePath(absolute_path=key), email_config)
     assert resp.absolute_temp_path.endswith(".eml")
@@ -97,7 +94,63 @@ async def test_get_file_path_unknown_folder_404(email_config: Config):
     assert e.value.status_code == 404
 
 
-# ---------------------------------------------------------- merge конфига ---
+# Тема длиннее NAME_MAX (255 байт) и в байтах, и в символах — иначе на APFS
+# (лимит в символах) старый код не падал бы.
+LONG_SUBJECT = "Re: " * 62 + (
+    "RE: FW: О согласовании изменений в регламент взаимодействия подразделений "
+    "по вопросам обработки обращений клиентов в 4 квартале 2026 года (повторно)"
+)
+
+
+@pytest.fixture
+def odd_names_config(config: Config, tmp_path, monkeypatch):
+    """Письма, имя временного файла для которых не годится как есть."""
+    messages = [
+        make_plain_email(LONG_SUBJECT, "Текст письма", msg_id="long-1@fixture"),
+        make_email_with_attachment(
+            "Вложение с именем-каталогом",
+            "Во вложении файл.",
+            msg_id="dotdot-1@fixture",
+            filename="..",
+            payload="Содержимое вложения".encode(),
+        ),
+    ]
+    mail_root = make_profile(tmp_path / "tb-odd", {"INBOX": messages})
+    monkeypatch.setattr(config, "data_directory", str(tmp_path / "ragsearch"))
+    config.__dict__.pop("user_conf_path", None)
+    config.__dict__.pop("data_directory_path", None)
+    monkeypatch.setattr(
+        config,
+        "email",
+        EmailConfig(enabled=True, path_to_email_folder=str(mail_root)),
+    )
+    yield config
+    config.__dict__.pop("user_conf_path", None)
+    config.__dict__.pop("data_directory_path", None)
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_long_subject_fits_name_max(odd_names_config: Config):
+    """Длинная тема — не 500 ENAMETOOLONG: имя обрезается до NAME_MAX."""
+    key = _email_key(odd_names_config, "long-1@fixture", "body")
+    resp = await get_file_path(RequestFilePath(absolute_path=key), odd_names_config)
+    name = os.path.basename(resp.absolute_temp_path)
+    assert name.startswith("Re Re Re")  # имя из темы, а не запасное
+    assert name.endswith(".eml")
+    assert len(name.encode()) <= 255
+    with open(resp.absolute_temp_path, "rb") as f:
+        assert b"long-1@fixture" in f.read()
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_dotdot_attachment_is_a_file(odd_names_config: Config):
+    """Вложение «..» пишется в файл с запасным именем, а не в каталог."""
+    key = _email_key(odd_names_config, "dotdot-1@fixture", "..")
+    resp = await get_file_path(RequestFilePath(absolute_path=key), odd_names_config)
+    assert os.path.isfile(resp.absolute_temp_path)
+    assert os.path.basename(resp.absolute_temp_path) == "file"
+    with open(resp.absolute_temp_path, "rb") as f:
+        assert "Содержимое вложения".encode() in f.read()
 
 
 def _current() -> UserConfig:
@@ -113,7 +166,7 @@ def _current() -> UserConfig:
 
 
 def test_merge_folders_only_keeps_email():
-    """Регресс: POST {"folders": [...]} не должен сбрасывать почту в дефолт."""
+    """POST {"folders": [...]} не сбрасывает почту в дефолт."""
     incoming = UserConfig.model_validate({"folders": ["/home/u/other"]})
     merged = _merge_user_config(_current(), incoming)
     assert merged.folders == ["/home/u/other"]
@@ -141,18 +194,14 @@ def test_merge_full_replacement_still_works():
     assert merged.sberchat.enabled is True
 
 
-# ------------------------------------------------- update_config: переходы --
-
-
 class FakeIndex:
     """Протокол Index, достаточный для update_config; пишет журнал вызовов."""
 
     def __init__(self):
         self.calls: list = []
         self.emails_scanner = None
-        # update_config сверяется с ним, чтобы не запускать сканирование на
-        # деактивированном индексе (БТ §5.4). True — как у демона с
-        # автозапуском, то есть прежнее поведение этих тестов.
+        # update_config не сканирует на деактивированном индексе (БТ §5.4);
+        # True — как у демона с автозапуском.
         self.active = True
 
     async def stop_index(self):
@@ -244,16 +293,12 @@ async def test_folders_update_does_not_touch_email(
     assert saved is not None and saved.email.enabled is True
 
 
-# ------------------------------------------------ update_config: валидация --
-
-
 @pytest.mark.asyncio
 async def test_config_rejects_missing_folder(email_config, patched_watcher, tmp_path):
     """Несуществующая папка отклоняется, и конфиг на диске не меняется.
 
-    Регресс на боевой случай: Swagger по умолчанию шлёт folders: ["string"],
-    API отвечал 200, путь сохранялся — и watcher падал на inotify целиком,
-    переставая отслеживать вообще всё.
+    Swagger по умолчанию шлёт folders: ["string"], а сохранённый
+    несуществующий путь ронял бы watcher на inotify целиком.
     """
     index = FakeIndex()
     before = email_config.user_config
@@ -294,10 +339,9 @@ async def test_disable_email_cleans_index_even_without_transition(
 ):
     """Явное выключение чистит индекс, даже если почта уже числилась выключенной.
 
-    Регресс на боевой случай: пользователь правит user_conf.yml руками (или
-    удаляет его), демон читает «почта выключена», и последующий honest-запрос
-    на выключение не удалял уже проиндексированные письма — поиск продолжал их
-    возвращать, и объяснить это было нечем.
+    user_conf.yml могли поправить руками или удалить: демон читает «почта
+    выключена», а письма в индексе остались, и запрос на выключение обязан их
+    вычистить.
     """
     monkeypatch.setattr(email_config, "email", EmailConfig(enabled=False))
     index = FakeIndex()

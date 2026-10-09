@@ -24,14 +24,13 @@ from pydantic_settings import (
 )
 
 from src.common.fts import FtsConfig
-from src.server.model import EmailConfig
+from src.common.user_config import EmailConfig
 from src.utils import get_logger
 
 if getattr(sys, "frozen", False):
-    # если упаковано PyInstaller — путь внутри упакованного приложения
+    # Бандл PyInstaller: ресурсы распакованы в sys._MEIPASS.
     base_path = Path(sys._MEIPASS)  # type: ignore
 else:
-    # если запуск из исходников
     base_path = Path(os.path.abspath("."))
     base_path = base_path.relative_to(Path.cwd())
 
@@ -46,35 +45,87 @@ _TOKEN_LEN_CACHE_CHAR_FACTOR = 8
 
 if os.environ.get("DEV") == "1":
     _root = Path("data/app")
+    # Свой user_conf.yml: иначе dev-демон и RESET=1 меняют конфиг продукта.
+    _user_root = _root / "ragsearch"
     LANCE_URL = str(_root / "lance")
     LSM_PATH = str(_root / "lsm.ldb")
 else:
     _root = Path("~/.files-search").expanduser()
-    os.makedirs(_root, exist_ok=True)
+    _user_root = Path("~/.ragsearch").expanduser()
+    os.makedirs(_root, mode=0o700, exist_ok=True)
     LANCE_URL = str(_root / "lance")
     LSM_PATH = str(_root / "lsm.ldb")
 
-_user_root = Path("~/.ragsearch").expanduser()
+
+def _is_home_or_ancestor(path: Path) -> bool:
+    """Путь — домашний каталог или его предок: такое не удаляем и не закрываем."""
+    home = Path(os.path.expanduser("~")).resolve()
+    path = path.expanduser().resolve()
+    return path == home or path in home.parents
 
 
-def reset_storage() -> None:
-    """Удалить индексы и пользовательский конфиг (RESET=1).
+def reset_storage(cfg: "Config") -> None:
+    """Удалить индексы и пользовательский конфиг (RESET=1) по путям из конфига.
 
-    Вызывается явно из точки входа: импорт модуля не должен ничего удалять.
+    Вызывается из точки входа после настройки логирования: импорт модуля не
+    должен ничего удалять. user_conf.yml удаляется файлом, как в
+    POST /api/v1/reset: data_directory задаётся снаружи и может быть общим.
     """
-    lg.info("resetting storage: %s, %s", _root, _user_root)
-    shutil.rmtree(_root, ignore_errors=True)
-    shutil.rmtree(_user_root, ignore_errors=True)
-    os.makedirs(_root, exist_ok=True)
+    roots = [Path(cfg.lsm_root).expanduser(), Path(cfg.ld_db_path).expanduser()]
+    lg.info("RESET=1: удаляю %s и %s", ", ".join(map(str, roots)), cfg.user_conf_path)
+    for target in roots:
+        if _is_home_or_ancestor(target):
+            lg.warning(
+                "RESET=1: %s — домашний каталог или его предок, не удаляю", target
+            )
+            continue
+        shutil.rmtree(target, ignore_errors=True)
+    cfg.user_conf_path.unlink(missing_ok=True)
+    os.makedirs(roots[0], mode=0o700, exist_ok=True)
 
 
-def reset_storage_if_requested() -> None:
+def reset_storage_if_requested(cfg: "Config") -> None:
     if os.environ.get("RESET") == "1":
-        reset_storage()
+        reset_storage(cfg)
+
+
+def protect_storage(cfg: "Config") -> None:
+    """Закрыть каталоги данных от других пользователей (0700).
+
+    В индексе, очередях и кэше OCR — полный текст документов и писем, в
+    user_conf.yml — список папок. chmod на каждом старте закрывает и каталоги,
+    созданные раньше по umask. Отказ не роняет демон.
+    """
+    for raw in (cfg.lsm_root, cfg.data_directory):
+        path = Path(raw).expanduser()
+        if _is_home_or_ancestor(path):
+            continue
+        try:
+            path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(path, 0o700)
+        except OSError as exc:
+            lg.warning("не удалось закрыть каталог %s правами 0700: %s", path, exc)
+
+
+def _ov_output_dim(embedder: Any) -> int | None:
+    """Длина вектора по статической форме выхода OpenVINO-модели.
+
+    None — не узнать: модель подменена (в тестах, без CompiledModel) или
+    последняя ось выхода динамическая; тогда embed_dim судит по имени каталога.
+    """
+    compiled = getattr(embedder, "model", None)
+    if compiled is None:
+        return None
+    shape = compiled.outputs[0].get_partial_shape()
+    if shape.rank.is_dynamic:
+        return None
+    last = shape[shape.rank.get_length() - 1]
+    return last.get_length() if last.is_static else None
 
 
 class ExcelParserConfig(BaseModel):
-    # Строк данных на лист: дальше лист обрезается с предупреждением, но не теряется.
+    # Строк листа сверху, считая пустые (плюс SCAN_ROWS на шапку, src/parsers/xlsx.py):
+    # дальше лист обрезается с предупреждением, но не теряется.
     max_rows: int = 5000
 
 
@@ -88,8 +139,7 @@ class OcrConfig(BaseModel):
 
     enabled: bool = True
     languages: str = "rus+eng"
-    # 200, а не 300: на сканах 100 dpi точнее (сумм 94,8% против 92,2%), на настоящих
-    # сканах — то же качество, и на 10–20% быстрее (замер КТ-OCR1, 02.10.2026).
+    # 200, а не 300: качество на сканах не хуже, а распознавание быстрее.
     dpi: int = 200
     max_pages_per_file: int = 200
     max_seconds_per_file: float = 1200
@@ -99,29 +149,23 @@ class OcrConfig(BaseModel):
 
 class FileScanConfig(BaseModel):
     path: str | None = None
-    # Умолчание — домашний каталог, а НЕ пустой список. Пустой список означал,
-    # что демон, запущенный без CONFIG_PATH, поднимается, отвечает на /health и
-    # /search, но не индексирует ничего — и понять это можно было только по
-    # GET /config. Держится это ровно на user_conf.yml: пока он есть, пути
-    # берутся оттуда, а стоит его удалить — индексация молча умолкает.
-    # Разумное умолчание убирает и переменную окружения из команды запуска.
-    #
-    # Тесты не задевает: cfg/dev.yml задаёт paths: [] явно, а явное значение
-    # перебивает умолчание модели.
-    # Умолчание — "/home" (родительский для обеих форм SberOS-путей), чтобы
-    # индексация шла с фиксированного каталога независимо от HOME и CONFIG_PATH.
+    # "/home", а не домашний каталог: общий корень обеих форм путей SberOS, не
+    # зависит от HOME и CONFIG_PATH. Обходятся дома всех пользователей, открытые
+    # правами uid демона, и без max_depth под inotify встаёт каждый подкаталог
+    # (fs.inotify.max_user_watches). Не пустой список: с ним демон работает, но
+    # не индексирует ничего. Непустой folders из user_conf.yml главнее;
+    # cfg/dev.yml для тестов задаёт paths: [] явно.
     paths: list[str] = Field(default_factory=lambda: ["/home"])
     max_depth: int | None = None
-    # Идти ли по символьным ссылкам при обходе. True: пользователи держат за
-    # ссылками рабочие каталоги, и без этого они молча не индексировались.
-    # Обход защищён от петель и повторного прохода одного дерева по
-    # (st_dev, st_ino) — см.iter_file_metadata.
+    # True: рабочие каталоги часто лежат за симлинками. От петель и повторного
+    # обхода дерева защищает учёт (st_dev, st_ino) в iter_file_metadata.
     follow_symlinks: bool = True
     verbose: bool = False
     filter_files: Callable[[str], bool] | None = None
-    filter_meta: Callable[[Any], bool] | None = None  # filter_meta
+    filter_meta: Callable[[Any], bool] | None = None
     filter_dirs: Callable[[str], bool] | None = None
     batch_wait_time: float = 1
+    # Не используется: форматы задаёт реестр парсеров (src/parsers).
     allowed_extensions: list[str] = Field(
         default_factory=lambda: [
             "pdf",
@@ -136,23 +180,13 @@ class FileScanConfig(BaseModel):
 
 
 class EmailScanConfig(BaseModel):
-    """Пороги размера для почтового тракта.
+    """Пороги размера для почты — ограничение памяти демона.
 
-    Письмо разбирается только целиком в памяти (MIME-дерево не читается
-    потоково), поэтому пороги здесь — про потребление памяти демоном, а не про
-    полезность содержимого. Файловый `FileScanConfig.max_size` к почте не
-    применяется: письма не проходят через обход файловой системы.
-
-    Порог письма обязан быть выше порога вложения: вложение лежит внутри
-    письма в base64 — плюс треть на кодирование и ещё ~2.6% на переносы строк,
-    так что вложение в 30 МиБ занимает в письме около 41 МиБ. При меньшем
-    пороге письма порог вложения не сработал бы никогда: письмо отсекалось бы
-    раньше, чем дело дошло до вложений.
-
-    Пик памяти задаёт именно порог письма: письмо читается и разбирается
-    целиком. Поэтому снижать порог вложения имеет смысл только вместе с
-    порогом письма — иначе тяжёлое письмо всё равно будет прочитано, а
-    вложение отброшено уже после разбора.
+    Письмо разбирается целиком в памяти, поэтому пик задаёт порог письма, и
+    снижать порог вложения есть смысл только вместе с ним. `FileScanConfig.max_size`
+    к почте не применяется. Порог письма должен быть выше порога вложения:
+    в base64 вложение 30 МиБ занимает ~41 МиБ, и иначе письмо отсекалось бы
+    раньше, чем дойдёт до вложений.
     """
 
     max_message_size: int = 48 * 1024 * 1024
@@ -165,9 +199,13 @@ class SplitterCfg(BaseModel):
 
 
 class EmbeddingModelConfig(BaseModel):
+    # Эмбеддинги считает OpenVINO (Config.ov_model) по model_path. model_type
+    # меняет только нарезку (jina/st — токенизатор transformers) и embed_dim;
+    # device и *_promt_name никто не читает.
     model_type: Literal["jina", "st", "fake", "ov"] = "ov"
     model_path: str = str(base_path / "models/rubert-tiny2_002")
     device: str = "cpu"
+    # Не увеличивать: с большим батчем индексация зависает (CPU 0 %).
     batch_size: int = 8
     passages_promt_name: str | None = None
     query_promt_name: str | None = None
@@ -183,9 +221,11 @@ class Config(BaseSettings):
     email_scan_cfg: EmailScanConfig = Field(default_factory=EmailScanConfig)
     embed_splitter_cfg: SplitterCfg = Field(default_factory=SplitterCfg)
     embed_model_cfg: EmbeddingModelConfig = Field(default_factory=EmbeddingModelConfig)
+    # Не используется, как и reranker_k/reranker_cutoff: реранкера в продукте нет.
     reranker_model_cfg: RarankerModelConfig = Field(default_factory=RarankerModelConfig)
     # Полнотекстовый индекс; индекс с другими параметрами пересобирается при старте.
     fts_cfg: FtsConfig = Field(default_factory=FtsConfig)
+    # Не используются: реранкера в продукте нет.
     reranker_k: int = 30
     reranker_cutoff: float = 0.1
     ld_db_path: str = LANCE_URL
@@ -193,7 +233,8 @@ class Config(BaseSettings):
     lsm_path: str = LSM_PATH
     ld_files_table: str = "files"
     ld_email_table: str = "files_email"
-    # Add option for eager initialization (useful for testing PyInstaller builds)
+    # Каталог user_conf.yml (настройки из POST /config); «~» раскрывается в
+    # data_directory_path.
     data_directory: str = str(_user_root)
     # Сколько строк накапливать перед записью в LanceDB. Это НЕ размер батча
     # инференса (тот в embed_model_cfg.batch_size): каждая запись — отдельная
@@ -222,18 +263,10 @@ class Config(BaseSettings):
         "DEBUG",
         "NOTSET",
     ] = "INFO"
-    # Файл лога (RAG_LOG_FILE). Пустая строка — выключить файловый сток.
-    #
-    # Зачем он нужен, если есть journald. Демон пишет в stderr, и при исправном
-    # journald этого достаточно. Но политика журнала задаётся образом ОС, а не
-    # нами: при Storage=none или SplitMode=none пользовательского журнала нет
-    # вовсе, а MaxLevelStore=warning выбрасывает всё, что мы пишем на INFO.
-    # Со стороны это выглядит одинаково — «сервис работает, логов нет» — и
-    # диагностировать нечем. Свой файл не зависит ни от одной из этих настроек.
-    #
-    # Каталог внутри ~/.files-search выбран сознательно: postrm при purge
-    # удаляет его целиком, значит лог с путями к личным файлам пользователя не
-    # переживёт удаление пакета (БТ §7 «следов не остаётся»).
+    # Файл лога; пустая строка — только stderr. Нужен, когда образ ОС не хранит
+    # наш журнал: Storage=none, SplitMode=none или MaxLevelStore=warning.
+    # Внутри ~/.files-search, чтобы postrm --purge удалил лог с путями к личным
+    # файлам вместе с индексом (БТ §7).
     log_file: str | None = str(_root / "logs" / "lib-local-rag.log")
     log_max_bytes: int = 10 * 1024 * 1024
     log_backup_count: int = 3
@@ -244,32 +277,19 @@ class Config(BaseSettings):
     # Минимальный интервал между компакциями таблицы: она склеивает фрагменты,
     # но стоит CPU и диска, поэтому не запускается на каждое обновление.
     index_optimize_interval: float = 300.0
-    # Интервал (сек) периодического полного прохода — страховка поверх
-    # наблюдения за файловой системой. События теряются при переполнении
-    # очереди, не приходят для каталогов, ставших читаемыми, и оставляют
-    # осиротевшие записи после перемещений; проход заодно зовёт
-    # reconcile_deleted и вычищает из индекса пропавшее с диска.
-    # Запускается только в простое. 0 — выключить.
-    # Задаётся через RAG_FULL_RESCAN_INTERVAL или YAML-конфиг.
+    # Интервал (с) полного прохода в простое; 0 — выключить. Страховка поверх
+    # наблюдения ФС: события теряются при переполнении очереди и не приходят для
+    # каталогов, ставших читаемыми. Проход же через reconcile_deleted вычищает
+    # из индекса пропавшее с диска.
     full_rescan_interval: float = 3600.0
-    # Пауза (сек) между батчами записи при индексации: отдаёт CPU
-    # интерактивной работе пользователя. 0 — индексировать без пауз.
-    # Задаётся через RAG_INDEX_THROTTLE_SECONDS или YAML-конфиг.
+    # Пауза (с) между батчами записи — отдаёт CPU пользователю; 0 — без пауз.
     index_throttle_seconds: float = 0.0
-    # Начинать ли индексацию сразу при старте процесса.
-    #
-    # True — штатный режим бесшовной поставки: демон поднялся и сам пошёл
-    # обходить папки, пользователь ничего не активирует. Управление — у
-    # кодингового агента через MCP-мост или HTTP API.
-    # False — отладочный режим: демон стартует, но ничего не сканирует, пока
-    # не придёт POST /api/v1/activate; поиск по уже собранному индексу
-    # продолжает работать.
-    #
-    # Задаётся через RAG_AUTOSTART_INDEXING или YAML-конфиг.
+    # True — штатно: индексация стартует вместе с демоном. False — для отладки:
+    # обход ждёт POST /api/v1/activate, поиск по готовому индексу работает.
     autostart_indexing: bool = True
     model_config = SettingsConfigDict(
         extra="ignore",
-        cli_parse_args=False,  # os.environ.get("TESTING") != "Y",
+        cli_parse_args=False,
         # Без префикса в конфиг попадает любая переменная окружения, совпавшая
         # с именем поля: EMAIL из оболочки роняет старт, USER_HOME и
         # DATA_DIRECTORY подменяют пути.
@@ -280,8 +300,11 @@ class Config(BaseSettings):
 
     @cached_property
     def data_directory_path(self):
-        os.makedirs(self.data_directory, exist_ok=True)
-        return Path(self.data_directory).expanduser().resolve()
+        # Создаётся раскрытый путь: makedirs("~/...") завёл бы в рабочем
+        # каталоге каталог с буквальным именем «~».
+        path = Path(self.data_directory).expanduser().resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     @cached_property
     def use_hf_tokenizer(self):
@@ -307,52 +330,12 @@ class Config(BaseSettings):
             )
 
     @cached_property
-    def openai(self):
-        from openai import AsyncOpenAI  # type: ignore
-
-        return AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-    @cached_property
-    def gigachat(self):
-        from gigachat import GigaChat  # type: ignore
-
-        token = os.getenv("GIGA_TOKEN")
-        if not token:
-            return None
-        ret = GigaChat(credentials=token, verify_ssl_certs=False)
-        return ret
-
-    @cached_property
-    def gigachat_models(self):
-        if self.gigachat:
-            return self.gigachat.get_models()
-        return None
-
-    def _load_transformers_model(self):
-        from transformers import AutoModel  # type: ignore
-
-        model = AutoModel.from_pretrained(
-            self.embed_model_cfg.model_path,
-            trust_remote_code=True,
-            # cache_dir="data/cache",
-        ).to(self.embed_model_cfg.device)
-        return model
-
-    # @cached_property
-    # def reranker(self):
-    #     from src.jina_reranker import JinaReranker
-
-    #     return JinaReranker(**self.reranker_model_cfg.model_dump())
-
-    @cached_property
-    def embedder(self):
-        if self.embed_model_cfg.model_type == "jina":
-            return self._load_transformers_model()
-        else:
-            raise ValueError(f"{self.embed_model_cfg.model_type=} is not supported")
-
-    @cached_property
     def embed_dim(self):
+        if self.embed_model_cfg.model_type == "ov":
+            # Под embed_dim создаётся таблица LanceDB: размерность, угаданная по
+            # имени каталога, разошлась бы с векторами на первой же записи.
+            if (dim := _ov_output_dim(self.ov_model)) is not None:
+                return dim
         if self.embed_model_cfg.model_type == "jina":
             return 1024
         elif self.embed_model_cfg.model_type in {"st", "ov"}:
@@ -370,21 +353,18 @@ class Config(BaseSettings):
             raise ValueError(f"{self.embed_model_cfg.model_type=} is not supported")
 
     def _ov_token_len(self, text: str):
-        # Через count_tokens, а не напрямую в CompiledModel: сплиттер вызывается
-        # из потоков парсинга, и общий на модель InferRequest их не выдерживает.
+        # Только через count_tokens (свой InferRequest на поток), не через общий
+        # self.ov_model.tokenizer([text]): сплиттер зовут из потоков парсинга, и
+        # на общем InferRequest они ловят «Infer Request is busy».
         return self.ov_model.count_tokens(text)
 
     @cached_property
     def _cached_token_len(self) -> Callable[[str], int]:
-        """Подсчёт длины с кэшем — то, чем меряет длину сплиттер.
+        """Длина в токенах для сплиттера, с кэшем.
 
-        `RecursiveCharacterTextSplitter` спрашивает длину на каждый кандидат
-        разбиения, а не по разу на чанк: сотни вызовов на документ при десятке
-        уникальных строк, и каждый гонит инференс токенизатора.
-
-        Кэш возвращает те же значения, поэтому границы чанков не меняются.
-        Очень длинные строки не кэшируются: их спрашивают один раз, а держать
-        их в памяти дорого.
+        Сплиттер спрашивает длину на каждый кандидат разбиения — сотни прогонов
+        токенизатора на документ при десятке уникальных строк. Границы чанков
+        кэш не меняет; очень длинные строки не кэшируются.
         """
         cached = lru_cache(maxsize=_TOKEN_LEN_CACHE_SIZE)(self._ov_token_len)
         max_len = self.embed_splitter_cfg.chunk_size * _TOKEN_LEN_CACHE_CHAR_FACTOR
@@ -406,45 +386,14 @@ class Config(BaseSettings):
         )
         return tokenizer
 
-    def _load_sentense_transformers_model(self):
-        from sentence_transformers import SentenceTransformer  # type: ignore
-
-        model_id = self.embed_model_cfg.model_path
-        if "rubert-tiny2" in model_id:
-            # from sentence_transformers import models
-
-            return SentenceTransformer(
-                model_id,
-                backend="openvino",
-                model_kwargs={
-                    "file_name": "openvino/openvino_model_qint8_quantized.xml",
-                    "repo_type": "local",
-                },
-                # local_files_only=True,
-            )
-            # return model
-
-        return SentenceTransformer(model_id, device=self.embed_model_cfg.device)
-
     @cached_property
     def tokenizer(self):
         if self.embed_model_cfg.model_type in ["jina", "st"]:
             return self._load_transformers_tokenizer()
         elif self.embed_model_cfg.model_type == "ov":
             return self.ov_model.tokenizer
-        elif self.embed_model_cfg.model_type == "st":
-            return self.st_model.tokenizer
         else:
             raise ValueError(f"{self.embed_model_cfg.model_type=} is not supported")
-
-    @cached_property
-    def st_model(self):
-        if self.embed_model_cfg.model_type == "st":
-            return self._load_sentense_transformers_model()
-        else:
-            raise ValueError(
-                f"{self.embed_model_cfg.model_type=} is not a valid sentence-transformers model"
-            )
 
     @cached_property
     def ov_model(self):
@@ -485,33 +434,10 @@ class Config(BaseSettings):
         )
 
     def embed_passages(self, texts: list[str]) -> list[list[float]] | np.ndarray:
-        if self.embed_model_cfg.model_type == "st":
-            return self.st_model.encode(
-                texts,
-                prompt_name=self.embed_model_cfg.passages_promt_name,
-                batch_size=self.embed_model_cfg.batch_size,
-                show_progress_bar=False,
-            ).tolist()
-        elif self.embed_model_cfg.model_type == "ov":
+        if self.embed_model_cfg.model_type == "ov":
             return self.ov_model.encode(texts)
-        elif self.embed_model_cfg.model_type == "jina":
-            return self.embedder.encode(texts, task="retrieval.passage").tolist()
         elif self.embed_model_cfg.model_type == "fake":
             return [[random() for _ in range(1024)] for _ in texts]
-        else:
-            raise NotImplementedError()
-
-    def embed_query(self, texts: list[str]) -> list[list[float]] | np.ndarray:
-        if self.embed_model_cfg.model_type == "st":
-            return self.st_model.encode(
-                texts,
-                prompt_name=self.embed_model_cfg.query_promt_name,
-                batch_size=self.embed_model_cfg.batch_size,
-            ).tolist()
-        elif self.embed_model_cfg.model_type == "ov":
-            return self.ov_model.encode(texts)
-        elif self.embed_model_cfg.model_type == "jina":
-            return self.embedder.encode(texts, task="retrieval.query").tolist()
         else:
             raise NotImplementedError()
 
@@ -530,12 +456,10 @@ class Config(BaseSettings):
                 settings_cls,
                 env_file=".env",
             ),
-            # init_settings,
         )
-        # Get config path from environment or use None as fallback
         conf = os.environ.get("CONFIG_PATH")
         if conf is None:
-            # If no config path is found, return basic sources
+            # init_settings тут нет: без CONFIG_PATH аргументы Config(...) игнорируются.
             return ret
 
         conf_yaml = conf if conf.endswith((".yml", ".yaml")) else None
@@ -544,7 +468,7 @@ class Config(BaseSettings):
         if conf_yaml:
             ret = (
                 env_settings,
-                init_settings,  # Use the original init_settings directly
+                init_settings,
                 YamlConfigSettingsSource(
                     settings_cls,
                     yaml_file=conf_yaml,
@@ -554,7 +478,7 @@ class Config(BaseSettings):
         elif conf_json:
             ret = (
                 env_settings,
-                init_settings,  # Use the original init_settings directly
+                init_settings,
                 JsonConfigSettingsSource(
                     settings_cls,
                     json_file=conf_json,
@@ -569,7 +493,7 @@ class Config(BaseSettings):
 
     @property
     def user_config(self):
-        from .server.model import UserConfig
+        from .common.user_config import UserConfig
 
         p = self.user_conf_path
         if not p.exists():
@@ -578,10 +502,8 @@ class Config(BaseSettings):
             with open(p) as f:
                 return UserConfig.model_validate(yaml.load(f, Loader=yaml.CLoader))
         except Exception:
-            # Битый или обрезанный user_conf.yml не должен ронять всё: это
-            # свойство читают и API (GET/POST /config), и обход файлов, и
-            # почта. Откатываемся к конфигу из YAML/env — демон продолжает
-            # работать, а пользователь может перезаписать настройки.
+            # Битый user_conf.yml не должен ронять API, обход файлов и почту:
+            # откатываемся к конфигу из YAML/env, настройки можно перезаписать.
             lg.exception("user_conf.yml повреждён (%s), берём конфиг по умолчанию", p)
             return None
 
@@ -634,7 +556,9 @@ class Config(BaseSettings):
 
     @property
     def email_begin_date(self):
-        if self.email_config and self.email_config.index_last_n_days:
+        # is not None, а не истинность: окно снимает только null (0 и
+        # отрицательные EmailConfig приводит к окну по умолчанию).
+        if self.email_config and self.email_config.index_last_n_days is not None:
             return datetime.datetime.now() - datetime.timedelta(
                 self.email_config.index_last_n_days
             )
@@ -643,22 +567,27 @@ class Config(BaseSettings):
 
     @property
     def user_config_with_default(self):
-        from .server.model import UserConfig
+        from .common.user_config import UserConfig
 
+        default_folders = [str(Path(p).expanduser()) for p in self.file_scan_cfg.paths]
         if (cfg := self.user_config) is not None:
+            if not cfg.folders:
+                # Как в scan_paths: пустой или null список — пути из YAML. GET
+                # /config и мост (песочница чтения, local_add_path) должны видеть
+                # те же корни, что обходит демон.
+                return cfg.model_copy(update={"folders": default_folders})
             return cfg
         else:
             return UserConfig(
-                folders=[str(Path(p).expanduser()) for p in self.file_scan_cfg.paths],
+                folders=default_folders,
                 email=self.email_config or EmailConfig(),
             )
 
     def update_user_config(self, config: BaseModel):
-        """Атомарно записать пользовательский конфиг.
+        """Атомарно записать user_conf.yml (временный файл + os.replace).
 
-        Открытие целевого файла на "w" усекает его сразу, поэтому обрыв
-        процесса посреди yaml.dump оставлял пустой или обрезанный
-        user_conf.yml — а его читают и API, и обход файлов, и почта.
+        Прямая запись с "w" сразу усекает файл, и обрыв посреди yaml.dump
+        оставил бы его пустым или обрезанным.
         """
         p = self.user_conf_path
         os.makedirs(p.parent, exist_ok=True)
@@ -683,12 +612,9 @@ class Config(BaseSettings):
 
     @property
     def scan_max_depth(self) -> int | None:
-        """Глубина рекурсивного наблюдения файловых каталогов.
+        """Глубина наблюдения каталогов (см. UserConfig.max_depth).
 
-        None — наблюдать всё дерево (recursive=True, по одному inotify-watch на
-        каждый подкаталог). Число — ограничить глубину, чтобы не упираться в
-        fs.inotify.max_user_watches на большом домашнем каталоге. Совпадает по
-        приоритету со scan_paths: пользовательская настройка — главнее конфига.
+        Как и в scan_paths, пользовательская настройка главнее конфига.
         """
         if (user_cfg := self.user_config) and user_cfg.max_depth is not None:
             return user_cfg.max_depth

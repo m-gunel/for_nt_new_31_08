@@ -6,6 +6,7 @@ from .doc_model import Block, ParsedDoc
 
 # Старший байт символа UTF-16: 0x00 — латиница и знаки, 0x04 — кириллица.
 _HIGH = {0x00, 0x04}
+_NON_ASCII = bytes(range(0x80, 0x100))
 
 
 def _utf16_without_bom(sample: bytes) -> str | None:
@@ -39,15 +40,17 @@ def decode_text(data: bytes) -> tuple[str, str]:
         return data.decode("utf-8"), "utf-8"
     except UnicodeDecodeError:
         text = data.decode("utf-8", "replace")
-        if text.count("\ufffd") <= max(3, len(text) // 1000):
+        bad = text.count("\ufffd")
+        # Доля битых — от байтов вне ASCII, а не от длины: в cp1251 битый почти
+        # каждый такой байт, даже когда русских слов в ASCII-логе единицы.
+        non_ascii = len(data) - len(data.translate(None, _NON_ASCII))
+        if bad <= max(3, len(text) // 1000) and bad * 10 <= non_ascii * 3:
             return text, "utf-8"
         return data.decode("cp1251", "replace"), "cp1251"
 
 
 @parser("txt")
 class TxtParser(Parser):
-    """Парсер для обычных текстовых файлов (.txt)."""
-
     def parse_io(self, file: BinaryIO) -> ParsedDoc:
         """Строка — блок: чанк знает свои строки в исходном файле."""
         text, encoding = decode_text(file.read())

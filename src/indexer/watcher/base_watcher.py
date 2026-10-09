@@ -1,7 +1,8 @@
 import abc
 import asyncio
+import errno
 import os
-from contextlib import ExitStack
+from contextlib import AsyncExitStack
 from logging import Logger
 from pathlib import Path
 
@@ -22,7 +23,6 @@ class AbstractFilesWatcher(abc.ABC, ConfigMixin):
         return Filter()
 
     def _get_file_metadata(self, path: str) -> FileMetadata:
-        """Get file metadata from path, handling errors gracefully."""
         # abspath — как в iter_file_metadata: индекс хранит абсолютные пути,
         # а watchdog отдаёт путь в том виде, в каком его передали в schedule.
         path = os.path.abspath(path)
@@ -32,16 +32,14 @@ class AbstractFilesWatcher(abc.ABC, ConfigMixin):
                 path=path, size=stat.st_size, mtime_seconds=int(stat.st_mtime)
             )
         except OSError:
-            # If we can't stat the file (e.g., it was deleted), return metadata with zeros
+            # Файл уже исчез — нулевые метаданные.
             return FileMetadata(path=path, size=0, mtime_seconds=0)
 
     def _watch_paths(self) -> list[Path]:
         """Каталоги для наблюдения, из которых убраны несуществующие.
 
         inotify отказывает по отсутствующему пути при старте эмиттера, и
-        падает при этом весь observer — вместе с наблюдением за живыми
-        папками. Одного мусорного пути, сохранённого в user_conf.yml, хватало,
-        чтобы демон остался вообще без слежения за файловой системой.
+        падает весь observer — вместе с наблюдением за живыми папками.
         """
         paths: list[Path] = []
         missing: list[str] = []
@@ -70,14 +68,19 @@ class AbstractFilesWatcher(abc.ABC, ConfigMixin):
         if not paths:
             lg.warning("нет ни одного существующего каталога — watcher не запущен")
             return
-        with ExitStack() as stack:
+        # Исключения сверяются ниже корня, как в полном проходе: корень вида
+        # ~/Build иначе терял бы все свои события.
+        roots = [os.path.abspath(p) for p in paths]
+        async with AsyncExitStack() as stack:
             adapter = WatchDogAdapter(
                 *paths,
                 watch_filter=self.filter,
                 ignore_permission_denied=True,
                 max_depth=self.cfg.scan_max_depth,
             )
-            stack.callback(adapter.close)
+            # Закрытие — в потоке: observer.stop() ждёт, пока поток постановки
+            # отпустит observer, а на большом дереве это секунды и минуты.
+            stack.push_async_callback(asyncio.to_thread, adapter.close)
             # Нужен в _handle_new_dirs: на каталог, перемещённый внутрь
             # наблюдаемого дерева, наблюдение приходится ставить вручную.
             self._adapter = adapter
@@ -86,15 +89,18 @@ class AbstractFilesWatcher(abc.ABC, ConfigMixin):
                 # обходит всё дерево и заняла бы event loop целиком.
                 watcher = await adapter.start_async()
             except OSError as exc:
-                # errno нужен в логе: ENOSPC/EMFILE — упёрлись в лимит
-                # fs.inotify.max_user_watches, ENOENT/ENOTDIR — каталог исчез
-                # между проверкой и стартом эмиттера.
+                # errno нужен в логе: ENOSPC — исчерпан fs.inotify.max_user_watches,
+                # EMFILE — fs.inotify.max_user_instances, ENOENT/ENOTDIR — каталог
+                # исчез между проверкой и стартом эмиттера.
+                limit = {
+                    errno.ENOSPC: "fs.inotify.max_user_watches",
+                    errno.EMFILE: "fs.inotify.max_user_instances",
+                }.get(exc.errno)
                 lg.error(
-                    "не удалось начать наблюдение (errno=%s %s), watcher "
-                    "остановлен; при ENOSPC/EMFILE поднимите "
-                    "fs.inotify.max_user_watches",
+                    "не удалось начать наблюдение (errno=%s %s), watcher остановлен%s",
                     exc.errno,
                     exc.strerror,
+                    f"; поднимите {limit}" if limit else "",
                     exc_info=True,
                 )
                 return
@@ -105,11 +111,11 @@ class AbstractFilesWatcher(abc.ABC, ConfigMixin):
                 dir_paths: set[str] = set()
                 file_paths: set[str] = set()
                 for event in changes:
-                    if not check_path(Path(event.path)):
-                        # пропускаем изменения в исключаемых местах
+                    path = os.path.abspath(event.path)
+                    if not check_path(Path(path), roots):
                         continue
                     target = dir_paths if event.is_directory else file_paths
-                    target.add(os.path.abspath(event.path))
+                    target.add(path)
 
                 await self._handle_missing_dirs(dir_paths)
                 await self._handle_new_dirs(dir_paths)
@@ -117,9 +123,17 @@ class AbstractFilesWatcher(abc.ABC, ConfigMixin):
 
     async def _handle_missing_dirs(self, dir_paths: set[str]) -> None:
         """Снять с индекса поддеревья исчезнувших каталогов."""
+        adapter = getattr(self, "_adapter", None)
+        # Есть только у WatchDogAdapter: заглушкам в тестах не нужен.
+        unwatch = getattr(adapter, "unwatch_dir", None)
         for path in sorted(dir_paths):
             if os.path.isdir(path):
                 continue
+            if unwatch is not None:
+                try:
+                    await asyncio.to_thread(unwatch, path)
+                except Exception:
+                    lg.exception("не удалось снять наблюдение с %s", path)
             try:
                 await self.on_delete_dir(path)
             except Exception as e:
@@ -140,15 +154,10 @@ class AbstractFilesWatcher(abc.ABC, ConfigMixin):
     async def _handle_new_dirs(self, dir_paths: set[str]) -> None:
         """Проиндексировать каталоги, появившиеся в наблюдаемом дереве.
 
-        Событий по вложенным файлам может не прийти вовсе: перенос каталога —
-        это один rename, ядро шлёт единственный IN_MOVED_TO по самому
-        каталогу. Раньше до адаптера не доходило даже это (DirCreatedEvent не
-        был подписан), и каталог, перенесённый снаружи внутрь, оставался
-        непроиндексированным до перезапуска демона.
-
-        Одним механизмом закрываются три сценария: перенос каталога извне,
-        каталог, ставший читаемым, и подкаталог, созданный после старта.
-        Переименование внутри дерева тоже: старый путь снимается с индекса в
+        Перенос каталога — один rename: ядро шлёт единственный IN_MOVED_TO по
+        самому каталогу, событий по вложенным файлам нет. Так же
+        обрабатываются каталог, ставший читаемым, и подкаталог, созданный
+        после старта. При переименовании внутри дерева старый путь снимает
         _handle_missing_dirs, новый обходится здесь.
         """
         adapter = getattr(self, "_adapter", None)
@@ -157,10 +166,6 @@ class AbstractFilesWatcher(abc.ABC, ConfigMixin):
                 # Каталога нет — это ветка _handle_missing_dirs.
                 continue
             if adapter is not None:
-                # У IN_MOVED_TO нет бита IN_CREATE, поэтому watchdog не
-                # добавляет watch на ПЕРЕМЕЩЁННЫЙ внутрь каталог, хотя на
-                # созданный обычным mkdir добавляет. Без этого файлы,
-                # появившиеся в нём уже после переноса, не замечаются.
                 try:
                     await asyncio.to_thread(adapter.watch_dir, path)
                 except Exception:
@@ -174,24 +179,29 @@ class AbstractFilesWatcher(abc.ABC, ConfigMixin):
                 lg.info(
                     "появился каталог %s: файлов к индексации %s", path, len(metas)
                 )
-                await self.on_upsert(metas)
+                # Как в _handle_files: сбой записи (нет места, LanceDB,
+                # инференс) не должен завершать наблюдение.
+                try:
+                    await self.on_upsert(metas)
+                except Exception:
+                    lg.exception("не удалось проиндексировать каталог %s", path)
 
     async def _handle_files(self, file_paths: set[str]) -> None:
         """Развести пути на удалённые и живые ПО ФАКТУ, а не по типу события.
 
         Порядок и склейка событий отличаются между FSEvents, inotify и Windows:
-        удаление легко перекрывается более поздним `modified` по тому же пути.
-        Тогда запись остаётся в индексе навсегда — полный проход удалённые
+        удаление легко перекрывается более поздним `modified` по тому же пути,
+        и запись осталась бы в индексе навсегда — полный проход удалённые
         файлы не замечает.
         """
         missing = [p for p in file_paths if not os.path.exists(p)]
         existing = [p for p in file_paths if os.path.exists(p)]
 
-        for path in missing:
+        if missing:
             try:
-                await self.on_delete(self._get_file_metadata(path))
+                await self.on_delete_many([self._get_file_metadata(p) for p in missing])
             except Exception as e:
-                lg.exception(f"Error handling delete {path}: {e}")
+                lg.exception(f"Error handling delete {missing[:3]}...: {e}")
 
         if existing:
             try:
@@ -202,6 +212,18 @@ class AbstractFilesWatcher(abc.ABC, ConfigMixin):
     @abc.abstractmethod
     async def on_delete(self, file: FileMetadata) -> None:
         raise NotImplementedError()
+
+    async def on_delete_many(self, files: list[FileMetadata]) -> None:
+        """Снять с индекса пачку исчезнувших файлов.
+
+        По умолчанию — по одному через on_delete; Watcher переопределяет его
+        одним пакетным удалением.
+        """
+        for file in files:
+            try:
+                await self.on_delete(file)
+            except Exception as e:
+                lg.exception(f"Error handling delete {file.path}: {e}")
 
     @abc.abstractmethod
     async def on_delete_dir(self, path: str) -> None:

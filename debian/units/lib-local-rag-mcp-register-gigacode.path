@@ -5,17 +5,11 @@ Documentation=file:/usr/lib/lib-local-rag/mcp/README.md
 ConditionUser=!@system
 
 [Path]
-# Здесь следим за самим файлом, а не за каталогом: settings.json создаёт сам
-# GigaCode (в нём лежат ide, $version и пустой mcpServers), так что событие
-# гарантированно будет. Наблюдение за файлом точнее — не дёргает сервис на
-# каждую постороннюю запись в ~/.gigacode.
-#
-# Про то, почему только PathChanged= и никакого PathExists=, — см. соседний
-# юнит lib-local-rag-mcp-register-wsc.path.
+# Следим за самим файлом: settings.json создаёт GigaCode, так что событие
+# будет, а посторонние записи в ~/.gigacode сервис не дёргают. Почему только
+# PathChanged= — см. lib-local-rag-mcp-register-wsc.path.
 PathChanged=%h/.gigacode/settings.json
-# Вторая строка — папка разработчика SberOS /home/work/ЛОГИН@ДОМЕН (%u
-# раскрывается в ЛОГИН@ДОМЕН), зачем она и почему безвредна, если папки
-# нет, — см. тот же соседний юнит.
+# Папка разработчика SberOS (%u = ЛОГИН@ДОМЕН) — см. тот же юнит.
 PathChanged=/home/work/%u/.gigacode/settings.json
 Unit=lib-local-rag-mcp-register.service
 

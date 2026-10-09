@@ -14,6 +14,7 @@ from fastapi import APIRouter, Body, HTTPException, Response
 
 from src.common import IndexingStatus
 from src.indexer import AppIndex, reconfigure_lock, restart_watcher, stop_watcher
+from src.indexer.exclude import read_refusal
 from src.parsers import get_parser, read_document_text
 from src.server.model import (
     HealthCheckResponse,
@@ -25,6 +26,7 @@ from src.server.model import (
     SearchRequest,
     SearchResponse,
     UserConfig,
+    UserConfigUpdate,
 )
 from src.thunderbird.lazy_iter_mbox import _decode_filename
 from src.utils import AppConfig, get_logger
@@ -34,13 +36,11 @@ lg = get_logger(__name__)
 
 router = APIRouter()
 
-# Демон живёт долго, а выданные наружу временные файлы никто не удаляет.
-# Держим ограниченное окно последних выдач и подчищаем самые старые, чтобы
-# не забивать диск пользователя.
+# Выданные наружу временные файлы никто не удаляет: держим окно последних
+# выдач и подчищаем самые старые.
 _MAX_TEMP_DIRS = 32
-# Одного счётчика мало: письмо ограничено 48 МиБ, поэтому 32 выдачи — это до
-# полутора гигабайт. На АРМ каталог временных файлов обычно смонтирован как
-# tmpfs, то есть занимает оперативную память, а не диск.
+# И по объёму: 32 письма по 48 МиБ — до 1,5 ГиБ, а /tmp на АРМ обычно tmpfs,
+# то есть оперативная память.
 _MAX_TEMP_BYTES = 256 * 1024 * 1024
 _temp_dirs: deque[tuple[Path, int]] = deque()
 _temp_dirs_bytes = 0
@@ -80,10 +80,8 @@ async def status_check(index: AppIndex) -> IndexingStatus:
     return await index.status()
 
 
-# Пример тела для «Try it out» в /docs. Без него Swagger собирает тело из
-# схемы и заполняет каждый фильтр заглушкой «string»: такой запрос отвергается
-# (folder не абсолютный путь) или молча ничего не находит (ext «string»).
-# Первым — запрос без фильтров: все они необязательны.
+# Примеры для «Try it out» в /docs: иначе Swagger заполняет каждый фильтр
+# заглушкой «string», и запрос отвергается или молча ничего не находит.
 _SEARCH_EXAMPLES = {
     "no_filters": {
         "summary": "Без фильтров",
@@ -125,11 +123,9 @@ async def search(
     request: Annotated[SearchRequest, Body(openapi_examples=_SEARCH_EXAMPLES)],
     index: AppIndex,
 ) -> SearchResponse:
-    # Индексатор берёт по limit глубокий пул чанков, документы из него
-    # собирает и обрезает до limit уже SearchResponse. pinned — документы,
-    # найденные по коду из имени файла: индексатор их находит и дочитывает,
-    # SearchResponse ставит первыми. Фильтры по метаданным уходят в LanceDB
-    # условием where и действуют на всё это сразу.
+    # По limit индексатор берёт глубокий пул чанков, а SearchResponse собирает
+    # из него не больше limit документов. pinned заполняет индексатор: это
+    # документы, найденные по коду из имени файла, в выдаче они первые.
     pinned: list[str] = []
     results = await index.search(
         request.query,
@@ -150,8 +146,7 @@ async def get_config(cfg: AppConfig):
 def _merge_user_config(current: UserConfig, incoming: UserConfig) -> UserConfig:
     """Частичный апдейт: не присланные поля не затирают сохранённые.
 
-    Раньше на диск писалась вся модель запроса, и POST {"folders": [...]}
-    молча сбрасывал настройки почты в дефолт (email.enabled=false).
+    Иначе POST {"folders": [...]} сбрасывал бы настройки почты в дефолт.
     """
     data = current.model_dump()
     for key, value in incoming.model_dump(exclude_unset=True).items():
@@ -162,13 +157,46 @@ def _merge_user_config(current: UserConfig, incoming: UserConfig) -> UserConfig:
     return UserConfig.model_validate(data)
 
 
-def _validate_folders(folders: list[str] | None) -> None:
-    """Отклонить пути, которых нет на диске.
+# Каталоги ОС: документов пользователя в них нет, а обход и inotify по ним —
+# это вся система (/usr) или псевдо-ФС (/proc, /sys). /root не в списке: под
+# root демон не запускается (ConditionUser=!@system), а у root это дом.
+_SYSTEM_DIRS = (
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/proc",
+    "/sbin",
+    "/sys",
+    "/usr",
+    "/var",
+)
 
-    Сохранённый несуществующий путь тих и разрушителен: обход не находит по
-    нему файлов, а watcher падает на inotify целиком и перестаёт отслеживать
-    вообще все папки. Swagger подставляет в тело запроса "string" — этого
-    достаточно, чтобы индексация выглядела сломанной, хотя API ответил 200.
+
+def _forbidden_folder(folder: str) -> bool:
+    """Корень ФС, системный каталог или путь со скрытым компонентом.
+
+    Список папок — граница чтения /read_file и local_read_file, а меняет его
+    агент: инструкция в документе «добавь / (или ~/.config) в индекс» открыла
+    бы ему всю ФС или конфиги с токенами.
+    """
+    path = os.path.abspath(os.path.expanduser(folder))
+    if path == os.sep or os.path.realpath(path) == os.sep:
+        return True
+    if any(path == d or path.startswith(d + os.sep) for d in _SYSTEM_DIRS):
+        return True
+    return any(part.startswith(".") for part in Path(path).parts)
+
+
+def _validate_folders(folders: list[str] | None) -> None:
+    """Отклонить пути, которых нет на диске, и опасные корни.
+
+    На несуществующем пути watcher падает на inotify целиком и перестаёт
+    отслеживать все папки, хотя API ответил 200 (Swagger подставляет "string").
     """
     if folders is None:
         return
@@ -178,16 +206,32 @@ def _validate_folders(folders: list[str] | None) -> None:
             status_code=400,
             detail=f"не существуют или не являются каталогами: {bad}",
         )
+    forbidden = [p for p in folders if _forbidden_folder(p)]
+    if forbidden:
+        raise HTTPException(
+            status_code=400,
+            detail=f"корень ФС, системные и скрытые каталоги не индексируются: {forbidden}",
+        )
 
 
 @router.post("/config")
 async def update_config(
-    user_config: UserConfig,
+    user_config: UserConfigUpdate,
     cfg: AppConfig,
     index: AppIndex,
 ) -> Response:
     # До захвата блокировки и до записи на диск: при отказе конфиг должен
     # остаться ровно тем, что был.
+    if "folders" in user_config.model_fields_set and not user_config.folders:
+        # scan_paths понял бы [] и null как «настройки нет» и обходил бы пути
+        # из YAML — обратное тому, о чём просили.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "folders: пустой список и null не принимаются; "
+                "остановить индексацию — POST /api/v1/deactivate"
+            ),
+        )
     _validate_folders(user_config.folders)
     # Перезапуск watcher'а и индексации — не атомарная последовательность.
     # Без блокировки два параллельных POST /config гонятся за общим состоянием
@@ -195,10 +239,8 @@ async def update_config(
     async with reconfigure_lock():
         prev_paths = set(str(Path(p).expanduser().absolute()) for p in cfg.scan_paths)
         prev_email_enabled = cfg.email_enabled
-        # Глубина обхода читается ровно один раз — в AbstractFilesWatcher.run().
-        # Применить её можно только перезапуском наблюдения, поэтому смену
-        # надо заметить здесь: без этого POST /config {"max_depth": N} отвечал
-        # 200 и не менял ничего до следующего /activate или рестарта демона.
+        # max_depth читается только в AbstractFilesWatcher.run(): новая глубина
+        # вступает в силу лишь после перезапуска наблюдения.
         prev_max_depth = cfg.scan_max_depth
         cfg.update_user_config(
             _merge_user_config(cfg.user_config_with_default, user_config)
@@ -214,34 +256,24 @@ async def update_config(
             await index.stop_index()
             if to_delete := prev_paths - new_paths:
                 for p in to_delete:
-                    # Со слэшем на конце: delete_prefix снимает всё, что
-                    # начинается с этой строки, и без разделителя удаление
-                    # ~/Документы задело бы и ~/Документы_архив. Ровно та же
-                    # причина, по которой слэш добавлен в Watcher.on_delete_dir.
+                    # Со слэшем: иначе delete_prefix для ~/Документы задел бы
+                    # и ~/Документы_архив (так же в Watcher.on_delete_dir).
                     await index.delete_prefix(p.rstrip(os.sep) + os.sep)
         elif depth_changed:
-            # Список папок тот же, изменилась только глубина: останавливать
-            # индексацию незачем — она глубину не учитывает, — но наблюдение
-            # придётся поднять заново, иначе новое значение не вступит в силу.
+            # Изменилась только глубина: индексация её не учитывает,
+            # перезапускается лишь наблюдение.
             await stop_watcher()
         email_enabled = cfg.email_enabled
-        # Пришло ли выключение явно в этом запросе. Одного перехода
-        # «было включено -> стало выключено» мало: prev_email_enabled читается
-        # с диска, и если пользователь до вызова поправил user_conf.yml руками
-        # или удалил его, переход не наступает — почта остаётся выключенной, а
-        # уже проиндексированные письма навсегда остаются в выдаче поиска.
-        # Явный запрос трактуем как «убрать почту из индекса», сколько бы раз
-        # его ни повторили.
+        # Явное выключение в запросе — всегда «убрать почту из индекса»:
+        # prev_email_enabled читается с диска, и после ручной правки или
+        # удаления user_conf.yml перехода «вкл → выкл» нет, а старые письма
+        # остались бы в выдаче.
         disable_requested = (
             "email" in user_config.model_fields_set and not user_config.email.enabled
         )
         if email_enabled and not prev_email_enabled:
-            # Включение почты через API: сканер досоздаётся лениво,
-            # рестарт демона больше не нужен; первый проход — сразу.
-            #
-            # Но только на активном индексе: иначе включение почты запускало бы
-            # обход ящика на деактивированном демоне — обход в дверь, закрытую
-            # БТ §5.2. Настройка сохранена выше, поллинг поднимет /activate.
+            # Сканер почты создаётся лениво, первый проход — сразу, но только на
+            # активном индексе (БТ §5.2); иначе поллинг поднимет /activate.
             if index.active:
                 await index.start_emails_polling(immediate=True)
             else:
@@ -251,32 +283,26 @@ async def update_config(
                 )
         elif not email_enabled and (prev_email_enabled or disable_requested):
             await index.stop_emails_polling()
-            # Router не должен знать ни про число таблиц, ни про устройство
-            # сканера.
             await index.drop_email_index()
-        # Перезапуск — последним шагом секции, после всей работы по почте.
-        # Раньше start_reindex() создавал фоновую задачу в середине
-        # обработчика, и она шла сверять удалённые файлы в ту же БД
-        # состояния, куда drop_email_index() в этот момент писал.
-        # reconfigure_lock от этого не спасает: задача живёт вне лока.
+        # Перезапуск — после работы с почтой: фоновая задача start_reindex()
+        # живёт вне reconfigure_lock и писала бы в БД состояния одновременно
+        # с drop_email_index().
         if folders_changed:
             if index.active:
                 await index.start_reindex()
                 await restart_watcher()
             else:
-                # БТ §5.4: «Если индексация остановлена, то новая папка
-                # добавляется в список, но фактическое сканирование не
-                # начинается до следующего запуска». Список уже сохранён выше.
+                # БТ §5.4: при остановленной индексации список сохраняется,
+                # сканирование ждёт следующего запуска.
                 lg.info(
                     "индексация деактивирована: новый список папок сохранён, "
                     "сканирование начнётся после POST /api/v1/activate"
                 )
         elif depth_changed:
             if index.active:
-                # Переиндексация здесь не нужна: max_depth ограничивает только
-                # постановку inotify-наблюдений (_dirs_for_watch), а полный
-                # проход iter_file_metadata обходит дерево целиком независимо
-                # от него. Достаточно поднять наблюдение с новым значением.
+                # Без переиндексации: max_depth ограничивает только
+                # inotify-наблюдения (_dirs_for_watch), а iter_file_metadata
+                # обходит дерево целиком.
                 await restart_watcher()
             else:
                 lg.info(
@@ -381,11 +407,9 @@ def _email_subject(data: bytes) -> str:
     return _decode_filename(msg["Subject"]) or "message"  # type: ignore
 
 
-# Ключ письма: "email_<папка>:<начало>:<конец>:<имя>". Двоеточие может быть
-# И в имени папки ("Входящие:Архив"), И в имени вложения ("Отчёт:Q3.pdf"),
-# поэтому не годится ни split слева, ни rsplit справа: первый отъедает имя
-# папки, второй — имя вложения. Опорные точки — два ЧИСЛОВЫХ поля посередине;
-# ленивый `.+?` берёт самую левую пару, которая ими является.
+# Ключ письма: "email_<папка>:<начало>:<конец>:<имя>". Двоеточие бывает и в
+# имени папки, и в имени вложения, поэтому ни split, ни rsplit не годятся.
+# Опора — два числовых поля посередине; ленивый `.+?` берёт самую левую пару.
 _EMAIL_PATH_RE = re.compile(
     r"^email_(?P<prefix>.+?):(?P<start>\d+):(?P<stop>\d+):(?P<name>.*)$"
 )
@@ -411,23 +435,19 @@ async def get_file_path(req: RequestFilePath, cfg: AppConfig) -> ResponseFilePat
         )
     folder = match["prefix"]
     name = match["name"]
-    # Числа гарантированы самим шаблоном (\d+), int здесь уже не может упасть.
     start, stop = int(match["start"]), int(match["stop"])
     if start < 0 or stop <= start:
-        # Отрицательная длина чтения (f.read(stop - start)) прочитала бы
-        # весь mbox в память целиком.
+        # f.read() с отрицательной длиной прочитал бы весь mbox в память.
         raise HTTPException(status_code=400, detail="invalid offsets in absolute_path")
     if stop - start > cfg.email_scan_cfg.max_message_size:
-        # Диапазон приходит от клиента, а читается в память целиком: без
-        # верхней границы один запрос может забрать весь ящик.
+        # Диапазон задаёт клиент, а читается он в память целиком.
         raise HTTPException(
             status_code=400,
             detail="requested range exceeds the email size limit",
         )
 
-    # cfg.email_files отдаёт голые имена папок — шаблон выше уже снял префикс
-    # "email_", поэтому сверяем напрямую, как и _process_email_chunks.
-    # cfg.email_files может обходить ~/.thunderbird — не в event loop.
+    # Шаблон уже снял "email_", а email_files отдаёт голые имена папок.
+    # email_files может обходить ~/.thunderbird — не в event loop.
     email_files = await asyncio.to_thread(lambda: list(cfg.email_files))
     file = {name: path for path, name in email_files}.get(folder)
     if not file:
@@ -473,23 +493,21 @@ _READ_FILE_MAX_BYTES = 64 * 1024 * 1024
 
 def _read_file_sync(raw_path: str, cfg: AppConfig) -> ReadFileResponse:
     """Синхронная часть /read_file — файловая работа уходит с event loop."""
-    # realpath, а не abspath: симлинк из индексируемой папки наружу не должен
-    # превращать ручку в чтение произвольного места ФС.
-    path = Path(os.path.realpath(os.path.expanduser(raw_path)))
+    # Границы — по пути, как его хранит индекс (ссылки не раскрыты); читается
+    # сам файл. realpath — от нормализованного пути: от raw_path «ссылка/..»
+    # увела бы чтение мимо проверенного места.
+    logical = os.path.abspath(os.path.expanduser(raw_path))
+    path = Path(os.path.realpath(logical))
     if not path.is_file():
         raise HTTPException(status_code=404, detail="файл не найден или не обычный")
-    inside = False
-    for root in cfg.scan_paths:
-        root_real = os.path.realpath(os.path.expanduser(root))
-        if str(path) == root_real or str(path).startswith(
-            root_real.rstrip(os.sep) + os.sep
-        ):
-            inside = True
-            break
-    if not inside:
+    refusal = read_refusal(logical, cfg.scan_paths, cfg.file_scan_cfg.follow_symlinks)
+    if refusal == "outside":
         raise HTTPException(status_code=400, detail="путь вне индексируемых папок")
-    if path.name.startswith("."):
-        raise HTTPException(status_code=400, detail="скрытые файлы не читаются")
+    if refusal == "excluded":
+        raise HTTPException(
+            status_code=400,
+            detail="скрытые файлы и содержимое скрытых и служебных каталогов не читаются",
+        )
     if path.stat().st_size > _READ_FILE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="файл больше лимита чтения")
     parser = get_parser(path.suffix.lower().lstrip("."))
@@ -505,9 +523,8 @@ def _read_file_sync(raw_path: str, cfg: AppConfig) -> ReadFileResponse:
             status_code=422, detail="не удалось разобрать файл"
         ) from None
     if not text:
-        # Парсер честно отработал, но текста нет: например, .doc на машине
-        # без конвертера. Это не сбой разбора, и агенту полезнее явный отказ,
-        # чем пустой ответ.
+        # Разбор прошёл, но текста нет (например, .doc без конвертера): агенту
+        # полезнее явный отказ, чем пустой ответ.
         raise HTTPException(
             status_code=422, detail="парсер не дал текста (нет конвертера?)"
         )
@@ -527,9 +544,10 @@ async def read_file(req: ReadFileRequest, cfg: AppConfig) -> ReadFileResponse:
     Мост разбирает OOXML сам (stdlib), но pdf живёт только в бинаре демона
     (pymupdf), а легаси .doc/.xls — только через конвертер Р7-Офиса. Ручка
     закрывает их для local_read_file; без неё pdf в поставке был бы недоступен
-    навсегда. Правила доступа повторяют индексацию: realpath-путь внутри
-    scan_paths, обычный файл, формат из реестра парсеров — без этого ручка
-    превращалась бы в произвольное чтение файловой системы.
+    навсегда. Правила доступа повторяют индексацию (read_refusal): путь внутри
+    scan_paths без скрытых и служебных каталогов ниже корня, через символьную
+    ссылку — если обход по ним идёт; обычный файл, формат из реестра парсеров.
+    Без этого ручка превращалась бы в произвольное чтение файловой системы.
     """
     # Парсер может запускать внешний конвертер (Р7): это секунды блокировки,
     # event loop трогать нельзя.

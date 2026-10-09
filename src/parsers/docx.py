@@ -7,13 +7,14 @@ from typing import BinaryIO
 from docx2txt import process
 
 from src.utils import get_logger
-from src.utils.r7_office import convert_via_r7, find_x2t
+from src.utils.r7_office import R7Busy, convert_via_r7, find_x2t
 
 from ._tables import Budget
 from .base import Parser, SkipFile, parser
 from .doc_model import Block, ParsedDoc
 from .docx_ooxml import parse_docx
 from .metadata import ooxml_properties
+from .ooxml_limits import DOCX_LARGE, DOCX_UNREAD, oversize_reason
 
 lg = get_logger(__name__)
 
@@ -24,11 +25,15 @@ BUDGET_TOKENS = 450  # чанк таблицы; «Документ: <имя>» �
 class DocxParser(Parser):
     def parse_io(self, file: BinaryIO) -> ParsedDoc:
         """Структура документа по OOXML (src/parsers/docx_ooxml.py); сбой — docx2txt."""
+        if reason := oversize_reason(file, DOCX_UNREAD, DOCX_LARGE):
+            raise SkipFile(reason)
         meta, titles = ooxml_properties(file, "docx")
         try:
             blocks, found = parse_docx(
                 file, Budget(BUDGET_TOKENS, self._config.ov_model.count_tokens)
             )
+        except MemoryError:
+            raise  # docx2txt строит из того же XML дерево ещё прожорливее
         except Exception as exc:
             lg.warning(
                 "docx: разбор по OOXML не удался (%s: %s) — текст через docx2txt",
@@ -45,15 +50,10 @@ class DocxParser(Parser):
 
 
 def _find_doc_converter() -> tuple[str, list[str]] | None:
-    """Найти доступный конвертер .doc → текст.
+    """Конвертер .doc → текст, от лёгкого к тяжёлому; None — файл будет пропущен.
 
-    Целевая ОС продукта — Linux (SberOS), где `textutil` не существует.
-    Ни один из конвертеров не является обязательной зависимостью: если ничего
-    не нашлось, файл пропускается с предупреждением.
-
-    Порядок — от лёгкого к тяжёлому. На АРМ SberOS нет ни catdoc, ни
-    antiword, ни LibreOffice, зато везде стоит Р7-Офис (пакет sber-r7-office)
-    — его встроенный конвертер x2t закрывает .doc на типовой машине.
+    На АРМ SberOS нет textutil, catdoc, antiword и LibreOffice, зато везде стоит
+    Р7-Офис (sber-r7-office) — его x2t закрывает .doc на типовой машине.
     """
     if shutil.which("textutil"):  # macOS
         return "textutil", ["textutil", "-convert", "txt", "{src}", "-output", "{dst}"]
@@ -81,17 +81,28 @@ class DocParser(Parser):
     def parse_io(self, file: BinaryIO) -> ParsedDoc:
         # Р7-Офис переводит .doc в .docx — тот же разбор со структурой (заголовки,
         # нумерация, таблицы). Нет Р7 или не справился — конвертеры в голый текст.
+        busy: R7Busy | None = None
         if find_x2t():
             with tempfile.TemporaryDirectory() as tmp_dir:
                 src = os.path.join(tmp_dir, "doc.doc")
                 dst = os.path.join(tmp_dir, "doc.docx")
                 with open(src, "wb") as out:
                     shutil.copyfileobj(file, out)
-                if convert_via_r7(src, dst):
+                try:
+                    ok = convert_via_r7(src, dst, raise_busy=True)
+                except R7Busy as exc:
+                    ok, busy = False, exc
+                if ok:
                     with open(dst, "rb") as converted:
                         return DocxParser().parse_io(converted)
             file.seek(0)
         converter = _find_doc_converter()
+        if converter is not None and converter[0] == "r7-x2t":
+            # x2t уже не справился выше; второй запуск на том же файле дал бы
+            # тот же итог после ещё одного ожидания до CONVERT_TIMEOUT_S.
+            if busy is not None:
+                raise SkipFile(f"Р7-Офис: {busy}", permanent=False) from busy
+            return ParsedDoc([])
         if converter is None:
             lg.warning(
                 "не найден конвертер для .doc (нужен один из: textutil, catdoc, "
@@ -115,14 +126,6 @@ class DocParser(Parser):
 
 
 def _convert_doc(name: str, argv: list[str], src: str, dst: str, outdir: str) -> str:
-    if name == "r7-x2t":
-        # У x2t свои правила вызова (LD_LIBRARY_PATH, рабочий каталог,
-        # непредсказуемый код возврата) — его ведёт convert_via_r7, а не
-        # шаблон argv с {src}/{dst}.
-        if not convert_via_r7(src, dst):
-            raise RuntimeError("Р7-Офис не смог сконвертировать файл")
-        with open(dst, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
     cmd = [a.format(src=src, dst=dst, outdir=outdir) for a in argv]
     result = subprocess.run(
         cmd,

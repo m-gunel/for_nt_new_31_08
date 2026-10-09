@@ -5,10 +5,14 @@
 Запуск (только stdlib, ничего ставить не нужно; совместим с python3 >= 3.6):
 
     python3 scripts/sberos_check.py                 # все проверки
-    python3 scripts/sberos_check.py --port 8000     # порт демона, если не 8000
+    python3 scripts/sberos_check.py --port 8000     # порт, если демон его не опубликовал
     python3 scripts/sberos_check.py --compaction before
     ... удалить письмо, очистить корзину, дождаться compact в Thunderbird ...
     python3 scripts/sberos_check.py --compaction after
+
+Порт, pid, offsets.json, user_conf.yml и профиль Thunderbird берутся из дома
+демона, как у MCP-моста: $HOME или дом из passwd (на SberOS это разные
+каталоги, служба systemd --user живёт во втором).
 
 Отчёт печатается в stdout и сохраняется в sberos_report.json рядом со скриптом.
 
@@ -20,17 +24,16 @@
 from __future__ import print_function
 
 import argparse
+import configparser
 import hashlib
 import json
 import os
+import re
 import sys
 import time
+import urllib.request
 from email.parser import BytesHeaderParser
 
-HOME = os.path.expanduser("~")
-THUNDERBIRD_ROOT = os.path.join(HOME, ".thunderbird")
-FILES_SEARCH_ROOT = os.path.join(HOME, ".files-search")
-RAGSEARCH_CONF = os.path.join(HOME, ".ragsearch", "user_conf.yml")
 STATE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "sberos_compaction_state.json"
 )
@@ -38,16 +41,26 @@ REPORT_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "sberos_report.json"
 )
 
-# Повторяет логику find_email_root из src/thunderbird/find_files.py: корнем
-# считается каталог ImapMail/<host>, в котором есть хотя бы одна пара
-# <folder> + <folder>.msf; при нескольких аккаунтах предпочитается
-# корпоративный хост. Скрипт обязан выбирать тот же корень, что и демон,
-# иначе все остальные секции считаются по чужому каталогу.
+# Куда пакет ставит демон (debian/install); служба запускает PACKAGE_DIR/main.
+PACKAGE_DIR = "/opt/lib-local-rag"
+# Порт, если демон его не опубликовал, — как FALLBACK_URL моста.
+DEFAULT_PORT = 8000
+
+# Без прокси: штатный urlopen берёт http_proxy из окружения, а no_proxy
+# сравнивает строкой («localhost» не покрывает 127.0.0.1): 502 прокси выглядел
+# бы как «демон не отвечает». Как _OPENER в mcp_server.py.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+# Корень почты выбирается как Config.email_root (src/config.py): явный
+# email.path_to_email_folder, иначе как find_email_root
+# (src/thunderbird/find_files.py) — ImapMail/<host> хотя бы с одной парой
+# <folder> + <folder>.msf, корпоративный хост первым, между профилями —
+# профиль установки по installs.ini/profiles.ini, остальные по алфавиту.
+# Корень должен совпадать с демоновым, иначе остальные секции считаются по
+# чужому каталогу.
 PREFERRED_HOST = "imap.sberbank.ru"
 
-# mUTF-7-имя папки «Отправленные». Раньше именно по нему искался корень —
-# у пользователя без локально синхронизированных «Отправленных» почта не
-# индексировалась вовсе. Оставлено только для информационного поля отчёта.
+# mUTF-7-имя папки «Отправленные» — только для информационного поля отчёта.
 SENT_MUTF7 = "&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-"
 
 # Имена папок, которые не считаются персональными данными.
@@ -64,7 +77,7 @@ KNOWN_FOLDERS = {
     "&BCcENQRABD0EPgQyBDgEOgQ4-": "Черновики (mUTF-7)",
     "&BCMENAQwBDsENQQ9BD0ESwQ1-": "Удалённые (mUTF-7)",
     "&BB0ENQQ2BDUEOwQwBEIENQQ7BEwEPQQwBE8- &BD8EPgRHBEIEMA-": "Нежелательная почта (mUTF-7)",
-    "&BBAEQARFBDgEsg-": "Архив (mUTF-7)",
+    "&BBAEQARFBDgEMg-": "Архив (mUTF-7)",
     "&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1": "Отправленные-безсуффикса (mUTF-7)",
 }
 
@@ -83,54 +96,213 @@ def section(report, name, verdict, details):
     print(json.dumps(details, ensure_ascii=False, indent=2))
 
 
-# ---------------------------------------------------------------- profile ---
+def home_candidates():
+    """$HOME и дом из passwd без повторов — как _port_file_candidates моста.
+
+    Служба systemd --user живёт в доме из passwd, а терминал SberOS открыт с
+    HOME=/home/work/<LOGIN@DOMAIN>: по одному ~ данных демона не найти.
+    """
+    homes = [os.path.expanduser("~")]
+    try:
+        import pwd
+
+        homes.append(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, AttributeError):
+        pass  # не POSIX или uid без записи в passwd
+    found = []
+    seen = set()
+    for home in homes:
+        if not home or not os.path.isabs(home):
+            continue
+        key = os.path.realpath(home)
+        if key not in seen:
+            seen.add(key)
+            found.append(home)
+    return found
+
+
+def read_number(path):
+    """Число из файла, опубликованного демоном (port, pid); None — нет или мусор."""
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def read_port(files_root):
+    """Порт из <files_root>/port (src/port_file.py); None — не опубликован."""
+    port = read_number(os.path.join(files_root, "port"))
+    return port if port is not None and 1 <= port <= 65535 else None
+
+
+def pid_alive(pid):
+    """Жив ли процесс: True, False или None (неизвестно) — как _pid_alive моста."""
+    if pid is None or pid <= 0 or os.name != "posix":
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # процесс есть, просто не наш
+    except OSError:
+        return None
+    return True
+
+
+# Ранг дома: живой pid, неизвестный, мёртвый; без порт-файла — последним.
+_PID_RANK = {True: 0, None: 1, False: 2}
+_NO_PORT_RANK = 3
+
+
+def find_daemon_home():
+    """Дом, где лежат данные демона: port, pid, offsets.json, user_conf.yml.
+
+    Порядок как у моста (mcp_server._port_file_routes): устаревший порт-файл
+    в $HOME не заслоняет живую службу в доме из passwd; при равенстве — $HOME.
+    Без порт-файлов — первый дом с .files-search, иначе $HOME.
+    """
+    best = None
+    for home in home_candidates():
+        root = os.path.join(home, ".files-search")
+        if not os.path.isdir(root):
+            continue
+        if read_port(root) is None:
+            rank = _NO_PORT_RANK
+        else:
+            rank = _PID_RANK[pid_alive(read_number(os.path.join(root, "pid")))]
+        if best is None or rank < best[0]:
+            best = (rank, home)
+    return best[1] if best else os.path.expanduser("~")
+
+
+def display_path(path):
+    """Путь для отчёта: домашний каталог (в нём логин) заменён на ~."""
+    for home in home_candidates():
+        home = home.rstrip(os.sep)
+        if home and (path == home or path.startswith(home + os.sep)):
+            return "~" + path[len(home) :]
+    return path
+
+
+def expand_home(path, home):
+    """~ — дом демона: так путь из его конфига раскрывает Path.expanduser()."""
+    if path == "~" or path.startswith("~/"):
+        return home + path[1:]
+    return os.path.expanduser(path)
 
 
 def find_profile_dirs(tb_root):
-    """Все каталоги ImapMail/<host> под профилем Thunderbird."""
+    """Все каталоги ImapMail/<host> под профилем Thunderbird.
+
+    Хосты по алфавиту, как в find_email_root: при нескольких аккаунтах без
+    корпоративного демон берёт первый с папками.
+    """
     found = []
     if not os.path.isdir(tb_root):
         return found
     for dirpath, dirnames, _filenames in os.walk(tb_root):
         if os.path.basename(dirpath) == "ImapMail":
-            for host in dirnames:
+            for host in sorted(dirnames):
                 found.append(os.path.join(dirpath, host))
             dirnames[:] = []  # глубже ImapMail не спускаемся
     return found
 
 
-def list_folder_pairs(mail_root):
-    """Пары <name> + <name>.msf — то, что видит list_email_folders."""
-    ret = []
+def profile_ranks(tb_root):
+    """Ранг профиля, как в find_email_root: 0 — профиль установки, 1 — Default=1."""
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
     try:
-        names = os.listdir(mail_root)
-    except OSError:
-        return ret
-    for f in names:
-        if f.endswith(".msf"):
-            base = f[:-4]
-            full = os.path.join(mail_root, base)
-            if os.path.isfile(full):
-                ret.append((base, os.path.getsize(full)))
+        parser.read(
+            [
+                os.path.join(tb_root, "profiles.ini"),
+                os.path.join(tb_root, "installs.ini"),
+            ],
+            encoding="utf-8",
+        )
+    except (configparser.Error, OSError, UnicodeDecodeError):
+        return {}
+    ranks = {}
+    for name in parser.sections():
+        sect = parser[name]
+        if name.startswith("Profile"):
+            if sect.get("Default") == "1" and sect.get("Path"):
+                path = os.path.realpath(os.path.join(tb_root, sect["Path"]))
+                ranks.setdefault(path, 1)
+        elif sect.get("Default"):
+            ranks[os.path.realpath(os.path.join(tb_root, sect["Default"]))] = 0
+    return ranks
+
+
+def list_folder_pairs(mail_root):
+    """Пары <name> + <name>.msf — то, что видит list_email_folders.
+
+    Подпапки из <родитель>.sbd/ — с путём от корня: INBOX.sbd/Проекты.
+    """
+    ret = []
+    seen = set()
+    pending = [(mail_root, "")]
+    while pending:
+        directory, rel = pending.pop(0)
+        real = os.path.realpath(directory)
+        if real in seen:
+            continue
+        seen.add(real)
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for f in names:
+            if f.endswith(".msf"):
+                base = f[:-4]
+                full = os.path.join(directory, base)
+                if os.path.isfile(full):
+                    ret.append((rel + base, os.path.getsize(full)))
+        for f in names:
+            full = os.path.join(directory, f)
+            if f.endswith(".sbd") and os.path.isdir(full):
+                pending.append((full, rel + f + "/"))
     return ret
 
 
-def check_profile(report, tb_root):
+def check_profile(report, tb_root, email_folder=None):
+    if email_folder:
+        # Как Config.email_root: явный путь главнее автопоиска, пар .msf демон
+        # от него не требует. Сам путь в отчёт не идёт — в нём логин.
+        details = {"email_root_source": "path_to_email_folder"}
+        if not os.path.isdir(email_folder):
+            details["note"] = (
+                "email.path_to_email_folder задан, но каталога нет — "
+                "почта не индексируется"
+            )
+            section(report, "profile", "FAIL", details)
+            return None
+        return describe_mail_root(report, details, email_folder)
+
     details = {"thunderbird_root_exists": os.path.isdir(tb_root)}
     if not details["thunderbird_root_exists"]:
         section(
             report,
             "profile",
             "FAIL",
-            dict(details, note="каталог {0} не найден".format(tb_root)),
+            dict(details, note="каталог {0} не найден".format(display_path(tb_root))),
         )
         return None
 
     # Тот же отбор, что в find_email_root: кандидаты ImapMail/<host>,
-    # корпоративный хост первым, берём первый с непустым списком папок.
+    # корпоративный хост первым, между профилями — профиль установки, затем
+    # по имени каталога; берём первый с непустым списком папок.
     mail_roots = find_profile_dirs(tb_root)
     details["imap_mail_dirs_found"] = len(mail_roots)
-    mail_roots.sort(key=lambda p: os.path.basename(p) != PREFERRED_HOST)
+    ranks = profile_ranks(tb_root)
+    mail_roots.sort(
+        key=lambda p: (
+            os.path.basename(p) != PREFERRED_HOST,
+            ranks.get(os.path.realpath(os.path.dirname(os.path.dirname(p))), 2),
+            os.path.dirname(os.path.dirname(p)),
+        )
+    )
 
     chosen = None
     for candidate in mail_roots:
@@ -148,6 +320,11 @@ def check_profile(report, tb_root):
 
     details["chosen_host"] = os.path.basename(chosen)
     details["chosen_is_preferred_host"] = details["chosen_host"] == PREFERRED_HOST
+    return describe_mail_root(report, details, chosen)
+
+
+def describe_mail_root(report, details, chosen):
+    """Папки выбранного корня почты — в секцию profile (имена через mask_folder)."""
     pairs = list_folder_pairs(chosen)
     details["folders"] = [{"name": mask_folder(n), "size_bytes": s} for n, s in pairs]
     names = set(n for n, _ in pairs)
@@ -165,7 +342,40 @@ def check_profile(report, tb_root):
     return chosen
 
 
-# ---------------------------------------------------------------- offsets ---
+# Однобуквенные escape-последовательности YAML в "..." (yaml/emitter.py).
+_YAML_ESCAPES = dict(zip("0abtnvfreN_LP", "\0\a\b\t\n\v\f\r\x1b\x85\xa0\u2028\u2029"))
+_YAML_ESCAPE_RE = re.compile(r"\\(x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|.)")
+
+
+def _yaml_unescape(match):
+    code = match.group(1)
+    if len(code) > 1:
+        return chr(int(code[1:], 16))
+    return _YAML_ESCAPES.get(code, code)
+
+
+def yaml_str(parts):
+    """Строковое значение user_conf.yml в том виде, как его пишет yaml.dump.
+
+    parts — текст после «ключ:» и строки переноса без отступа. Не-ASCII
+    yaml.dump пишет в двойных кавычках escape-последовательностями, длинное
+    значение переносит: в двойных кавычках перенос после обратной косой черты
+    склеивается без пробела, в остальных стилях — через пробел. null — пустая
+    строка, как умолчание EmailConfig.
+    """
+    text = parts[0]
+    for part in parts[1:]:
+        if text.startswith('"') and (len(text) - len(text.rstrip("\\"))) % 2:
+            text = text[:-1] + part
+        else:
+            text = text + " " + part
+    if text in ("", "~", "null"):
+        return ""
+    if len(text) > 1 and text[0] == text[-1] == "'":
+        return text[1:-1].replace("''", "'")
+    if len(text) > 1 and text[0] == text[-1] == '"':
+        return _YAML_ESCAPE_RE.sub(_yaml_unescape, text[1:-1])
+    return text
 
 
 def parse_user_conf(path):
@@ -176,6 +386,7 @@ def parse_user_conf(path):
         "index_last_n_days": None,
         "folders_count": None,
         "offsets": {},
+        "path_to_email_folder": "",
     }
     if not conf["exists"]:
         return conf
@@ -189,16 +400,25 @@ def parse_user_conf(path):
     in_offsets = False
     folders_count = 0
     in_folders = False
+    path_parts = []
+    path_indent = None
     for line in lines:
         stripped = line.strip()
         indent = len(line) - len(line.lstrip(" "))
+        if path_indent is not None:
+            if stripped and indent > path_indent:
+                # Длинное значение yaml.dump переносит на строки глубже ключа.
+                path_parts.append(stripped)
+                continue
+            path_indent = None
+        # До проверки отступа: yaml.dump пишет элементы списка без него.
+        if in_folders and stripped.startswith("- "):
+            folders_count += 1
+            continue
         if indent == 0:
             in_email = stripped.startswith("email:")
             in_folders = stripped.startswith("folders:")
             in_offsets = False
-            continue
-        if in_folders and stripped.startswith("- "):
-            folders_count += 1
             continue
         if in_email:
             if stripped.startswith("enabled:"):
@@ -208,8 +428,11 @@ def parse_user_conf(path):
                 conf["index_last_n_days"] = None if v in ("null", "~", "") else v
             elif stripped.startswith("offsets:"):
                 v = stripped.split(":", 1)[1].strip()
-                in_offsets = v in ("", "null") and v != "null"
                 in_offsets = v == ""
+            elif stripped.startswith("path_to_email_folder:"):
+                in_offsets = False
+                path_parts = [stripped.split(":", 1)[1].strip()]
+                path_indent = indent
             elif in_offsets and ":" in stripped and not stripped.startswith("- "):
                 key, val = stripped.rsplit(":", 1)
                 key = key.strip().strip("'\"")
@@ -218,6 +441,8 @@ def parse_user_conf(path):
                 except ValueError:
                     pass
     conf["folders_count"] = folders_count
+    if path_parts:
+        conf["path_to_email_folder"] = yaml_str(path_parts)
     return conf
 
 
@@ -226,8 +451,7 @@ def _parse_offsets_state(raw):
 
     v2 — {"version": 2, "folders": {name: {offset,size,mtime}}};
     v1 — плоский {name: offset}. Без разбора версии ключи "version" и
-    "folders" принимались за имена папок: секция всегда падала в FAIL, а
-    вложенный dict с сырыми (личными) именами папок утекал в отчёт.
+    "folders" сошли бы за имена папок, а сырые имена папок попали бы в отчёт.
     """
     if not isinstance(raw, dict):
         return {}
@@ -243,11 +467,22 @@ def _parse_offsets_state(raw):
     return {n: o for n, o in raw.items() if isinstance(o, int)}
 
 
-def check_offsets(report, mail_root):
-    offsets_json = os.path.join(FILES_SEARCH_ROOT, "offsets.json")
+def user_conf_for_report(conf):
+    """user_conf без личного: имена папок из offsets — хешем, путь к почте — фактом.
+
+    Отчёт пересылают, а в путях логин и имена папок.
+    """
+    safe = dict(conf)
+    safe["offsets"] = {mask_folder(k): v for k, v in conf["offsets"].items()}
+    safe["path_to_email_folder_set"] = bool(safe.pop("path_to_email_folder"))
+    return safe
+
+
+def check_offsets(report, mail_root, files_root, user_conf):
+    offsets_json = os.path.join(files_root, "offsets.json")
     details = {
         "offsets_json_exists": os.path.isfile(offsets_json),
-        "user_conf": parse_user_conf(RAGSEARCH_CONF),
+        "user_conf": user_conf_for_report(user_conf),
         "dangling": [],
         "checked": 0,
     }
@@ -262,7 +497,7 @@ def check_offsets(report, mail_root):
             )
         except (OSError, ValueError) as e:
             details["offsets_json_error"] = type(e).__name__
-    merged = dict(details["user_conf"]["offsets"])
+    merged = dict(user_conf["offsets"])
     merged.update(saved)
     for name, off in merged.items():
         details["checked"] += 1
@@ -274,7 +509,7 @@ def check_offsets(report, mail_root):
         else:
             full = os.path.join(mail_root, name)
             if not os.path.isfile(full):
-                entry["status"] = "MISSING FILE"  # причина B бага P3
+                entry["status"] = "MISSING FILE"
                 details["dangling"].append(entry)
                 continue
             size = os.path.getsize(full)
@@ -288,9 +523,6 @@ def check_offsets(report, mail_root):
         "FAIL" if details["dangling"] else ("PASS" if details["checked"] else "SKIP")
     )
     section(report, "offsets", verdict, details)
-
-
-# --------------------------------------------------- mbox_scan + duplicates --
 
 
 def scan_mbox(path, sample_headers=2000):
@@ -374,12 +606,10 @@ def check_mbox_scan(report, mail_root):
             "sampled": total_sampled,
             "multipart_alternative": total_alt,
             "ratio": ratio,
-            "note": "каждое такое письмо сейчас эмбеддится дважды (plain + html)",
+            # Как _iter_parts в src/thunderbird/get_body.py.
+            "note": "из таких писем индексируется одна версия: text/plain, иначе html",
         },
     )
-
-
-# ------------------------------------------------------------- compaction ---
 
 
 def snapshot_folders(mail_root, first_n=50):
@@ -448,9 +678,6 @@ def check_compaction(report, mail_root, phase):
     section(report, "compaction", "PASS", {"diff": diffs})
 
 
-# ---------------------------------------------------------------- inotify ---
-
-
 def check_inotify(report):
     details = {}
     for key in ("max_user_watches", "max_user_instances", "max_queued_events"):
@@ -467,11 +694,11 @@ def check_inotify(report):
     section(report, "inotify", verdict, details)
 
 
-# ------------------------------------------------------------ find daemon ---
-
-
-def find_daemon_pid():
-    """PID процесса демона по cmdline (dist/main/main или main.py)."""
+def find_daemon_pid(files_root):
+    """PID демона: из pid рядом с его порт-файлом, иначе по cmdline."""
+    pid = read_number(os.path.join(files_root, "pid"))
+    if pid_alive(pid):
+        return pid
     if not os.path.isdir("/proc"):
         return None
     for pid in os.listdir("/proc"):
@@ -482,9 +709,21 @@ def find_daemon_pid():
                 cmd = f.read().decode("utf-8", "replace")
         except OSError:
             continue
-        if "dist/main/main" in cmd or ("main.py" in cmd and "python" in cmd):
+        if is_daemon_cmdline(cmd):
             return int(pid)
     return None
+
+
+def is_daemon_cmdline(cmd):
+    """cmdline демона: пакет, zip-поставка ($DIR/main/main), сборка или main.py."""
+    argv = cmd.split("\0")
+    if "--ocr-worker" in argv:
+        return False  # дочерний OCR-воркер того же бинаря
+    return (
+        argv[0] in (os.path.join(PACKAGE_DIR, "main"), "main/main")
+        or argv[0].endswith("/main/main")
+        or ("main.py" in cmd and "python" in cmd)
+    )
 
 
 def check_resources(report, pid, seconds):
@@ -534,17 +773,12 @@ def check_resources(report, pid, seconds):
         )
 
 
-# ---------------------------------------------------------------- runtime ---
-
-
 def http_json(method, url, body=None, timeout=10):
-    import urllib.request
-
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode())
     except Exception as e:
         code = getattr(e, "code", None)
@@ -619,9 +853,6 @@ def check_runtime(report, port):
     section(report, "runtime", "PASS", details)
 
 
-# ------------------------------------------------------------ frozen_lance --
-
-
 def check_frozen_lance(report, dist_dir):
     details = {"dist_dir": dist_dir, "exists": os.path.isdir(dist_dir)}
     if not details["exists"]:
@@ -644,26 +875,35 @@ def check_frozen_lance(report, dist_dir):
     verdict = "PASS" if hits else "FAIL"
     if not hits:
         details["note"] = (
-            "модуль lance не упакован (main.spec его исключает) "
-            "— optimize_indices во фризнутой сборке молча "
-            "не работает"
+            "модуль lance не упакован — optimize_indices не дописывает "
+            "новые строки в индексы до компакции (в журнале демона "
+            "WARNING «нет модуля lance»)"
         )
     section(report, "frozen_lance", verdict, details)
-
-
-# ------------------------------------------------------------------- main ---
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
-        "--thunderbird", default=THUNDERBIRD_ROOT, help="корень профиля Thunderbird"
+        "--thunderbird",
+        default=None,
+        help="корень профиля Thunderbird (по умолчанию ~/.thunderbird дома демона)",
     )
-    ap.add_argument("--port", type=int, default=8000, help="порт демона")
+    ap.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="порт демона (по умолчанию из ~/.files-search/port, иначе 8000)",
+    )
     ap.add_argument(
         "--pid", type=int, default=None, help="PID демона для замера ресурсов"
     )
-    ap.add_argument("--dist", default="dist/main", help="каталог PyInstaller-сборки")
+    ap.add_argument(
+        "--dist",
+        default=None,
+        help="каталог PyInstaller-сборки (по умолчанию {0}, если он есть, "
+        "иначе dist/main)".format(PACKAGE_DIR),
+    )
     ap.add_argument("--resource-seconds", type=int, default=15)
     ap.add_argument(
         "--compaction",
@@ -673,24 +913,39 @@ def main():
     )
     args = ap.parse_args()
 
+    home = find_daemon_home()
+    files_root = os.path.join(home, ".files-search")
+    user_conf = parse_user_conf(os.path.join(home, ".ragsearch", "user_conf.yml"))
+    email_folder = user_conf["path_to_email_folder"]
+
     report = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "python": sys.version.split()[0],
         "platform": sys.platform,
+        # Чей дом описывает отчёт; сам путь не пишем — в нём логин.
+        "daemon_home": "HOME" if home == os.path.expanduser("~") else "passwd",
         "sections": {},
     }
 
-    mail_root = check_profile(report, args.thunderbird)
-    check_offsets(report, mail_root)
+    if args.thunderbird:
+        mail_root = check_profile(report, args.thunderbird)
+    else:
+        mail_root = check_profile(
+            report,
+            os.path.join(home, ".thunderbird"),
+            expand_home(email_folder, home) if email_folder else None,
+        )
+    check_offsets(report, mail_root, files_root, user_conf)
     if args.compaction:
         check_compaction(report, mail_root, args.compaction)
     else:
         check_mbox_scan(report, mail_root)
     check_inotify(report)
-    check_runtime(report, args.port)
-    pid = args.pid if args.pid else find_daemon_pid()
+    check_runtime(report, args.port or read_port(files_root) or DEFAULT_PORT)
+    pid = args.pid if args.pid else find_daemon_pid(files_root)
     check_resources(report, pid, args.resource_seconds)
-    check_frozen_lance(report, args.dist)
+    dist = args.dist or (PACKAGE_DIR if os.path.isdir(PACKAGE_DIR) else "dist/main")
+    check_frozen_lance(report, dist)
 
     with open(REPORT_FILE, "w") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)

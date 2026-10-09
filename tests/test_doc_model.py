@@ -123,10 +123,93 @@ def test_page_number_pages_are_dropped():
                 Block("- 2 -", page=2),
                 Block("Стр. 3", page=3),
                 Block("Третья страница", page=4),
-            ]
+            ],
+            pdf=True,
         )
     )
     assert [b.page for b in doc.blocks] == [1, 4]
+
+
+def test_numbers_on_slides_are_kept():
+    """Фигура слайда «85%» или «1500» — содержание, а не номер страницы."""
+    texts = [
+        "Выручка компании",
+        "1500",
+        "млн рублей за год рост",
+        "85%",
+        "+15%",
+        "2025",
+    ]
+    doc = prepare(ParsedDoc([Block(t, page=3) for t in texts]))
+    assert [b.text for b in doc.blocks] == texts
+
+
+def _tariff_table(title: str) -> Block:
+    return Block(
+        f"{title}\nУслуга | Стоимость\nОткрытие счёта | бесплатно",
+        kind="table",
+        table_id="t1",
+        whole=True,
+    )
+
+
+def test_heading_chain_before_table_keeps_all_but_its_title():
+    doc = prepare(
+        ParsedDoc(
+            [
+                Block("Глава 3. Тарифы на расчётно-кассовое обслуживание", heading=1),
+                Block("Общие условия применения тарифов банка", heading=2),
+                Block("3.1.1 Физические лица", heading=3),
+                _tariff_table("3.1.1 Физические лица"),
+            ]
+        )
+    )
+    chunks = chunk_document(
+        doc, RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=0)
+    )
+    assert [(c["kind"], c["text"]) for c in chunks] == [
+        (
+            "text",
+            "Глава 3. Тарифы на расчётно-кассовое обслуживание\n\n"
+            "Общие условия применения тарифов банка",
+        ),
+        ("table", _tariff_table("3.1.1 Физические лица").text),
+    ]
+    assert chunks[0]["section"] == "Глава 3. Тарифы на расчётно-кассовое обслуживание"
+    assert chunks[1]["section"] == (
+        "Глава 3. Тарифы на расчётно-кассовое обслуживание › "
+        "Общие условия применения тарифов банка › 3.1.1 Физические лица"
+    )
+
+
+def test_heading_that_is_table_title_is_not_repeated():
+    doc = prepare(
+        ParsedDoc(
+            [
+                Block("Динамика просрочки по сегментам", page=2, heading=1),
+                _tariff_table("Динамика просрочки по сегментам"),
+            ]
+        )
+    )
+    chunks = chunk_document(doc, SPLITTER)
+    assert [c["kind"] for c in chunks] == ["table"]
+
+
+def test_heading_before_untitled_table_is_kept():
+    table = "Сегмент кредитования | 2025\nКорпоративный бизнес | 1,2%"
+    doc = prepare(
+        ParsedDoc(
+            [
+                Block("Раздел 2. Риски кредитного портфеля", page=1, heading=1),
+                Block(table, page=2, kind="table", whole=True),
+            ]
+        )
+    )
+    chunks = chunk_document(doc, SPLITTER)
+    assert [(c["kind"], c["text"]) for c in chunks] == [
+        ("text", "Раздел 2. Риски кредитного портфеля"),
+        ("table", table),
+    ]
 
 
 def test_txt_lines_and_paragraphs():

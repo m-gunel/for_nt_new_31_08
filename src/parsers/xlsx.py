@@ -14,7 +14,8 @@
 токены «2025», «01», «01»). Числа — без хвостов float, по формату ячейки. Широкая строка
 режется на несколько карточек ≤ BUDGET_TOKENS с повтором названия и подписи; сверху ещё
 встанет «Документ: …». Листы не выбрасываются; лист без таблицы идёт строками текста.
-Лимит — строк данных на лист (excel_config.max_rows). Легаси .xls — через Р7-Офис.
+Лимит — первые excel_config.max_rows + SCAN_ROWS строк листа, считая пустые: дальше
+лист не читается. Легаси .xls — через Р7-Офис.
 """
 
 import datetime as dt
@@ -30,12 +31,13 @@ from openpyxl.utils import get_column_letter
 from openpyxl.utils.exceptions import InvalidFileException
 
 from src.utils import get_logger
-from src.utils.r7_office import convert_via_r7
+from src.utils.r7_office import R7Busy, convert_via_r7
 
 from ._tables import Budget, pack_lines, split_parts
 from .base import Parser, SkipFile, parser
 from .doc_model import Block, ParsedDoc
 from .metadata import ooxml_properties
+from .ooxml_limits import XLSX_LARGE, XLSX_STREAMED, oversize_reason
 
 logger = get_logger(__name__)
 
@@ -57,9 +59,7 @@ _WS = re.compile(r"\s+")
 _NUMBERING = re.compile(r"^\d{1,3}(\.\d{1,3})*\.?$")
 _NOTE = re.compile(r"^\s*(\d{1,2}\s+\S|[¹²³⁴⁵⁶⁷⁸⁹*]|примечани|источник)", re.I)
 _DEFAULT_SHEET = re.compile(r"^(лист|sheet)\s*\d*$", re.I)
-
-
-# ---------- значения ----------
+_LITERAL = re.compile(r'"[^"]*"|\\.')  # текст в формате числа: «"…"» и «\x»
 
 
 def _empty(v) -> bool:
@@ -95,11 +95,13 @@ def fmt_date(d) -> str:
 
 def fmt_number(v, number_format: str | None = None) -> str:
     """15.679387 → «15,68»; доля 0.0123 → «0,012»; формат «0.0%» → «12,5%»."""
-    if isinstance(v, int):
+    # «%» в кавычках или после «\» — просто знак: Excel на 100 не умножает.
+    pct = "%" in _LITERAL.sub("", number_format or "")
+    # Целое — тоже процент: ячейку 100 % (и 1.0) read_only отдаёт как int 1.
+    if isinstance(v, int) and not pct:
         return str(v)
     if math.isnan(v) or math.isinf(v):
         return ""
-    pct = bool(number_format) and "%" in number_format
     if pct:
         v *= 100
     a = abs(v)
@@ -134,11 +136,8 @@ def header_text(v) -> str:
     return clean_label(v)
 
 
-# ---------- лист ----------
-
-Row = tuple[
-    list[Any], list[str | None], bool, int
-]  # значения, форматы, жирная одиночная, № строки
+# Значения, форматы, жирная одиночная, № строки.
+Row = tuple[list[Any], list[str | None], bool, int]
 
 
 def _read_rows(ws, limit: int) -> tuple[list[Row], bool]:
@@ -377,9 +376,12 @@ def _sheet(ws, n: int, budget: Budget, limit: int) -> tuple[list[Block], str | N
     sheet = clean_label(ws.title)
     if cut:
         logger.warning(
-            "лист «%s»: больше %s строк данных — остальные не индексируются",
+            "лист «%s»: прочитаны первые %s строк (excel_config.max_rows %s + %s "
+            "на шапку), остальные не индексируются",
             sheet,
+            limit + SCAN_ROWS,
             limit,
+            SCAN_ROWS,
         )
     if not rows:
         return [], None
@@ -495,7 +497,11 @@ class XlsxParser(Parser):
             dst = src + ".xlsx"
             with open(src, "wb") as out:
                 shutil.copyfileobj(file, out)
-            if not convert_via_r7(src, dst):
+            try:
+                ok = convert_via_r7(src, dst, raise_busy=True)
+            except R7Busy as exc:
+                raise SkipFile(f"легаси .xls: Р7-Офис: {exc}", permanent=False) from exc
+            if not ok:
                 logger.warning(
                     "легаси .xls не конвертирован (Р7-Офис не найден или "
                     "не справился с файлом) — файл пропущен"
@@ -508,6 +514,8 @@ class XlsxParser(Parser):
     def _parse_book(self, file: BinaryIO, meta: dict, titles: list[str]) -> ParsedDoc:
         budget = Budget(BUDGET_TOKENS, self._config.ov_model.count_tokens)
         limit = self._config.excel_config.max_rows
+        if reason := oversize_reason(file, XLSX_STREAMED, XLSX_LARGE):
+            raise SkipFile(reason)
         try:
             wb = openpyxl.load_workbook(file, read_only=True, data_only=True)
         except (InvalidFileException, KeyError) as exc:  # zip, но не книга Excel
@@ -522,6 +530,8 @@ class XlsxParser(Parser):
                 sheets.append(clean_label(ws.title))
                 try:
                     sheet_blocks, table = _sheet(ws, n, budget, limit)
+                except (MemoryError, OSError):
+                    raise  # временный сбой: книгу без листа нельзя отмечать готовой
                 except Exception as exc:  # битый лист не должен ронять остальную книгу
                     logger.warning(
                         "лист «%s» не разобран: %s: %s",

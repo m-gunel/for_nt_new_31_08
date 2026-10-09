@@ -1,13 +1,13 @@
 """Инкрементальность почты: новые письма подхватываются, удалённые уходят.
 
 Компакция mbox (Thunderbird переписывает файл при окончательном удалении
-писем) сдвигает все байтовые offset'ы, а ключ индекса — это offset. До
-доработки это молча ломало и подхват новых писем (offset за EOF → пустой
-обход без единого лога), и оставляло чанки удалённых писем в индексе
-навсегда.
+писем) сдвигает все байтовые offset'ы, а ключ индекса — это offset: без сброса
+состояния папки новые письма не подхватывались бы (offset за EOF), а чанки
+удалённых оставались бы в индексе навсегда.
 """
 
 import json
+import logging
 
 import pytest
 import pytest_asyncio as pa_fixture
@@ -69,9 +69,6 @@ async def _drain(scanner: EmailsScanner):
     return [m async for m in scanner.preindex()]
 
 
-# ------------------------------------------------------------ инкремент -----
-
-
 @pytest.mark.asyncio
 async def test_unchanged_mbox_is_skipped(scanner: EmailsScanner):
     """Файл не менялся между проходами — второй проход его даже не читает."""
@@ -101,13 +98,16 @@ async def test_new_email_is_picked_up(scanner: EmailsScanner, mail_root):
 
 @pytest.mark.asyncio
 async def test_compaction_resets_folder_state(scanner: EmailsScanner, mail_root):
-    """После компакции detect_stale_folders требует переиндексации папки."""
+    """После компакции detect_stale_folders требует переиндексации папки,
+    а сбрасывает состояние forget_folder — после удаления чанков."""
     await _drain(scanner)
     before = scanner.folder_state["INBOX"]
     assert before.offset > 0
     compact_mbox(mail_root / "INBOX", drop_msg_ids={"plain-1@fixture"})
     stale = scanner.detect_stale_folders()
     assert stale == ["INBOX"]
+    assert scanner.folder_state["INBOX"] == before, "до удаления состояние прежнее"
+    scanner.forget_folder("INBOX")
     assert scanner.folder_state["INBOX"] == FolderState()
     # после сброса полный перескан отдаёт все живые письма
     again = await _drain(scanner)
@@ -119,17 +119,28 @@ async def test_vanished_mbox_drops_folder(scanner: EmailsScanner, mail_root):
     await _drain(scanner)
     (mail_root / "INBOX").unlink()
     assert scanner.detect_stale_folders() == ["INBOX"]
-    # повторный вызов не находит ничего нового — состояние уже сброшено
+    # чанки удалены — папка уходит из состояния, повторный вызов пуст
+    scanner.forget_folder("INBOX")
+    assert "INBOX" not in scanner.folder_state
     assert scanner.detect_stale_folders() == []
+
+
+@pytest.mark.asyncio
+async def test_stale_folder_redetected_until_forgotten(
+    scanner: EmailsScanner, mail_root
+):
+    """Удаление по префиксу упало или проход отменили (forget_folder не
+    вызван) — папка остаётся протухшей, а не теряет старые ключи навсегда."""
+    await _drain(scanner)
+    compact_mbox(mail_root / "INBOX", drop_msg_ids={"plain-1@fixture"})
+    assert scanner.detect_stale_folders() == ["INBOX"]
+    assert scanner.detect_stale_folders() == ["INBOX"]
 
 
 @pytest.mark.asyncio
 async def test_untouched_folder_not_stale(scanner: EmailsScanner):
     """Папка, которую ещё не индексировали, не считается протухшей."""
     assert scanner.detect_stale_folders() == []
-
-
-# ------------------------------------------------------------- состояние ----
 
 
 @pytest.mark.asyncio
@@ -170,9 +181,6 @@ def test_state_reads_legacy_v1(email_config, mail_root, tmp_path):
     assert scanner.folder_state["INBOX"] == FolderState(offset=123)
 
 
-# ------------------------------------------------ end-to-end через Index ----
-
-
 @pa_fixture.fixture
 async def index(email_config: Config):
     idx = Index(email_config)
@@ -193,6 +201,46 @@ def _indexed_paths(cfg: Config) -> set[str]:
         if store.has_table
         for row in store.table.search().limit(1000).to_list()
     }
+
+
+@pytest.mark.asyncio
+async def test_failed_delete_is_retried_next_pass(index: Index, mail_root, monkeypatch):
+    """Сбой delete_prefix после компакции не оставляет в индексе ключей,
+    указывающих на чужие байты: следующий проход повторяет удаление."""
+    await index.scan_all()
+    compact_mbox(mail_root / "INBOX", drop_msg_ids={"plain-1@fixture"})
+
+    async def failing_delete(prefix: str) -> None:
+        raise RuntimeError("сбой записи в Lance")
+
+    monkeypatch.setattr(index, "delete_prefix", failing_delete)
+    await index.scan_all(emails_only=True)  # сбой гасит _preindex_emails
+    monkeypatch.delattr(index, "delete_prefix")
+    await index.scan_all(emails_only=True)
+
+    mbox_bytes = (mail_root / "INBOX").read_bytes()
+    email_keys = {p for p in _indexed_paths(index.cfg) if p.startswith("email_INBOX:")}
+    assert email_keys
+    for key in email_keys:
+        start = int(key.split(":")[1])
+        assert mbox_bytes[start : start + 5] == b"From ", key
+
+
+@pytest.mark.asyncio
+async def test_vanished_folder_leaves_state(index: Index, mail_root, caplog):
+    """Исчезнувшая папка после удаления её чанков уходит из состояния:
+    иначе WARNING «mbox file not found» шёл бы на каждом поллинге."""
+    await index.scan_all()
+    (mail_root / "INBOX").unlink()
+    (mail_root / "INBOX.msf").unlink()
+    await index.scan_all(emails_only=True)
+
+    assert index.emails_scanner is not None
+    assert "INBOX" not in index.emails_scanner.folder_state
+    assert not any(p.startswith("email_INBOX:") for p in _indexed_paths(index.cfg))
+    with caplog.at_level(logging.WARNING, logger="app.email"):
+        await index.scan_all(emails_only=True)
+    assert "mbox file not found" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -219,9 +267,8 @@ async def test_compaction_cleans_index_and_keeps_fresh(index: Index, mail_root):
     await index.scan_all(emails_only=True)
 
     after = _indexed_paths(index.cfg)
-    # чанков удалённого письма больше нет: его старый ключ ушёл вместе
-    # с delete_prefix по всей папке
-    # все email-ключи указывают на реальные границы писем в новом файле
+    # старые ключи ушли с delete_prefix по папке: все email-ключи указывают
+    # на границы писем в новом файле
     mbox_bytes = (mail_root / "INBOX").read_bytes()
     email_keys = {p for p in after if p.startswith("email_INBOX:")}
     assert email_keys, "почта должна быть в индексе после компакции"

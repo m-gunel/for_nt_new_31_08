@@ -26,10 +26,8 @@ def doc_prefix(original_name: str | None) -> str:
 
 # Карточка документа — лишняя строка индекса после всех чанков документа: имя
 # файла и свойства (название, автор, тема…), которых нет в самих чанках. Запрос
-# «найди файл …» и код из имени («ЦБ_21», «5348-У») попадают в неё целиком,
-# а не в случайный кусок текста, где имя — лишь первая строка. idx=-1: у чанков
-# idx с нуля, и карточка не занимает чужой номер; поле idx ни для чего, кроме
-# порядка внутри документа, не используется.
+# «найди файл …» и код из имени («ЦБ_21», «5348-У») попадают в неё целиком.
+# idx=-1: у чанков idx с нуля, а idx задаёт только порядок внутри документа.
 CARD_KIND = "card"
 CARD_IDX = -1
 # Свойства документа в карточке — подпись и ключ в meta, в этом порядке.
@@ -60,17 +58,23 @@ def norm_words(text: str) -> str:
 def document_card_text(meta: Mapping | None) -> str:
     """Текст карточки документа: «Документ: <имя>» и непустые свойства.
 
-    Свойство пропускаем, если его слова уже есть в карточке: название,
-    совпадающее с именем файла, или автор, повторённый в «Изменил», только
-    раздули бы её и сместили вектор к повтору. Пустая строка — карточке
+    Свойство пропускаем, если его слова подряд и целиком уже есть в имени
+    файла или в свойстве выше: название, совпадающее с именем файла, или
+    автор, повторённый в «Изменил», только раздули бы её и сместили вектор
+    к повтору. Подписи полей не сравниваются. Пустая строка — карточке
     не из чего состоять.
     """
     meta = meta or {}
-    lines = [p.rstrip("\n")] if (p := doc_prefix(meta.get("original_name"))) else []
+    name = meta.get("original_name")
+    lines = [p.rstrip("\n")] if (p := doc_prefix(name)) else []
+    # Слова в пробелах — сравнение целыми словами: «Петров» не начало «Петрова».
+    seen = [f" {norm_words(PurePath(name).stem)} "] if lines else []
     for label, key in CARD_FIELDS:
         value = " ".join(str(meta.get(key) or "").split())
-        if value and norm_words(value) not in norm_words("\n".join(lines)):
+        words = norm_words(value)
+        if words and not any(f" {words} " in s for s in seen):
             lines.append(f"{label}: {value[:CARD_VALUE_MAX]}")
+            seen.append(f" {norm_words(value[:CARD_VALUE_MAX])} ")
     return "\n".join(lines)
 
 
@@ -78,6 +82,28 @@ def strip_doc_prefix(text: str, original_name: str | None) -> str:
     """Текст чанка без строки «Документ: …» — только если это ровно префикс этого файла."""
     prefix = doc_prefix(original_name)
     return text[len(prefix) :] if prefix and text.startswith(prefix) else text
+
+
+# Колонки дат в схеме — timestamp("ns"): примерно 1677-09-21 … 2262-04-11.
+# Дата вне диапазона (1601 год с SMB, 2262+ на APFS) роняет запись всего
+# батча с ArrowInvalid, и проход обрывается. Границы — с запасом от краёв.
+_STORABLE_MIN = datetime(1678, 1, 1)
+_STORABLE_MAX = datetime(2262, 1, 1)
+
+
+def storable_datetime(dt: datetime | None) -> datetime | None:
+    """Дата, если её примет колонка timestamp("ns"), иначе None."""
+    if dt is None or not _STORABLE_MIN <= dt.replace(tzinfo=None) < _STORABLE_MAX:
+        return None
+    return dt
+
+
+def datetime_from_timestamp(ts: float) -> datetime | None:
+    """Локальная дата по времени Unix для колонок дат; не представима — None."""
+    try:
+        return storable_datetime(datetime.fromtimestamp(ts))
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 class FileMetadata(NamedTuple):

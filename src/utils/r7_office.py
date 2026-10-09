@@ -1,23 +1,19 @@
 """Конвертер форматов через Р7-Офис (x2t из комплекта desktopeditors).
 
-Р7-Офис — стандартный офисный пакет АРМ Сбера: его наличие на целевой машине
-гарантировано политикой, в отличие от catdoc/antiword/LibreOffice, которых
-в поставке SberOS нет вообще. Встроенный конвертер x2t умеет читать легаси-
-форматы (.doc, .xls), которые иначе индексатору недоступны.
+Р7-Офис стоит на АРМ по политике, а catdoc/antiword/LibreOffice в SberOS нет;
+x2t читает легаси-форматы (.doc, .xls), иначе индексатору недоступные.
 
-Особенности вызова x2t, без которых он не работает или падает:
-
-  - LD_LIBRARY_PATH обязан включать каталог самого x2t и его родителя —
-    иначе не резолвятся libascdocumentscore и соседние .so;
-  - рабочий каталог процесса должен быть доступен на запись: x2t создаёт
-    временные файлы в текущем каталоге, а в /opt/r7-office прав у демона нет;
-  - код возврата ненадёжен: успешная конвертация даёт и 0, и 80, а на
-    несуществующем входе процесс роняет сигналом. Обёртка проверяет вход
-    сама и судит об успехе по факту существования непустого результата;
-  - пустой результат при отработавшем вызове означает «не смог разобрать
-    вход» — это тоже отказ, а не успех.
+Особенности x2t:
+  - LD_LIBRARY_PATH должен включать каталог x2t и его родителя, иначе не
+    резолвятся libascdocumentscore и соседние .so;
+  - x2t пишет временные файлы в рабочий каталог, а в /opt/r7-office у демона
+    прав нет;
+  - код возврата ненадёжен (успех — и 0, и 80, на несуществующем входе
+    процесс падает по сигналу): вход проверяем сами, успех — только
+    непустой результат.
 """
 
+import hashlib
 import os
 import subprocess
 
@@ -25,15 +21,22 @@ from src.utils import get_logger
 
 lg = get_logger(__name__)
 
-# Каталоги конвертера внутри пакета sber-r7-office. Структура стабильно
-# повторяет ONLYOFFICE (converter/x2t рядом с движком); второй шаблон —
-# страховка на случай переименования корневого каталога продукта.
+# x2t в пакете sber-r7-office; второй путь — на случай переименования
+# корневого каталога продукта.
 _X2T_CANDIDATES = (
     "/opt/r7-office/desktopeditors/converter/x2t",
     "/opt/r7-office/r7-office/desktopeditors/converter/x2t",
 )
 
 CONVERT_TIMEOUT_S = 120
+
+# Содержимое (sha256), на котором x2t уже не уложился в таймаут: второй таймаут
+# подряд — свойство файла, а не нагрузки, и дальше его не повторяем.
+_timed_out: set[str] = set()
+
+
+class R7Busy(Exception):
+    """x2t не запустился или не уложился в таймаут — на следующем проходе может выйти."""
 
 
 def find_x2t() -> str | None:
@@ -51,11 +54,19 @@ def find_x2t() -> str | None:
     return None
 
 
-def convert_via_r7(src: str, dst: str, timeout_s: int = CONVERT_TIMEOUT_S) -> bool:
+def convert_via_r7(
+    src: str,
+    dst: str,
+    timeout_s: int = CONVERT_TIMEOUT_S,
+    *,
+    raise_busy: bool = False,
+) -> bool:
     """Конвертировать файл командой x2t. True — в dst готовый результат.
 
     Отказоустойчива во всех случаях, включая полное отсутствие Р7-Офиса:
     возвращает False и пишет предупреждение, исключений наружу не бросает.
+    Исключение одно и только по запросу: raise_busy=True — сбой запуска x2t
+    и первый таймаут на этом содержимом бросают R7Busy (временный сбой).
     Что делать с пропущенным файлом, решает вызывающий парсер (0 чанков —
     «постоянный» пропуск индексатора, исключение — повторная попытка).
     """
@@ -63,14 +74,18 @@ def convert_via_r7(src: str, dst: str, timeout_s: int = CONVERT_TIMEOUT_S) -> bo
     if not x2t:
         lg.warning("Р7-Офис не найден — конвертация %s невозможна", src)
         return False
-    if not os.path.isfile(src) or os.path.getsize(src) == 0:
-        lg.warning("конвертация %s: вход отсутствует или пуст", src)
+    try:
+        if not os.path.isfile(src) or os.path.getsize(src) == 0:
+            lg.warning("конвертация %s: вход отсутствует или пуст", src)
+            return False
+        if os.path.exists(dst):
+            os.remove(dst)
+    except OSError as exc:
+        # Вход исчез между проверками, на месте dst каталог или нет прав.
+        lg.warning("конвертация %s: вход или выход недоступен (%s)", src, exc)
         return False
-    if os.path.exists(dst):
-        os.remove(dst)
     converter_dir = os.path.dirname(x2t)
     env = dict(os.environ)
-    # Родительский каталог держит общие библиотеки движка.
     env["LD_LIBRARY_PATH"] = ":".join(
         (converter_dir, os.path.dirname(converter_dir), env.get("LD_LIBRARY_PATH", ""))
     ).rstrip(":")
@@ -84,10 +99,27 @@ def convert_via_r7(src: str, dst: str, timeout_s: int = CONVERT_TIMEOUT_S) -> bo
             timeout=timeout_s,
             check=False,
         )
+        ok = os.path.isfile(dst) and os.path.getsize(dst) > 0
     except (OSError, subprocess.SubprocessError) as exc:
         lg.warning("Р7-Офис: конвертация %s не состоялась (%s)", src, exc)
+        if raise_busy and _worth_retry(src, exc):
+            raise R7Busy(f"конвертация не состоялась ({exc})") from exc
         return False
-    ok = os.path.isfile(dst) and os.path.getsize(dst) > 0
     if not ok:
         lg.warning("Р7-Офис: пустой результат конвертации %s", src)
     return ok
+
+
+def _worth_retry(src: str, exc: Exception) -> bool:
+    """Сбой запуска — всегда; таймаут — только первый на этом содержимом."""
+    if not isinstance(exc, subprocess.TimeoutExpired):
+        return True
+    try:
+        with open(src, "rb") as f:
+            key = hashlib.file_digest(f, "sha256").hexdigest()
+    except OSError:
+        return True
+    if key in _timed_out:
+        return False
+    _timed_out.add(key)
+    return True

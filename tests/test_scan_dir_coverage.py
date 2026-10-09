@@ -1,19 +1,4 @@
-"""Охват обхода файловой системы: ссылки, границы устройства, слышимость.
-
-Обход `iter_file_metadata` молча терял целые куски дерева:
-* каталог за символьной ссылкой не индексировался вообще
-  (`entry.is_dir(follow_symlinks=False)`), а пользователи держат за ссылками
-  рабочие каталоги;
-* включить ссылки нельзя было безопасно: петля `docs/loop -> root` крутилась
-  бы вечно, а bind-mount/вторая ссылка удваивали бы индекс;
-* обход уходил на примонтированную сетевую шару и вставал на её таймауте;
-* о результатах прохода в лог не попадало ничего — пустой индекс невозможно
-  было отличить от зависшего обхода.
-
-Плюс `src/indexer/exclude.py`, который не был покрыт ни одним тестом: в нём
-восемь альтернатив, дублировавших `\\..+`, заменены на реально нужные
-`venv`/`site-packages`/`snap`.
-"""
+"""Охват обхода ФС: символьные ссылки, сетевые ФС, отчёт обхода, exclude.py."""
 
 import io
 import logging
@@ -34,13 +19,9 @@ from src.utils.lsm_adapter import LSMTable, _decode_file_meta, _encode_file_meta
 def _no_network_mounts(monkeypatch):
     """Обход не должен зависеть от таблицы монтирования прогонной машины.
 
-    iter_file_metadata читает настоящий /proc/mounts. Если TMPDIR окажется под
-    autofs или NFS (корпоративный Linux с autofs-домами — обычное дело), обход
-    не спустится в tmp_path и тесты про ссылки и счётчики упадут по причине,
-    не имеющей отношения к проверяемому. Тесты самой network_mount_points
-    зовут её по имени, импортированному в этот модуль, поэтому подмена
-    атрибута в scan_dir их не задевает, а
-    test_scan_does_not_descend_into_network_mount перекрывает подмену своей.
+    iter_file_metadata читает настоящий /proc/mounts, и TMPDIR под autofs или
+    NFS не дал бы спуститься в tmp_path. Тесты самой network_mount_points зовут
+    её по импортированному имени, и подмена атрибута scan_dir их не задевает.
     """
     monkeypatch.setattr(scan_dir, "network_mount_points", lambda: ())
 
@@ -69,17 +50,11 @@ def _scan(root: Path, **kwargs) -> list[str]:
     return sorted(Path(m.path).relative_to(root).as_posix() for m in metas)
 
 
-# ------------------------------------------------ ДЕФЕКТ 1: ссылки на каталоги
-
-
 def test_directory_behind_symlink_is_scanned_only_when_asked(tmp_path):
-    """Каталог за ссылкой раньше не индексировался вообще.
+    """Каталог за ссылкой обходится только при follow_symlinks=True.
 
-    `entry.is_dir(follow_symlinks=False)` для ссылки давал False, дальше её
-    отвергала и проверка `is_file`, — то есть рабочий каталог, доступный
-    пользователю через ссылку, в индекс не попадал ни одним файлом.
-    Умолчание параметра осталось False намеренно: прямые вызовы (в том числе
-    из старых тестов) не должны менять поведение молча.
+    Умолчание параметра — False, чтобы прямые вызовы не меняли поведение
+    молча; демон включает ссылки через конфиг.
     """
     outside = tmp_path / "outside"
     _mkfile(outside / "doc.txt")
@@ -88,27 +63,22 @@ def test_directory_behind_symlink_is_scanned_only_when_asked(tmp_path):
     (root / "link").symlink_to(outside, target_is_directory=True)
 
     assert _scan(root, follow_symlinks=True) == ["link/doc.txt", "own.txt"]
-    # Старое поведение сохранено и по умолчанию, и при явном False.
+    # По умолчанию и при явном False ссылки не обходятся.
     assert _scan(root) == ["own.txt"]
     assert _scan(root, follow_symlinks=False) == ["own.txt"]
-
-
-# ------------------------------------- ДЕФЕКТ 2: петли, дубли и настоящий путь
 
 
 def test_symlink_loop_does_not_hang_the_scan(tmp_path):
     """Петля `docs/loop -> root` обязана завершаться.
 
-    Без учёта каталогов по (st_dev, st_ino) включение ссылок означало бы
-    бесконечный спуск scan/docs/loop/docs/loop/... — демон крутился бы на
-    обходе вечно, а индексация не заканчивалась никогда.
+    Без учёта каталогов по (st_dev, st_ino) обход спускался бы по петле
+    бесконечно.
     """
     root = tmp_path / "scan"
     _mkfile(root / "docs" / "doc.txt")
     (root / "docs" / "loop").symlink_to(root, target_is_directory=True)
 
-    # islice — страховка от зависания самого теста: при потере visited_dirs
-    # генератор бесконечен, и без ограничения тест не упал бы, а завис.
+    # islice — чтобы при петле тест упал, а не завис.
     metas = list(islice(iter_file_metadata(str(root), follow_symlinks=True), 20))
     found = sorted(Path(m.path).relative_to(root).as_posix() for m in metas)
 
@@ -139,10 +109,9 @@ def test_two_symlinks_to_one_directory_do_not_duplicate_files(tmp_path):
 def test_real_path_wins_over_path_through_symlink(tmp_path):
     """Каталог, доступный и напрямую, и через ссылку, индексируется по настоящему пути.
 
-    Каталоги, найденные через ссылку, откладываются в deferred_links и
-    обходятся после всех настоящих. Без этого выигрывал тот, кто попался
-    первым: в индекс уходил путь scan/link/doc.txt, и снятие ссылки
-    выкидывало из выдачи живой файл, который никуда не девался.
+    Каталоги за ссылками откладываются в deferred_links и обходятся после
+    настоящих: иначе в индекс мог уйти путь через ссылку, и её снятие выкинуло
+    бы из выдачи живой файл.
     """
     root = tmp_path / "scan"
     _mkfile(root / "real" / "doc.txt")
@@ -171,11 +140,9 @@ def test_symlinked_file_is_indexed_by_its_own_path(tmp_path):
     # stat идёт по ссылке: размер — у цели, а не у самой ссылки.
     assert metas["target.txt"].size > 0
     assert metas["alias.txt"].size == metas["target.txt"].size
-    # Прежнее поведение при выключенных ссылках сохранено.
+    # При выключенных ссылках алиас не берётся.
     assert _scan(root) == ["target.txt"]
 
-
-# --------------------------------------- ДЕФЕКТ 3: граница локального носителя
 
 _PROC_MOUNTS = r"""proc /proc proc rw,relatime 0 0
 /dev/sda1 / ext4 rw,relatime 0 0
@@ -189,11 +156,7 @@ systemd-1 /net autofs rw,relatime 0 0
 
 
 def _fake_proc_mounts(monkeypatch, content: str) -> None:
-    """Подменить чтение /proc/mounts, чтобы тест шёл и на macOS.
-
-    Атрибут `open` в модуле перекрывает встроенный: разработка идёт на macOS,
-    где /proc/mounts нет, а проверять разбор надо именно там же, где пишут код.
-    """
+    """Подменить /proc/mounts через атрибут `open` модуля — тест идёт и на macOS."""
 
     def _open(path, *args, **kwargs):
         assert str(path) == "/proc/mounts", path
@@ -205,10 +168,8 @@ def _fake_proc_mounts(monkeypatch, content: str) -> None:
 def test_network_mount_points_parses_proc_mounts(monkeypatch):
     """Сетевые точки монтирования вынимаются из /proc/mounts, локальные — нет.
 
-    Раньше границы устройства не было вовсе: обход спускался в примонтированную
-    шару и вставал на сетевом таймауте, останавливая весь проход по домашнему
-    каталогу. autofs здесь тоже сетевой: спуск в него сам ТРИГГЕРИТ
-    монтирование.
+    Спуск в сетевую шару вставал бы на её таймауте и останавливал весь проход.
+    autofs тоже считается сетевым: спуск в него сам запускает монтирование.
     """
     _fake_proc_mounts(monkeypatch, _PROC_MOUNTS)
 
@@ -216,23 +177,19 @@ def test_network_mount_points_parses_proc_mounts(monkeypatch):
 
     assert points == (
         "/mnt/nfs",
-        # \040 — экранированный пробел из /proc/mounts, его надо развернуть,
-        # иначе точка монтирования с пробелом в имени не совпадёт ни с чем.
+        # \040 — экранированный пробел из /proc/mounts, разворачивается.
         "/mnt/win share",
         "/home/u/remote",
         "/net",
     )
-    # ext4, tmpfs и proc — локальные, их в списке быть не должно.
+    # ext4, tmpfs и proc — локальные.
     assert "/" not in points
     assert "/run" not in points
     assert "/proc" not in points
 
 
 def test_network_mount_points_empty_without_proc_mounts(monkeypatch):
-    """Без /proc/mounts (macOS, контейнер без procfs) ограничение просто не действует.
-
-    Обход обязан вести себя как раньше, а не падать на отсутствующем файле.
-    """
+    """Без /proc/mounts (macOS, контейнер без procfs) ограничение не действует."""
 
     def _no_file(*args, **kwargs):
         raise OSError(2, "No such file or directory", "/proc/mounts")
@@ -261,8 +218,7 @@ def test_is_under_matches_whole_path_components():
 def test_scan_does_not_descend_into_network_mount(tmp_path, monkeypatch):
     """Каталог под точкой монтирования сетевой ФС в обход не берётся.
 
-    network_mount_points подменён: настоящую сетевую шару в тесте не поднять,
-    а проверять надо именно решение обхода — спускаться или нет.
+    network_mount_points подменён: настоящую сетевую шару в тесте не поднять.
     """
     root = tmp_path / "scan"
     _mkfile(root / "local" / "doc.txt")
@@ -274,16 +230,11 @@ def test_scan_does_not_descend_into_network_mount(tmp_path, monkeypatch):
     assert _scan(root) == ["local/doc.txt"]
 
 
-# ------------------------------------------------- ДЕФЕКТ 4: молчаливый обход
-
-
 def test_scan_summary_lands_in_info_with_counters(tmp_path, caplog):
     """Итог обхода — одна строка INFO со счётчиками, без единого WARNING.
 
-    Раньше обход не сообщал о себе ничего: пустой индекс было не отличить от
-    зависшего прохода. Уровень принципиален — пропуск подкаталога по правам
-    штатен, и WARNING делал бы красным каждый обход домашнего каталога
-    (см. tests/test_scan_paths_diagnostics.py).
+    Пропуск подкаталога по правам штатен, и WARNING делал бы красным каждый
+    обход домашнего каталога (см. tests/test_scan_paths_diagnostics.py).
     """
     root = tmp_path / "scan"
     _mkfile(root / "doc1.txt")
@@ -318,10 +269,8 @@ def test_scan_summary_lands_in_info_with_counters(tmp_path, caplog):
 def test_progress_is_logged_during_long_scan(tmp_path, caplog, monkeypatch):
     """Долгий обход отчитывается по ходу, а не только в конце.
 
-    Одна строка в самом конце на домашнем каталоге — это десятки минут
-    тишины, по которым не отличить работу от зависания. Шаг занижен
-    monkeypatch'ем: настоящий (_PROGRESS_EVERY_FILES) потребовал бы тысячи
-    файлов на диске.
+    Иначе десятки минут обхода домашнего каталога не отличить от зависания.
+    Шаг занижен: настоящий _PROGRESS_EVERY_FILES потребовал бы тысяч файлов.
     """
     monkeypatch.setattr(scan_dir, "_PROGRESS_EVERY_FILES", 2)
     root = tmp_path / "scan"
@@ -339,15 +288,11 @@ def test_progress_is_logged_during_long_scan(tmp_path, caplog, monkeypatch):
     assert not [r for r in records if r.levelno >= logging.WARNING]
 
 
-# ------------------------------------------- проводка флага до демона
-
-
 def test_config_follows_symlinks_by_default(config):
-    """Демон обязан идти по ссылкам без правки конфига.
+    """Демон идёт по ссылкам без правки конфига.
 
-    Умолчание самой iter_file_metadata осталось False ради прямых вызовов,
-    поэтому единственное место, где ссылки включаются, — конфиг. Сбросится
-    оно в False — и дефект 1 вернётся целиком, молча.
+    Умолчание iter_file_metadata — False ради прямых вызовов, поэтому ссылки
+    включаются только конфигом.
     """
     assert config.file_scan_cfg.follow_symlinks is True
 
@@ -358,13 +303,8 @@ async def test_files_scanner_passes_follow_symlinks_from_config(
 ):
     """FilesScanner пробрасывает флаг из конфига, а не зашивает своё значение.
 
-    Без проброса вся защита от петель и дублей оставалась бы мёртвым кодом:
-    обход демона по-прежнему не заходил бы за ссылки.
-
-    Сканер поднимается штатно, а не через `__new__`: иначе тест держался бы на
-    том, что preindex трогает ровно `self.cfg`, и первая же строка про
-    self.queue превратила бы его в AttributeError вместо осмысленного падения
-    по существу проверки.
+    Сканер поднимается штатно, а не через `__new__`: иначе тест зависел бы от
+    того, какие атрибуты трогает preindex.
     """
     root = tmp_path / "scan"
     root.mkdir()
@@ -388,29 +328,19 @@ async def test_files_scanner_passes_follow_symlinks_from_config(
     assert [c["follow_symlinks"] for c in calls] == [True, False]
 
 
-# ------------------------------------------------- ДЕФЕКТ 5: exclude.py
-
-
 def test_virtualenv_and_snap_dirs_are_excluded():
-    """venv/site-packages/snap уезжали в индекс тысячами файлов из состава пакетов.
+    """venv, site-packages и snap исключены.
 
-    В шаблоне их не было: `\\..+` ловит только .venv, а окружение без точки и
-    ~/snap обходились целиком — сотни тысяч .txt и .py из пакетов вытесняли
-    из выдачи настоящие документы пользователя.
+    `\\..+` ловит только .venv, а сотни тысяч .txt и .py из пакетов вытесняли
+    бы из выдачи документы пользователя.
     """
     for name in ("venv", "site-packages", "snap"):
         assert exclude_pattern.match(name), name
 
 
 def test_previously_known_garbage_stays_excluded():
-    """Чистка восьми мёртвых альтернатив не должна была задеть живые.
-
-    Тест ХАРАКТЕРИЗАЦИОННЫЙ: на старом шаблоне он тоже зелёный — все эти имена
-    ловились и до правки. Сам дефект стерегут кейсы на venv/site-packages/snap
-    (тест выше и последний тест файла), а здесь фиксируется, что рефакторинг,
-    убравший восемь альтернатив, не задел живые группы. Файл не был покрыт ни одним
-    тестом, и пропажа любой из них заметна иначе только по распухшему индексу.
-    """
+    """Остальные группы шаблона на месте: пропажа любой заметна иначе только
+    по распухшему индексу."""
     for name in (
         "node_modules",
         "__pycache__",
@@ -427,11 +357,8 @@ def test_previously_known_garbage_stays_excluded():
 def test_hidden_names_are_covered_by_single_group():
     """Скрытые имена держатся на одной группе `\\..+` — она обязана покрывать всё.
 
-    Тоже характеризационный: группа `\\..+` была в шаблоне всегда, так что на
-    старом коде тест зелёный. Он страхует ровно удаление восьми дублей —
-    .venv/.git/.svn/.hg/.idea/.vscode/.DS_Store/.Trash*. Отдельно важны
-    .files-search и .ragsearch: это собственные каталоги демона, и
-    индексировать свой индекс нельзя — иначе обход кормит сам себя.
+    Отдельно важны .files-search и .ragsearch: это каталоги самого демона, и
+    индексировать свой индекс нельзя.
     """
     for name in (
         ".venv",
@@ -450,11 +377,10 @@ def test_hidden_names_are_covered_by_single_group():
 
 
 def test_pattern_stays_anchored_at_both_ends():
-    """Якоря ^ и $ — единственное, что отделяет мусор от рабочих каталогов.
+    """Якоря ^ и $ отделяют мусор от рабочих каталогов.
 
-    Уберут `$` — и в мусор уедут envelope, venv2, snapshot, distribution:
-    пользователь молча лишится своих каталогов в поиске и никак не узнает,
-    почему документы не находятся.
+    Без `$` в исключения уехали бы envelope, venv2, snapshot, distribution, и
+    документы пользователя молча пропали бы из поиска.
     """
     for name in (
         "envelope",
@@ -476,14 +402,299 @@ def test_check_path_rejects_anything_under_excluded_dir():
     """check_path смотрит и на предков, а не только на имя самого файла.
 
     Иначе venv/lib/site-packages/pkg/readme.txt проходил бы проверку по имени
-    «readme.txt» и попадал в индекс, хотя лежит внутри исключённого каталога.
-    Кейсы на venv/site-packages/snap стерегут именно дефект: на старом шаблоне
-    этих трёх альтернатив не было, и все три пути возвращали True.
+    «readme.txt», хотя лежит внутри исключённого каталога.
     """
     assert check_path(Path("/home/u/Документы/отчёт.docx")) is True
     assert check_path(Path("/home/u/venv/lib/site-packages/pkg/readme.txt")) is False
-    # Новые альтернативы шаблона — на путях целиком, а не только по имени.
+    # venv/site-packages/snap — на путях целиком, а не только по имени.
     assert check_path(Path("/home/u/snap/firefox/notes.txt")) is False
     assert check_path(Path("/home/u/proj/site-packages/pkg/readme.txt")) is False
     assert check_path(Path("/home/u/.cache/notes.txt")) is False
     assert check_path(Path("/home/u/docs/~$отчёт.docx")) is False
+
+
+def _network_home_tree(tmp_path: Path) -> tuple[Path, Path]:
+    """/home с домом u (файл в корне дома и два подкаталога) и чужим домом v."""
+    home = tmp_path / "home"
+    u = home / "u"
+    _mkfile(u / "top.txt")
+    _mkfile(u / "Documents" / "report.txt")
+    _mkfile(u / "Desktop" / "plan.txt")
+    _mkfile(home / "v" / "other.txt")
+    return home, u
+
+
+_HOME_U = ["u/Desktop/plan.txt", "u/Documents/report.txt", "u/top.txt"]
+
+
+def test_network_home_under_home_root_is_scanned(tmp_path, monkeypatch):
+    """Дом пользователя на сетевой ФС обходится целиком из корня /home.
+
+    Штатный корень пакета — /home. Сетевой дом бывает и под autofs-/home, и
+    отдельным NFS-монтированием в локальном /home; раньше в обоих случаях
+    отбрасывался каждый подкаталог и индекс оставался пустым. Чужой сетевой
+    дом по-прежнему не обходится.
+    """
+    home, u = _network_home_tree(tmp_path)
+    monkeypatch.setattr(scan_dir, "_user_homes", lambda: (str(u),), raising=False)
+
+    # /home — точка autofs, дома под ним — NFS.
+    monkeypatch.setattr(
+        scan_dir,
+        "network_mount_points",
+        lambda: (str(home), str(u), str(home / "v")),
+    )
+    assert _scan(home, follow_symlinks=True) == _HOME_U
+
+    # /home локальный, дом — отдельное NFS-монтирование.
+    monkeypatch.setattr(
+        scan_dir, "network_mount_points", lambda: (str(u), str(home / "v"))
+    )
+    assert _scan(home, follow_symlinks=True) == _HOME_U
+
+
+def test_root_on_network_fs_is_scanned_whole(tmp_path, monkeypatch):
+    """Корень, лежащий на сетевой ФС, обходится целиком, а не только верхний уровень.
+
+    Путь выбран пользователем (`~` на NFS или папка на шаре): отбрасывать его
+    подкаталоги как «сетевые» значит молча индексировать только файлы в корне.
+    """
+    home, u = _network_home_tree(tmp_path)
+    monkeypatch.setattr(scan_dir, "_user_homes", lambda: (), raising=False)
+
+    # `~` = /home/u, и это само NFS-монтирование.
+    monkeypatch.setattr(scan_dir, "network_mount_points", lambda: (str(u),))
+    assert _scan(u, follow_symlinks=True) == [
+        "Desktop/plan.txt",
+        "Documents/report.txt",
+        "top.txt",
+    ]
+
+    # Папка на шаре, примонтированной выше корня.
+    monkeypatch.setattr(scan_dir, "network_mount_points", lambda: (str(home),))
+    assert _scan(u, follow_symlinks=True) == [
+        "Desktop/plan.txt",
+        "Documents/report.txt",
+        "top.txt",
+    ]
+
+
+def test_share_mounted_inside_network_home_stays_excluded(tmp_path, monkeypatch):
+    """Исключение сетевых шар внутри дерева не ослабло: дом разрешён, шара в нём — нет."""
+    home, u = _network_home_tree(tmp_path)
+    _mkfile(u / "remote" / "share.txt")
+    monkeypatch.setattr(scan_dir, "_user_homes", lambda: (str(u),), raising=False)
+    monkeypatch.setattr(
+        scan_dir, "network_mount_points", lambda: (str(u), str(u / "remote"))
+    )
+
+    assert _scan(u, follow_symlinks=True) == [
+        "Desktop/plan.txt",
+        "Documents/report.txt",
+        "top.txt",
+    ]
+
+
+def test_user_homes_cover_both_sberos_forms(monkeypatch):
+    """Оба дома доменного пользователя SberOS считаются его домами.
+
+    pw_dir — /home/ДОМЕН@ЛОГИН, HOME терминала — /home/work/ЛОГИН@ДОМЕН; любой из
+    них может оказаться сетевым монтированием под корнем /home.
+    """
+    import pwd
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("HOME", "/home/work/ivanov@sigma.sbrf.ru")
+    monkeypatch.setattr(
+        pwd,
+        "getpwuid",
+        lambda uid: SimpleNamespace(
+            pw_name="ivanov@sigma.sbrf.ru", pw_dir="/home/sigma.sbrf.ru@ivanov"
+        ),
+    )
+
+    homes = scan_dir._user_homes()
+
+    assert "/home/sigma.sbrf.ru@ivanov" in homes
+    assert "/home/work/ivanov@sigma.sbrf.ru" in homes
+
+
+def test_symlink_to_network_mount_is_not_followed(tmp_path, monkeypatch):
+    """Ссылка на сетевую шару не уводит обход на шару.
+
+    Сверяется цель ссылки, а не её путь: иначе `~/Сетевой диск -> /mnt/nfs`
+    проходил проверку и шара обходилась целиком при штатном follow_symlinks.
+    """
+    mnt = tmp_path / "mnt_nfs"
+    _mkfile(mnt / "docs" / "remote.txt")
+    _mkfile(mnt / "file.txt")
+    root = tmp_path / "lhome"
+    _mkfile(root / "local.txt")
+    (root / "Сетевой диск").symlink_to(mnt, target_is_directory=True)
+    (root / "docs-link").symlink_to(mnt / "docs", target_is_directory=True)
+    (root / "rel-link").symlink_to(Path("..") / "mnt_nfs", target_is_directory=True)
+    (root / "remote.txt").symlink_to(mnt / "file.txt")
+    # Цепочка: ссылка на локальную ссылку, ведущую на шару.
+    (tmp_path / "hop").symlink_to(mnt, target_is_directory=True)
+    (root / "chain").symlink_to(tmp_path / "hop", target_is_directory=True)
+    monkeypatch.setattr(scan_dir, "_user_homes", lambda: (), raising=False)
+    monkeypatch.setattr(scan_dir, "network_mount_points", lambda: (str(mnt),))
+
+    assert _scan(root, follow_symlinks=True) == ["local.txt"]
+
+
+def test_symlink_to_network_is_rejected_before_stat_of_target(
+    tmp_path, monkeypatch, caplog
+):
+    """Ссылка на шару отсекается до stat цели.
+
+    Недоступная цель (на живой машине — зависший сервер NFS) не мешает
+    признать ссылку сетевой: она учитывается в счётчике «на сетевых ФС», а не
+    проваливается в stat, который на hard-mount висел бы.
+    """
+    mnt = tmp_path / "mnt_nfs"  # не создаётся: цель недоступна
+    root = tmp_path / "lhome"
+    _mkfile(root / "local.txt")
+    (root / "Сетевой диск").symlink_to(mnt / "docs", target_is_directory=True)
+    monkeypatch.setattr(scan_dir, "_user_homes", lambda: (), raising=False)
+    monkeypatch.setattr(scan_dir, "network_mount_points", lambda: (str(mnt),))
+
+    with caplog.at_level(logging.INFO, logger="app.scanner"):
+        assert _scan(root, follow_symlinks=True) == ["local.txt"]
+
+    summary = [r.getMessage() for r in caplog.records if "завершён" in r.getMessage()]
+    assert len(summary) == 1
+    assert "на сетевых ФС 1" in summary[0], summary[0]
+
+
+def test_check_path_with_roots_checks_only_below_root():
+    """С корнями check_path сверяет только компоненты ниже корня.
+
+    Полный проход сам корень и его предков не проверяет и корни вида ~/Build,
+    ~/snap/<app>/common/Документы обходит; watcher обязан пропускать их события.
+    Без корней правило прежнее — все компоненты вплоть до «/».
+    """
+    build = Path("/home/u/Build")
+    assert check_path(build / "report.docx", [build]) is True
+    assert check_path(build, [build]) is True
+    snap_docs = Path("/home/u/snap/app/common/Документы")
+    assert check_path(snap_docs / "a.docx", [str(snap_docs)]) is True
+    wine_docs = Path("/home/u/.wine/drive_c/docs")
+    assert check_path(wine_docs / "a.docx", [wine_docs]) is True
+    # Ниже корня исключения действуют как прежде.
+    assert check_path(build / "venv" / "lib.txt", [build]) is False
+    assert check_path(build / "~$отчёт.docx", [build]) is False
+    # Под несколькими корнями достаточно одного, который путь пропускает.
+    assert check_path(build / "report.docx", ["/home", build]) is True
+    assert check_path(build / "report.docx", ["/home"]) is False
+    # Без корней и вне корней — все компоненты.
+    assert check_path(build / "report.docx") is False
+    assert check_path(build / "report.docx", ["/srv"]) is False
+
+
+def test_home_symlinked_to_network_dir_is_still_scanned(tmp_path, monkeypatch):
+    """Дом-ссылка на сетевой каталог (/home/u -> /net/srv/home/u) обходится, как раньше.
+
+    Ссылки на сетевые шары отсекаются по цели, и без сверки настоящего пути дома
+    отсёкся бы и сам дом.
+    """
+    net_home = tmp_path / "net" / "srv" / "u"
+    _mkfile(net_home / "top.txt")
+    _mkfile(net_home / "Documents" / "report.txt")
+    home = tmp_path / "home"
+    home.mkdir()
+    u = home / "u"
+    u.symlink_to(net_home, target_is_directory=True)
+    monkeypatch.setattr(scan_dir, "_user_homes", lambda: (str(u),), raising=False)
+    monkeypatch.setattr(
+        scan_dir,
+        "network_mount_points",
+        lambda: (str(tmp_path / "net"), str(net_home)),
+    )
+
+    assert _scan(home, follow_symlinks=True) == ["u/Documents/report.txt", "u/top.txt"]
+
+
+def test_links_inside_root_on_share_are_followed(tmp_path, monkeypatch):
+    """Корень — ссылка на папку шары: ссылки внутри той же шары обходятся, как раньше.
+
+    Пользователь сам выбрал этот путь, и точка монтирования под ним разрешена
+    по настоящему пути корня.
+    """
+    mnt = tmp_path / "mnt"
+    _mkfile(mnt / "projects" / "plan.txt")
+    _mkfile(mnt / "other" / "x.txt")
+    (mnt / "projects" / "other-link").symlink_to(
+        mnt / "other", target_is_directory=True
+    )
+    root = tmp_path / "Проекты"
+    root.symlink_to(mnt / "projects", target_is_directory=True)
+    monkeypatch.setattr(scan_dir, "_user_homes", lambda: (), raising=False)
+    monkeypatch.setattr(scan_dir, "network_mount_points", lambda: (str(mnt),))
+
+    assert _scan(root, follow_symlinks=True) == ["other-link/x.txt", "plan.txt"]
+
+
+@pytest.mark.parametrize("root_spec", ["home", "~"])
+def test_local_scan_unchanged_when_network_mounts_exist_elsewhere(
+    tmp_path, monkeypatch, caplog, root_spec
+):
+    """Обычный локальный обход не меняется от сетевых монтирований вне дерева.
+
+    На АРМ в /proc/mounts почти всегда есть сетевые точки (/net, шары в /mnt).
+    Локальный /home или `~` с вложенными папками и ссылками на локальные
+    каталоги и файлы обязан давать ту же выдачу, что без них, а события
+    watcher'а по найденным файлам — проходить check_path. Дома пользователя
+    берутся настоящие, без подмены. Проходит и до правки обхода.
+    """
+    home = tmp_path / "home"
+    u = home / "u"
+    _mkfile(u / "top.txt")
+    _mkfile(u / "Documents" / "report.txt")
+    _mkfile(u / "Documents" / "sub" / "deep" / "x.txt")
+    _mkfile(u / "venv" / "lib.txt")  # мусор исключается, как прежде
+    _mkfile(tmp_path / "data" / "projects" / "plan.txt")
+    _mkfile(tmp_path / "data" / "rel_target" / "r.txt")
+    (u / "Проекты").symlink_to(tmp_path / "data" / "projects", target_is_directory=True)
+    (u / "rel").symlink_to(
+        Path("..") / ".." / "data" / "rel_target", target_is_directory=True
+    )
+    (u / "alias.txt").symlink_to(u / "Documents" / "report.txt")
+    (u / "Documents" / "loop").symlink_to(u, target_is_directory=True)
+    mnt = tmp_path / "mnt_nfs"
+    _mkfile(mnt / "remote.txt")
+    monkeypatch.setenv("HOME", str(u))
+    root = u if root_spec == "~" else home
+    raw = "~" if root_spec == "~" else str(home)
+
+    def scan() -> list[str]:
+        metas = list(iter_file_metadata(raw, follow_symlinks=True))
+        return sorted(Path(m.path).relative_to(root).as_posix() for m in metas)
+
+    baseline = scan()
+    monkeypatch.setattr(
+        scan_dir,
+        "network_mount_points",
+        lambda: (str(mnt), "/net/srv", "/mnt/share"),
+    )
+    with caplog.at_level(logging.INFO, logger="app.scanner"):
+        found = scan()
+
+    prefix = "u/" if root_spec == "home" else ""
+    expected = sorted(
+        prefix + p
+        for p in (
+            "top.txt",
+            "alias.txt",
+            "Documents/report.txt",
+            "Documents/sub/deep/x.txt",
+            "Проекты/plan.txt",
+            "rel/r.txt",
+        )
+    )
+    assert baseline == expected
+    assert found == expected
+    summary = [r.getMessage() for r in caplog.records if "завершён" in r.getMessage()]
+    assert len(summary) == 1 and "на сетевых ФС 0" in summary[0], summary
+    for rel in found:
+        assert check_path(root / rel) is True, rel

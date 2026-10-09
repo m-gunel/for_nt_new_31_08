@@ -13,7 +13,6 @@ from src.thunderbird.lazy_iter_mbox import _iter_emails
 from src.thunderbird.read_messages import extract_unique_body
 
 _patt_clean = re.compile(r"\n{2,}", re.MULTILINE | re.DOTALL)
-# _patt_split
 
 
 def get_charset(body: str):
@@ -31,13 +30,10 @@ def _get_part(part: Message) -> str | None:
         in {
             "text/plain",
             "text/html",
-            # "multipart/alternative",
         }
         and "attachment" not in cdispo
     ):
         charset = part.get_content_charset()
-        # print("Charset: ", charset)
-        # print("CType: ", ctype)
         body: str = part.get_payload(decode=True).decode(encoding=charset)  # type: ignore
         if ctype == "text/html":
             body = BeautifulSoup(body).get_text()
@@ -56,8 +52,7 @@ def get_body(message: Message, encoding: str = "utf-8") -> str | None:
         return body
 
 
-# Пути к mbox-файлам профиля Thunderbird. Были зашиты под конкретную машину —
-# подставьте свои или найдите профиль через src.thunderbird.find_files.
+# Подставьте свой профиль или найдите его через src.thunderbird.find_files.
 _MAIL_ROOT = Path(
     "~/.thunderbird/<профиль>/ImapMail/imap.sberbank.ru"
 ).expanduser()

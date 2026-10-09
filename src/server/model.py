@@ -10,6 +10,14 @@ import polars as pl
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.common import CARD_KIND, strip_doc_prefix
+
+# Реэкспорт: роутер и тесты берут модели настроек отсюда.
+from src.common.user_config import (  # noqa: F401
+    EMAIL_WINDOW_DAYS,
+    EmailConfig,
+    SberchatConfig,
+    UserConfig,
+)
 from src.utils.lance_wrapper import sql_quote
 
 
@@ -39,10 +47,9 @@ def _has_score(row: dict[str, Any]) -> bool:
 def _row_rank(row: dict[str, Any]) -> tuple[bool, float]:
     """Ключ сортировки строк: строки пула — по оценке, дочитанные — после всех.
 
-    Строки документа, найденного по коду из имени и дочитанного вне пула
-    (src/indexer/name_codes.py), оценки не имеют. Без этого их 0.0 обгонял
-    бы векторный пул, где оценка — минус расстояние, и дочитанный путь
-    отбирал бы у копии из пула место «первого» пути в `duplicates`.
+    У дочитанных по коду из имени строк (src/indexer/name_codes.py) оценки нет,
+    и их 0.0 обгонял бы векторный пул (оценка — минус расстояние), отбирая у
+    копии из пула место «первого» пути в `duplicates`.
     """
     return (_has_score(row), _row_score(row))
 
@@ -106,10 +113,9 @@ class DocumentInfo(BaseModel):
     origin_url: str | None = None
 
 
-# Фрагментов на документ в выдаче. Пул поиска глубокий (src/indexer/indexer.py,
-# search_pool), и у длинного документа в нём бывают десятки чанков: без
-# границы ответ раздувался бы ими, а агенту хватает лучших — остальное он
-# дочитает через /read_file. 3 — столько показывает и MCP-мост.
+# Фрагментов на документ: у длинного документа в глубоком пуле десятки чанков,
+# агенту хватает лучших, остальное — через /read_file. Столько же показывает
+# MCP-мост.
 MAX_FRAGMENTS_PER_DOC = 3
 
 
@@ -160,11 +166,8 @@ class _Hit:
         self.document = self.document or other.document
 
     def take_meta(self, row: dict[str, Any]) -> None:
-        # meta в схеме чанка nullable (src/common/doc_meta.py): строка,
-        # записанная до появления метаданных, мигрированная из старой таблицы
-        # или вставленная руками, приходит с meta=None. Индексация по None —
-        # TypeError, то есть одна такая строка роняла весь /search в 500.
-        # Титул и так имеет фолбэк на имя файла.
+        # meta nullable (src/common/doc_meta.py): у старых и мигрированных строк
+        # meta=None, и одна такая строка уронила бы весь /search в 500.
         meta = row.get("meta") or {}
         self.title = self.title or meta.get("original_name")
         if self.document is None and any(
@@ -183,19 +186,15 @@ def _distinct_docs(
 ) -> list[_Hit]:
     """Документы выдачи одного источника: не больше limit, в порядке лучшей строки.
 
-    Строки идут по убыванию оценки, поэтому первая строка документа — его
-    лучшая, и порядок первых вхождений — это порядок по оценке документа.
-    Копии уже встреченного файла (тот же sha256 под другим путём) мест не
-    занимают: их пути уходят в `duplicates` того пути, что встретился первым.
-    Карточка (kind="card") фрагментом не становится — она лишь отмечает, что
-    слова запроса есть в имени или свойствах файла. Отмечает только карточка,
-    найденная полнотекстовым каналом (есть `_score`): в векторный пул
-    карточки попадают и просто ближайшими соседями — в маленьком индексе все
-    до одной, — а дочитанная по коду из имени с запросом не сверялась вовсе.
+    Копии файла (тот же sha256 под другим путём) мест не занимают: их пути
+    уходят в `duplicates` первого встреченного пути. Карточка (kind="card")
+    фрагментом не становится, а лишь отмечает совпадение с именем или
+    свойствами файла — и только найденная полнотекстовым каналом (есть
+    `_score`): в векторный пул карточки попадают просто ближайшими соседями,
+    а дочитанная по коду из имени с запросом не сверялась.
 
-    Документы из `pinned` (найдены по коду из имени файла) идут первыми и
-    занимают места из того же limit. Копия закреплённого файла закрепляет
-    путь, под которым она осталась в выдаче.
+    Документы из `pinned` идут первыми и занимают места из того же limit;
+    копия закреплённого файла закрепляет оставшийся в выдаче путь.
     """
     rows = sorted(frame.iter_rows(named=True), key=_row_rank, reverse=True)
     first: dict[str, str] = {}  # sha256 → путь, который остаётся в выдаче
@@ -306,19 +305,11 @@ class SearchResponse(BaseModel):
         таблице гибридный поиск деградировал до векторного — в одной
         `_relevance_score`, в другой `_distance`.
 
-        limit — ДОКУМЕНТОВ на источник (None — все из пула). Документ
-        оценивается лучшей своей строкой и несёт до MAX_FRAGMENTS_PER_DOC
-        лучших фрагментов. Копии одного файла (одинаковый sha256)
-        схлопываются: остаётся путь с лучшей строкой, остальные — в
-        `duplicates`, мест они не занимают. Карточка документа — не фрагмент,
-        а отметка "card" в `match`.
-
-        pinned — пути документов, найденных по коду из имени файла
-        (Index.search, тот же параметр). Они идут первыми — в порядке своей
-        лучшей строки пула, дочитанные вне пула — после них — и несут
-        "name_code" в `match`. Порядок задан явно, а не подменой оценок:
-        score остаётся настоящей оценкой поиска, а у дочитанных вне пула,
-        которым оценки нет, — null, а не выдуманный 0.
+        limit — документов на источник (None — все из пула), у документа до
+        MAX_FRAGMENTS_PER_DOC лучших фрагментов. pinned — пути, найденные по
+        коду из имени файла (Index.search): идут первыми и несут "name_code" в
+        `match`. Порядок задан явно, а не подменой оценок: score остаётся
+        настоящей оценкой поиска, у дочитанных вне пула — null.
         """
         hits: dict[str, _Hit] = {}
         duplicates: dict[str, set[str]] = defaultdict(set)
@@ -381,8 +372,7 @@ _EXT = re.compile(r"[0-9a-z]+")
 
 
 def _fold_yo(sql: str) -> str:
-    """ё → е в SQL-выражении: «Ковалёв» в свойствах и «Ковалев» в запросе
-    (и наоборот) пишут как придётся, и люди, и агенты."""
+    """ё → е в SQL-выражении: «Ковалёв» и «Ковалев» пишут вперемешку."""
     return f"replace({sql}, 'ё', 'е')"
 
 
@@ -396,17 +386,13 @@ def _like_contains(value: str) -> str:
     return f"'%{sql_quote(escaped)}%' ESCAPE '\\'"
 
 
-# Граница даты фильтра. Даты в индексе — timestamp в наносекундах, а он
-# покрывает лишь 1677–2262 годы: литерал за пределами LanceDB не отвергает, а
-# молча переполняет, и «до 3000 года» отсекало бы всё. Поэтому — ошибка 422.
+# Даты в индексе — timestamp в нс (1677–2262 гг.): литерал за пределами LanceDB
+# молча переполняет, поэтому вне диапазона — 422.
 _FilterDate = Annotated[date, Field(ge=date(1900, 1, 1), le=date(2200, 12, 31))]
 
 
-# Дата документа для фильтра — та же, что выдача показывает как «изменён» и
-# «создан»: из свойств документа (dcterms:modified, modDate PDF), а без них —
-# файла на диске. У скачанного, пришедшего почтой, распакованного или
-# перенесённого на новый ноутбук файла дата на диске — день копирования, и
-# фильтр «за 2023» отбрасывал документ, на котором написано «изменён: 2023».
+# Дата для фильтра — из свойств документа, а без них — файла на диске: у
+# скачанного или скопированного файла дата на диске — день копирования.
 _MODIFIED = "coalesce(meta.doc_modified, meta.date_modified)"
 _CREATED = "coalesce(meta.doc_created, meta.date_created)"
 
@@ -465,9 +451,8 @@ class SearchFilters(BaseModel):
     @field_validator("*", mode="before")
     @classmethod
     def _blank_is_absent(cls, value):
-        """Незаполненное поле формы клиент шлёт пустым, а не убирает: это «не
-        фильтровать», а не ошибка. Пустой author к тому же совпал бы с любым
-        автором, но не с документом без автора и молча резал бы выдачу."""
+        """Пустое поле формы — «не фильтровать»: пустой author молча отсёк бы
+        документы без автора."""
         if isinstance(value, str) and not value.strip():
             return None
         if isinstance(value, list):
@@ -547,11 +532,8 @@ class SearchFilters(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str
-    # limit — документов на источник; пул чанков из LanceDB растёт с ним
-    # (search_pool в src/indexer/indexer.py, потолок там же). Верхняя граница
-    # всё равно обязательна: выдача из сотен тысяч документов собиралась бы в
-    # pydantic-модели прямо в event loop. 1000 — с запасом над рабочими
-    # сценариями.
+    # Пул чанков растёт с limit (search_pool в src/indexer/indexer.py). Потолок
+    # нужен: огромная выдача собиралась бы в pydantic прямо в event loop.
     limit: int = Field(
         10, ge=1, le=1000, description="Сколько документов вернуть на источник"
     )
@@ -570,7 +552,6 @@ class SearchRequest(BaseModel):
             "найденные по коду из имени"
         ),
     )
-    # offset: int
 
     @field_validator("query_type", "sources", mode="before")
     @classmethod
@@ -593,34 +574,26 @@ class SearchRequest(BaseModel):
         return value
 
 
-class EmailConfig(BaseModel):
-    enabled: bool = False
-    path_to_email_folder: str = ""
-    # Окно по умолчанию, а не None: None — это «весь ящик за все годы», то
-    # есть на порядок больше чанков, чем весь файловый корпус. Совпадает с
-    # cfg/example.yml; явный null в запросе снимает ограничение.
-    index_last_n_days: int | None = 30
-    offsets: dict[str, int] | None = None
+# Тело POST /config строже базовых моделей из src/common/user_config.py: те же
+# классы читают user_conf.yml и секцию email YAML-конфига, где лишний ключ не
+# должен обнулять настройки или ронять старт, а в запросе опечатка давала бы
+# 200 без изменений.
+class EmailConfigUpdate(EmailConfig):
+    model_config = ConfigDict(extra="forbid")
+
+    # Окно — от одного дня; без ограничения — явный null.
+    index_last_n_days: int | None = Field(EMAIL_WINDOW_DAYS, ge=1)
 
 
-class SberchatConfig(BaseModel):
-    enabled: bool = False
+class SberchatConfigUpdate(SberchatConfig):
+    model_config = ConfigDict(extra="forbid")
 
 
-class UserConfig(BaseModel):
-    folders: list[str] | None = Field(
-        None, description="Список директорий для сканирвоания"
-    )
-    # Глубина рекурсивного наблюдения. None — как раньше: рекурсивно по всему
-    # дереву (на каждый подкаталог ставится inotify-наблюдение и на большом
-    # домашнем каталоге это упирается в fs.inotify.max_user_watches). Число —
-    # наблюдать только каталоги до этой вложенности включительно, создавая
-    # по одному наблюдению на каждый, без рекурсии watchdog'а.
-    max_depth: int | None = Field(
-        None, description="Глубина рекурсивного наблюдения файлового вотчера"
-    )
-    email: EmailConfig = Field(default_factory=EmailConfig)
-    sberchat: SberchatConfig = Field(default_factory=SberchatConfig)
+class UserConfigUpdate(UserConfig):
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailConfigUpdate = Field(default_factory=EmailConfigUpdate)
+    sberchat: SberchatConfigUpdate = Field(default_factory=SberchatConfigUpdate)
 
 
 class IndexingControlResponse(BaseModel):

@@ -26,6 +26,17 @@ class Budget:
         )
 
 
+def _repeatable(prefix: str, budget: Budget) -> bool:
+    """Повтор prefix в каждом чанке оставляет строкам хотя бы половину бюджета."""
+    return Budget(budget.limit // 2, budget.count).fits(prefix)
+
+
+def _shorten(text: str, budget: Budget) -> str:
+    """Начало text с « …», которое по оценке символами влезает в половину бюджета."""
+    n = int(budget.limit // 2 * budget.SAFE_CHARS_PER_TOKEN) - 2
+    return text[: max(n, 1)].rstrip() + " …"
+
+
 def split_parts(
     prefix: str, parts: list[str], budget: Budget, sep: str = "\n"
 ) -> list[str]:
@@ -46,6 +57,9 @@ def split_parts(
             res.append(t)
             continue
         head = (prefix.rstrip() + " …") if prefix else ""
+        if prefix and not _repeatable(prefix, budget):
+            # С prefix почти во весь бюджет в каждый кусок влезало бы по слову.
+            head = _shorten(prefix.rstrip(), budget)
         step = max(50, int(budget.limit * budget.SAFE_CHARS_PER_TOKEN) - len(head))
         words = [w[k : k + step] for w in t.split(" ") for k in range(0, len(w), step)]
         piece: list[str] = []
@@ -98,10 +112,17 @@ def table_blocks(
     head = " | ".join(dict.fromkeys(h for h in header if h))
     prefix = "".join(x + "\n" for x in (title, head) if x)
     lines = [(" | ".join(c for c in cells if c), n) for cells, n in body]
+    lines = [x for x in lines if x[0]]
+    if lines and prefix and not _repeatable(prefix, budget):
+        # Шапка-простыня (абзац в первой строке, многоуровневая шапка широкой
+        # формы): иначе строкам не остаётся бюджета. Целиком — один раз первой
+        # строкой, в каждом чанке — её начало, как длинная подпись строки в xlsx.
+        lines.insert(0, (prefix.rstrip("\n"), lines[0][1]))
+        prefix = _shorten(prefix.rstrip("\n"), budget) + "\n"
     return list(
         pack_lines(
             prefix,
-            [x for x in lines if x[0]],
+            lines,
             budget,
             kind="table",
             table_id=table_id,

@@ -1,6 +1,6 @@
 import abc
 import os
-from collections.abc import AsyncGenerator, AsyncIterable, Callable, Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from pathlib import Path
 from typing import (
     Any,
@@ -8,7 +8,7 @@ from typing import (
 )
 
 from src.common import Chunk, DocumentMetadata
-from src.utils import ConfigMixin, ExpectedError, wrap_iter_to_async
+from src.utils import ConfigMixin, ExpectedError
 
 from .doc_model import ParsedDoc, chunk_document, prepare
 from .metadata import file_metadata
@@ -43,23 +43,12 @@ class Parser(abc.ABC, ConfigMixin):
         with open(path, "rb") as f:
             yield from self.iter_chunks_io(f)
 
-    async def async_iter_chunks(self, path: str) -> AsyncIterable[Chunk]:
-        with open(path, "rb") as f:
-            async for chunk in self.async_iter_chunks_io(f):
-                yield chunk
-
     def iter_chunks_io(self, file: BinaryIO) -> Generator[Chunk, Any, None]:
         """Чанки документа с полями места — без префикса «Документ: …» и метаданных:
         их добавляет конвейер индексации, которому известно имя файла."""
         yield from chunk_document(
             prepare(self.parse_io(file)), self._config.embed_splitter
         )
-
-    async def async_iter_chunks_io(self, file: BinaryIO) -> AsyncGenerator[Chunk, Any]:
-        # Без лога на каждый чанк: при 10 000 файлов это сотни тысяч записей
-        # за проход, а полезной информации в них нет.
-        async for chunk in wrap_iter_to_async(self.iter_chunks_io(file)):
-            yield chunk
 
 
 def file_extension(name: str | os.PathLike) -> str:
@@ -96,19 +85,3 @@ def get_parser(ext: str):
 
 def get_parsers_registry() -> dict[str, type[Parser]]:
     return _registry
-
-
-# .doc - Microsoft Word document (legacy)
-# .docx - Microsoft Word Open XML document
-# .pdf - Portable Document Format (Adobe PDF)
-# .txt - Plain text file
-# .rtf - Rich Text Format
-# .odt - OpenDocument Text Document
-# .html/.htm - HyperText Markup Language
-# .xls - Microsoft Excel spreadsheet (legacy)
-# .xlsx - Microsoft Excel Open XML spreadsheet
-# .csv - Comma-separated values file
-# .ods - OpenDocument Spreadsheet
-# .ppt - Microsoft PowerPoint presentation (legacy)
-# .pptx - Microsoft PowerPoint Open XML presentation
-# .odp - OpenDocument Presentation

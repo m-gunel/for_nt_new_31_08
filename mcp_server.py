@@ -3,17 +3,13 @@
 
 Отдаёт агенту то, чего у него нет своими силами: семантический поиск по
 локальному индексу LocalRAG и состояние этого индекса. Разговаривает с
-сайдкаром по HTTP через уже существующие ручки (/search, /status, /config) —
-собственного API у моста нет.
+сайдкаром по HTTP через уже существующие ручки (/health, /status, /search,
+/config, /read_file) — собственного API у моста нет.
 
-Зависимостей при импорте нет вообще: только stdlib. Это условие поставки —
-мост уезжает в дистрибутив отдельными файлами и должен запускаться на голом
-системном python3, без venv репозитория. Чтение файлов: офисные форматы и pdf
-мост запрашивает у демона (POST /api/v1/read_file) — в его бинаре вшиты
-pymupdf и конвертер Р7 для легаси .doc/.xls; если демон недоступен или
-старой версии, OOXML (.docx/.pptx/.xlsx) мост разбирает сам через zipfile +
-ElementTree, а pdf и легаси-форматы честно отказывают. Текстовые файлы
-читаются всегда и без демона.
+Только stdlib: в поставке мост запускается на системном python3 без venv.
+Офисные форматы и pdf читает демон (POST /api/v1/read_file: pymupdf и
+конвертер Р7 для .doc/.xls). Без демона OOXML (.docx/.pptx/.xlsx) мост
+разбирает сам, pdf и легаси-форматы — отказ. Текстовые файлы читаются всегда.
 
 Протокол: MCP stdio (JSON-RPC построчно через stdin/stdout).
 
@@ -39,6 +35,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -48,54 +45,40 @@ import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 
-# Адрес сайдкара. LQRAG_URL, если задан, сильнее всего остального: им
-# пользуются тесты и нестандартные установки. Иначе порт берётся из файла,
-# который демон публикует при старте, — без этого конфиг агента с зашитым
-# адресом протухал бы при каждом перезапуске индексатора на другом порту
-# (БТ §4.2 требует динамического назначения). Файла нет — исторический 8000.
-#
-# LQRAG_PORT_FILE — явный путь, и он эксклюзивен: заданный файл не дополняется
-# поиском по домашним каталогам, иначе тест или нестандартная установка
-# молча подхватили бы порт чужого демона. None — перебираем кандидатов
-# из _port_file_candidates().
+# Адрес сайдкара: LQRAG_URL, иначе порт из файла, который публикует демон
+# (порт динамический, БТ §4.2), иначе 8000.
+# Заданный LQRAG_PORT_FILE исключает поиск по домашним каталогам: иначе тест
+# или нестандартная установка подхватили бы порт чужого демона.
 _PORT_FILE_ENV = os.environ.get("LQRAG_PORT_FILE")
 LQRAG_PORT_FILE = os.path.expanduser(_PORT_FILE_ENV) if _PORT_FILE_ENV else None
 PORT_FILE_RELATIVE = os.path.join(".files-search", "port")
-# Демон кладёт свой pid рядом с портом (src/port_file.py): по нему мост
-# отличает опубликованный порт живого демона от файла, оставшегося после
-# SIGKILL, закрытого терминала или выключения питания.
+# pid демона рядом с порт-файлом (src/port_file.py), см. _pid_alive.
 PID_FILE_NAME = "pid"
 FALLBACK_URL = "http://127.0.0.1:8000"
 LQRAG_TIMEOUT = float(os.environ.get("LQRAG_TIMEOUT", "30"))
 
-# Сайдкар всегда на этой же машине, и прокси из окружения агента ему не нужен.
-# Штатный urlopen берёт http_proxy/HTTP_PROXY, а no_proxy сравнивает как
-# строку: «localhost» не покрывает 127.0.0.1, CIDR не поддерживается. Запрос
-# уходил на корпоративный прокси, его 502 выглядел как ответ живого демона, и
-# проба, автозапуск и «прогревается» не срабатывали. Все запросы к сайдкару —
+# Без прокси: штатный urlopen берёт http_proxy из окружения агента, а no_proxy
+# сравнивает строкой («localhost» не покрывает 127.0.0.1). 502 прокси выглядит
+# как ответ живого демона, и автозапуск не срабатывает. Все запросы к сайдкару —
 # только через этот opener.
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-# Автозапуск демона. Мост — первое, что видит агент, и если индексатор не
-# поднят (служба остановлена, вход без перезапуска сессии после установки),
-# без этого агент получал бы отказ соединения до ручного вмешательства, а
-# просить пользователя набирать systemctl в поставке нельзя.
+# Автозапуск: если служба не поднята (остановлена, сессия не перезапущена после
+# установки), мост сам зовёт systemctl — просить об этом пользователя нельзя.
 SERVICE_UNIT = "lib-local-rag.service"
 AUTOSTART_TIMEOUT_S = 10
-# Сколько вызов инструмента ждёт ответа systemctl. У агента таймаут MCP-запроса
-# по умолчанию 5 с (WSC), и ответ «прогревается» обязан успеть раньше него.
-# Обычно systemctl --no-block отвечает за доли секунды.
+# Ожидание systemctl внутри вызова: таймаут MCP-запроса у агента (WSC) 5 с,
+# ответ «прогревается» должен успеть раньше.
 AUTOSTART_WAIT_S = 3.0
-# Проба на initialize: только отличить «слушает» от «отказ», не больше.
+# Проба на initialize: только отличить «слушает» от «отказ».
 PROBE_TIMEOUT_S = 1.0
-# Прогрев идёт 40-45 с, на медленной машине до полутора минут. Отказы подряд
-# дольше этого порога — уже не прогрев: мост говорит «не поднимается».
+# Прогрев 40-45 с, на медленной машине до полутора минут; отказы дольше — уже
+# не прогрев, а «не поднимается».
 STUCK_AFTER_S = 180.0
-# start не чаще раза за этот интервал: если systemd службу не поднял, повтор
-# на каждом вызове ничего не изменит, а лог забьётся одинаковыми строками.
+# Если systemd службу не поднял, повтор start на каждом вызове ничего не даст,
+# только забьёт лог.
 AUTOSTART_RETRY_S = 180.0
-# Маску на время установки пакета postinst снимает сам, и ответ «masked»
-# устаревает быстро: ждать полный интервал до новой попытки незачем.
+# Маску postinst снимает сам, и «masked» устаревает быстро.
 MASKED_RETRY_S = 30.0
 WARMING_TEXT = (
     "Индексатор LocalRAG запускается или прогревается (обычно около 45 секунд). "
@@ -110,19 +93,19 @@ SERVICE_MASKED_TEXT = (
     "Служба LocalRAG временно остановлена: идёт установка или обновление пакета. "
     "Повторите запрос через минуту."
 )
-# Так systemctl сообщает о юните, которого он не видит. Для 1.0.6 это ровно
-# случай нечитаемого юнит-файла: systemd --user не смог его открыть.
+# Ответ systemctl на юнит, которого он не видит (в том числе нечитаемый файл).
 _UNIT_MISSING_MARKERS = ("not found", "could not be found", "not be found")
-# А так — о юните под маской: prerm маскирует службу (--runtime) на время
-# замены файлов пакета, чтобы мост не поднял демон из полузаменённого бандла.
+# Юнит под маской: prerm маскирует службу (--runtime) на время замены файлов
+# пакета, чтобы мост не поднял демон из полузаменённого бандла.
 _UNIT_MASKED_MARKERS = ("masked",)
 # Что показать агенту из `systemctl --user show`, когда служба не поднимается.
 _SERVICE_PROPERTIES = ("ActiveState", "SubState", "NRestarts")
 # Агент — единственный интерфейс управления индексатором, поэтому write-
 # инструменты видны ему по умолчанию. Закрытая установка отключает их явно:
-# LQRAG_ALLOW_WRITE=0. Песочница local_read_file от флага не зависит —
-# чтение всегда ограничено индексируемыми папками, скрытые файлы и конфиги
-# не выдаются, что бы ни было написано в проиндексированном документе.
+# LQRAG_ALLOW_WRITE=0. Песочница local_read_file от флага не зависит, но её
+# граница — список папок, а его с write-инструментами меняет сам агент, в том
+# числе по инструкции из проиндексированного документа. Корень ФС, системные
+# и скрытые каталоги демон в список не пускает (_validate_folders).
 ALLOW_WRITE = os.environ.get("LQRAG_ALLOW_WRITE", "1").strip().lower() in (
     "1",
     "true",
@@ -155,10 +138,16 @@ MAX_FILE_CHARS = 40000
 # Строк на лист книги Excel при локальном чтении (без демона): больше в ответ на
 # MAX_FILE_CHARS всё равно не влезет. У индексатора свой лимит — ExcelParserConfig.max_rows.
 MAX_XLSX_ROWS = 1000
-# Лимит размера файла при локальном (без демона) разборе. Зеркалит
-# _READ_FILE_MAX_BYTES демона: у его /read_file тот же потолок, и мост
-# не должен разбирать локально то, что демон честно отверг бы кодом 413.
+# Потолок локального разбора по размеру файла — как _READ_FILE_MAX_BYTES демона
+# (его ответ 413). Это сжатый размер; объём после распаковки — ниже.
 MAX_LOCAL_READ_BYTES = 64 * 1024 * 1024
+# Части OOXML мост разбирает в дерево целиком, а deflate сжимает до ~1000:1:
+# без своих пределов zip-бомба в сотни КиБ занимает гигабайты (как в
+# src/parsers/ooxml_limits.py демона).
+MAX_XML_BYTES = 64 * 1024 * 1024
+MAX_UNPACKED_BYTES = 256 * 1024 * 1024
+# Живой XML жмётся в 5–20 раз; сотни к одному — признак бомбы.
+MAX_RATIO = 100
 
 
 def _log(*args):
@@ -166,14 +155,11 @@ def _log(*args):
     print("[localrag-mcp]", *args, file=sys.stderr, flush=True)
 
 
-# ---------------------------------------------------------------------------
-# Ошибки
-# ---------------------------------------------------------------------------
 class InvalidParams(Exception):
-    """Аргументы вызова не проходят валидацию — это ошибка протокола (-32602).
+    """Невалидные аргументы вызова — ошибка протокола -32602.
 
-    Не «поправить молча»: тихая коррекция (зажать limit, подменить query_type)
-    прячет ошибку агента вместо того, чтобы вернуть её ему.
+    Молча не исправляем (зажать limit, подменить query_type): агент должен
+    увидеть свою ошибку.
     """
 
 
@@ -192,20 +178,18 @@ class TransportError(ToolError):
     """Сайдкар недоступен, молчит или ответил не-JSON."""
 
 
-# ---------------------------------------------------------------------------
-# HTTP к сайдкару
-# ---------------------------------------------------------------------------
-def _port_file_candidates():
-    """Где искать порт-файл, когда LQRAG_PORT_FILE не задан.
+class ReplyTimeout(TransportError):
+    """Сайдкар принял запрос, но не ответил за LQRAG_TIMEOUT: жив, но занят."""
 
-    Домов два, и нужны оба. Служба systemd --user живёт с HOME из passwd
-    (pw_dir) и публикует порт туда. А терминал на SberOS открывается с
-    HOME=/home/work/<LOGIN@DOMAIN>, хотя пользователь тот же: мост, запущенный
-    агентом из такого терминала, по одному ~ порт-файла не находил и уходил на
-    8000, где никого нет. $HOME первым — демон, поднятый вручную из того же
-    терминала, публикует порт именно туда; живость демона по pid важнее этого
-    порядка (см. _port_file_routes). Один и тот же каталог под двумя именами
-    (симлинк) проверяется один раз.
+
+def _port_file_candidates():
+    """Где искать порт-файл без LQRAG_PORT_FILE: в $HOME и в доме из passwd.
+
+    Служба systemd --user публикует порт в pw_dir, а терминал SberOS
+    открывается с HOME=/home/work/<LOGIN@DOMAIN>: по одному ~ мост файла не
+    найдёт. $HOME первым — туда пишет демон, запущенный вручную из терминала
+    (живость по pid важнее порядка, см. _port_file_routes). Один каталог под
+    двумя именами (симлинк) проверяется один раз.
     """
     homes = [os.path.expanduser("~")]
     try:
@@ -229,11 +213,7 @@ def _port_file_candidates():
 
 
 def _read_port(path):
-    """Порт из файла или None.
-
-    Нет файла, пустой, мусор внутри, число вне диапазона — всё это означает
-    одно: опубликованного порта здесь нет. Гадать нечего.
-    """
+    """Порт из файла; None, если файла нет или порт в нём невалиден."""
     try:
         with open(path, "r", encoding="utf-8") as handle:
             port = int(handle.read().strip())
@@ -243,12 +223,10 @@ def _read_port(path):
 
 
 def _pid_alive(port_file):
-    """Жив ли демон, опубликовавший порт: True, False или None — неизвестно.
+    """Жив ли демон, опубликовавший порт: True, False или None (неизвестно).
 
-    pid читается из соседнего с порт-файлом файла. Демон снимает оба при
-    штатной остановке, а после SIGKILL, закрытого терминала или выключения
-    питания они остаются, и по одному порту живой демон от мёртвого не
-    отличить. Нет файла, мусор внутри, не POSIX — неизвестно: гадать нечего.
+    pid лежит рядом с порт-файлом. После SIGKILL или выключения питания оба
+    файла остаются, и по одному порту живой демон от мёртвого не отличить.
     """
     # os.kill(pid, 0) на Windows не проверка, а TerminateProcess.
     if not port_file or os.name != "posix":
@@ -281,13 +259,11 @@ _PID_RANK = {True: 0, None: 1, False: 2}
 def _port_file_routes():
     """(routes, checked): опубликованные порты, живые демоны — первыми.
 
-    routes — (url, port_file, alive) по каждому читаемому порт-файлу, alive —
-    ответ _pid_alive(). checked — какие порт-файлы просмотрены вообще, для
-    стартового лога и ошибок. При равной живости порядок прежний: $HOME, затем
-    pw_dir. Без учёта pid устаревший файл в $HOME заслонял живой демон службы в
-    pw_dir, и мост до перезапуска агента отвечал «прогревается». Мёртвый
-    кандидат не выбрасывается: другого может не быть, а адрес с путём к файлу
-    нужен хотя бы для текста ошибки.
+    routes — (url, port_file, alive) по каждому читаемому порт-файлу; checked —
+    все просмотренные порт-файлы, для лога и ошибок. При равной живости —
+    порядок кандидатов. Без сортировки по pid устаревший файл в $HOME заслонял
+    бы живой демон службы в pw_dir. Мёртвый кандидат остаётся: другого может не
+    быть, а путь к файлу нужен для текста ошибки.
     """
     checked = [LQRAG_PORT_FILE] if LQRAG_PORT_FILE else _port_file_candidates()
     found = []
@@ -331,21 +307,13 @@ def _resolve_address():
 
 
 def _resolve_base_url():
-    """Базовый URL сайдкара на момент вызова и то, откуда он взят.
+    """(url, source) сайдкара на момент вызова.
 
-    Возвращает (url, source), где source — одна из трёх строк:
-      "env"       объект адресован через LQRAG_URL явно;
-      "port-file" порт взят из файла, опубликованного демоном: явный
-                  LQRAG_PORT_FILE или ~/.files-search/port в $HOME либо в
-                  домашнем каталоге из passwd;
-      "fallback"  ни того, ни другого нет — мост идёт на историческое
-                  http://127.0.0.1:8000, и это, скорее всего, признак того, что
-                  демон не запущен.
+    source: "env" (LQRAG_URL), "port-file" (порт опубликован демоном) или
+    "fallback" (http://127.0.0.1:8000 — обычно демон не запущен).
 
-    Читается каждый раз, а не запоминается на старте: демон могли перезапустить
-    на другом порту, пока мост жив, и залипший адрес выглядел бы как «сайдкар
-    недоступен» до перезапуска агента. Чтение локального файла на пять байт
-    несопоставимо дешевле самого HTTP-запроса, ради которого оно делается.
+    Адрес не кэшируется: демон могут перезапустить на другом порту, пока мост
+    жив, а чтение файла в пять байт дешевле самого HTTP-запроса.
     """
     url, source, _, _ = _resolve_address()
     return url, source
@@ -369,9 +337,6 @@ def _is_refused(exc):
     return isinstance(getattr(exc, "reason", None), ConnectionRefusedError)
 
 
-# ---------------------------------------------------------------------------
-# Автозапуск демона
-# ---------------------------------------------------------------------------
 def _autostart_state():
     """Начальное состояние автозапуска: модулю на старте, тестам — на каждый тест."""
     return {
@@ -409,12 +374,11 @@ def _note_reachable():
 
 
 def _note_refused():
-    """Отказ соединения. Возвращает, сколько секунд отказы идут подряд.
+    """Отметить отказ соединения; вернуть, сколько секунд отказы идут подряд.
 
-    Серия — это отказы без долгих пауз между ними. Если к мосту не обращались
-    дольше STUCK_AFTER_S, непрерывности никто не видел: демон мог за это время
-    подняться и упасть снова, и старый отсчёт выдал бы «не поднимается» на
-    первом же отказе новой серии.
+    Пауза дольше STUCK_AFTER_S начинает новую серию: демон мог за это время
+    подняться и упасть, и старый отсчёт дал бы «не поднимается» на первом же
+    отказе.
     """
     now = time.monotonic()
     with _autostart_lock:
@@ -429,10 +393,9 @@ def _note_refused():
 def _run_systemctl(systemctl, args):
     """`systemctl --user <args>` с таймаутом; TimeoutExpired и OSError — наружу.
 
-    stdin закрыт, stdout уходит в трубу, а не в наш: stdin моста — поток
-    JSON-RPC от агента, stdout — ответы ему, и чужие байты в них рвут сессию.
-    Вывод читаем байтами: на python3.6 в локали C декодирование по локали
-    падает на первом же не-ASCII символе.
+    stdin и stdout моста — канал JSON-RPC, и чужие байты в нём рвут сессию:
+    у systemctl stdin закрыт, stdout — в трубу. Вывод читаем байтами: на
+    python3.6 в локали C декодирование падает на первом не-ASCII символе.
     """
     env = dict(os.environ)
     # Агент может запустить мост без XDG_RUNTIME_DIR (не из графической сессии),
@@ -519,10 +482,9 @@ def _service_summary():
 def _systemctl_worker(state, start, show):
     """Тело фонового потока: снимок состояния службы и/или попытка start.
 
-    state передаётся явно, а не берётся из модуля в момент записи: поток может
-    пережить тест, который подменил _autostart, и писать должен в своё.
-    Снимок — до start: после него ActiveState=failed сменился бы на activating,
-    и причина, по которой служба не поднимается, из текста пропала бы.
+    state передаётся явно: поток может пережить тест, подменивший _autostart.
+    Снимок — до start, иначе ActiveState=failed сменится на activating и
+    причина сбоя пропадёт из текста.
     """
     if show:
         try:
@@ -590,12 +552,10 @@ def _request_systemd(wait=0.0, start=True, show=False):
 def _probe_and_autostart():
     """Проба на initialize: демон не слушает — просим systemd поднять его сразу.
 
-    Агент подключается к MCP задолго до первого поиска, и прогрев, начатый
-    здесь, к этому поиску обычно успевает закончиться. Недоступность — только
-    сбой соединения: ответ с ошибкой или таймаут чтения значат, что демон жив,
-    и поднимать его незачем. Живой pid у выбранного порт-файла — демон греет
-    модель (служба или запущенный вручную), и второй экземпляр на том же
-    индексе systemd не заказываем.
+    Агент подключается задолго до первого поиска, и прогрев обычно успевает
+    закончиться. Недоступность — только сбой соединения: HTTP-ошибка или
+    таймаут чтения значат, что демон жив. Живой pid у выбранного порт-файла —
+    демон греет модель, второй экземпляр на том же индексе не заказываем.
     """
     routes, source, _ = _resolve_routes()
     if source == "env":
@@ -642,10 +602,9 @@ def _stuck_text(down_for, service):
 def _unreachable(base, source, port_file, checked, reason):
     """Ошибка для агента, когда до сайдкара не достучаться.
 
-    Отказ соединения на 127.0.0.1 приходит мгновенно, и за оставшееся до
-    таймаута агента время мост успевает понять, что происходит, и ответить
-    по-человечески. Прежний текст про недоступный сайдкар остаётся в
-    подробностях — по нему разбирают сбой.
+    Отказ на 127.0.0.1 мгновенный, и до таймаута агента мост успевает выяснить
+    причину (прогрев, маска, нет юнита). Технический текст уходит в
+    «Подробности» — по нему разбирают сбой.
     """
     detail = (
         "сайдкар LocalRAG недоступен по %s (%s). Проверьте, что он запущен "
@@ -654,9 +613,6 @@ def _unreachable(base, source, port_file, checked, reason):
     if source == "port-file":
         detail += " Порт взят из %s." % port_file
     elif source == "fallback":
-        # При source=="fallback" сайдкар, скорее всего, просто не запущен, и
-        # это самая частая причина «агент слышит мост, но инструменты падают
-        # с отказом соединения».
         detail += (
             " Файла с фактическим портом демона (%s) нет, а LQRAG_URL не "
             "задан — вероятно, сервис LocalRAG не запущен. Для поставки .deb: "
@@ -670,10 +626,9 @@ def _unreachable(base, source, port_file, checked, reason):
     down_for = _note_refused()
     stuck = down_for >= STUCK_AFTER_S
     if source == "port-file" and _pid_alive(port_file):
-        # Процесс, опубликовавший порт, жив, а соединение отвергнуто — демон
-        # греет модель: uvicorn начинает слушать только после прогрева.
-        # systemctl start не зовём: служба либо уже поднята, либо демон
-        # запущен вручную, и второй экземпляр на том же индексе хуже ожидания.
+        # Процесс жив, а соединение отвергнуто — демон греет модель: uvicorn
+        # слушает только после прогрева. start не зовём: второй экземпляр на
+        # том же индексе хуже ожидания.
         if not stuck:
             return TransportError("%s Подробности: %s" % (WARMING_TEXT, detail))
         _, service = _request_systemd(AUTOSTART_WAIT_S, start=False, show=True)
@@ -735,12 +690,11 @@ def _http_json(method, path, payload=None):
             _note_reachable()
             raise _api_error(exc) from None
         except urllib.error.URLError as exc:
-            # URLError без HTTP-кода — сбой на этапе соединения (отказ или таймаут
-            # подключения): таймаут чтения urllib в URLError не заворачивает, он
-            # уходит в ветку OSError ниже с прежним текстом.
+            # Сбой соединения (отказ или таймаут подключения). Таймаут чтения
+            # urllib в URLError не заворачивает — он попадёт в OSError ниже.
             if _is_refused(exc):
-                # Отказ по одному порт-файлу — ещё не приговор: устаревший файл
-                # мог оказаться первым, а живой демон — в другом доме.
+                # Устаревший порт-файл мог оказаться первым, а живой демон —
+                # в другом доме.
                 if refused is None:
                     refused = (base, port_file, exc.reason)
                 continue
@@ -748,7 +702,8 @@ def _http_json(method, path, payload=None):
         except OSError as exc:
             # Соединение было, ответа нет — демон жив, но не уложился.
             _note_reachable()
-            raise TransportError(
+            error = ReplyTimeout if isinstance(exc, socket.timeout) else TransportError
+            raise error(
                 "сбой связи с сайдкаром %s: %s" % (base, exc)
             ) from None
         break
@@ -767,9 +722,6 @@ def _http_json(method, path, payload=None):
         ) from None
 
 
-# ---------------------------------------------------------------------------
-# Валидация аргументов
-# ---------------------------------------------------------------------------
 def _reject_unknown(args, allowed):
     extra = sorted(set(args) - set(allowed))
     if extra:
@@ -843,7 +795,9 @@ def _optional_sources(args):
 
 
 _EXT_RE = re.compile(r"[0-9a-z]+")
-_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+# ASCII: strptime в _optional_date, в отличие от date.fromisoformat, принимает
+# и не-ASCII цифры («２０２４»), отсечь их может только шаблон.
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)
 
 
 def _optional_text(args, name):
@@ -902,7 +856,9 @@ def _optional_date(args, name):
     try:
         if not _DATE_RE.fullmatch(value):
             raise ValueError
-        day = datetime.date.fromisoformat(value)
+        # strptime, а не date.fromisoformat (он с 3.7): нижней границы
+        # python3 в debian/control нет.
+        day = datetime.datetime.strptime(value, "%Y-%m-%d").date()
         # Диапазон демона (SearchFilters в src/server/model.py): за ним
         # timestamp индекса переполняется.
         if not 1900 <= day.year <= 2200:
@@ -956,15 +912,33 @@ def _filters_line(filters):
     return "Фильтры: " + "; ".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Инструмент: поиск
-# ---------------------------------------------------------------------------
 def _safe_status():
     """Статус индексации, но без права уронить вызов, ради которого спрошен."""
     try:
         return _http_json("GET", "/api/v1/status")
     except ToolError:
         return None
+
+
+def _inactive(status):
+    """Индексация выключена (/deactivate, /reset, autostart_indexing: false).
+
+    is_indexing=false бывает и в простое, отличает только поле active. У
+    демонов без этого поля индексация считается включённой.
+    """
+    return isinstance(status, dict) and status.get("active") is False
+
+
+# Инструмента для /activate у моста нет: агенту называем ручку, чтобы он
+# передал её пользователю.
+INACTIVE_TEXT = (
+    "Индексация выключена (включается POST /api/v1/activate): новые и "
+    "изменённые файлы не индексируются, индекс может быть пуст или устарел."
+)
+SAVED_INACTIVE_TEXT = (
+    "Индексация выключена: список сохранён, обход начнётся после её включения "
+    "(POST /api/v1/activate)."
+)
 
 
 def _format_score(value):
@@ -1025,9 +999,8 @@ _SEARCH_FILTER_ARGS = ("ext", "folder", "modified_after", "modified_before", "au
 # агент не понимает, почему он в выдаче.
 _MATCH_LABELS = (
     ("name_code", "код из имени файла"),
-    # Карточка — имя файла и его свойства, не только название: документ,
-    # найденный по «Автор: Петров», с меткой «совпало по названию» агент
-    # пересказал бы пользователю неверно.
+    # Карточка — имя файла и все свойства, не только название: с меткой «по
+    # названию» документ, найденный по автору, агент пересказал бы неверно.
     ("card", "слова запроса есть в имени или свойствах файла (название, автор, тема…)"),
 )
 
@@ -1141,10 +1114,9 @@ def _layout_search(results):
     Порядок важнее полноты фрагментов: сначала каждому документу —
     заголовок с путём, отметки и строка о документе, затем по первому
     фрагменту (при нехватке места — укороченному), и только потом добавочные
-    фрагменты верхним документам. Раньше документ раскладывался целиком, и
-    три длинных фрагмента первых документов обрывали список: агент не видел
-    файлов, которые демон нашёл. Документы отбрасываются, только если не
-    влезают даже их заголовки.
+    фрагменты верхним документам — иначе длинные фрагменты первых документов
+    вытесняют из ответа остальные найденные файлы. Документ отбрасывается,
+    только если не влезает даже его заголовок.
     """
     entries = []
     used = 0
@@ -1192,14 +1164,13 @@ def _tool_search(args):
         "query_type": query_type,
         "sources": sources,
     }
-    # Без фильтров поля нет вовсе: тело запроса остаётся прежним, и на нём
-    # держатся контрактные тесты и старые демоны.
+    # Без фильтров поля нет вовсе: старые демоны и контрактные тесты ждут тело
+    # без него.
     if filters:
         payload["filters"] = filters
     data = _http_json("POST", "/api/v1/search", payload)
     results = data.get("results") or []
-    # total — документы ответа демона, а не его поле total: у демонов до
-    # выдачи документами (limit = документы) оно считало строки.
+    # Не поле total демона: у старых демонов оно считает строки, а не документы.
     total = len(results)
 
     if not results:
@@ -1215,11 +1186,15 @@ def _tool_search(args):
                 % (status.get("files_to_index", "?"), status.get("type", "?"))
             )
         elif status is None:
-            # Утверждать «индекс актуален», не сумев спросить статус, нельзя:
-            # это ровно то ложное «не найдено», ради которого статус и заведён.
+            # Без статуса «индекс актуален» утверждать нельзя — это то же
+            # ложное «не найдено».
             text = (
                 "Ничего не найдено. Состояние индексации проверить не удалось — "
                 "возможно, индекс ещё строится."
+            )
+        elif _inactive(status):
+            text = "Ничего не найдено. %s Это НЕ значит, что документа нет." % (
+                INACTIVE_TEXT
             )
         else:
             text = "Ничего не найдено. Индексация не идёт, индекс актуален."
@@ -1237,11 +1212,8 @@ def _tool_search(args):
     head = "Найдено документов: %s" % total
     if shown < total:
         head += " (показано %s — остальное не поместилось в ответ)" % shown
-    # Раньше здесь стояло "indexing": False жёстко. Агент, получивший три
-    # документа во время первой индексации, считал список полным и отвечал
-    # пользователю, что больше ничего нет, — то же ложное «не найдено», от
-    # которого защищена пустая ветка выше. Статус стоит одного GET по
-    # localhost: демон отдаёт счётчики из памяти, без обращения к диску.
+    # Статус и при непустой выдаче: во время индексации агент иначе счёл бы
+    # список полным. Это один GET по localhost, счётчики демон берёт из памяти.
     status = _safe_status()
     indexing = bool(status and status.get("is_indexing"))
     if filters:
@@ -1253,6 +1225,11 @@ def _tool_search(args):
             "список может быть неполным, повторите поиск позже.\n"
             % (status.get("files_to_index", "?"), status.get("type", "?"))
         )
+    elif _inactive(status):
+        text += (
+            "ВНИМАНИЕ: индексация выключена (включается POST /api/v1/activate) — "
+            "новые и изменённые файлы не индексируются, список может быть неполным.\n"
+        )
     return text, {
         "total": total,
         "shown": shown,
@@ -1261,18 +1238,20 @@ def _tool_search(args):
     }
 
 
-# ---------------------------------------------------------------------------
-# Инструмент: состояние индекса
-# ---------------------------------------------------------------------------
 def _tool_index_status(args):
     _reject_unknown(args, ())
     status = _http_json("GET", "/api/v1/status")
     is_indexing = bool(status.get("is_indexing"))
+    inactive = _inactive(status)
+    if inactive:
+        state = "выключена"
+    else:
+        state = "идёт" if is_indexing else "не идёт"
     text = (
         "Индексация: %s\nФаза: %s\nВ очереди всего: %s (файлов: %s, писем: %s)\n"
         "Собрано на этапе preindex: %s"
         % (
-            "идёт" if is_indexing else "не идёт",
+            state,
             status.get("type", "?"),
             status.get("files_to_index", "?"),
             status.get("queued_files", "?"),
@@ -1280,25 +1259,24 @@ def _tool_index_status(args):
             status.get("total_files", "?"),
         )
     )
-    if is_indexing:
+    if inactive:
+        text += "\n%s Пустая выдача поиска не означает отсутствия документа." % (
+            INACTIVE_TEXT
+        )
+    elif is_indexing:
         text += "\nПустая выдача поиска сейчас не означает отсутствия документа."
     return text, status
 
 
-# ---------------------------------------------------------------------------
-# Инструмент: чтение файла
-# ---------------------------------------------------------------------------
-# Форматы, которые мост извлекает сам. Секретоёмкие расширения (.env, .ini,
-# .conf, .properties, .toml) выкинуты намеренно: индекс стоит на домашнем
-# каталоге, а в таких файлах лежат токены — в этом же репозитории индекс
-# пакетов в pyproject.toml прописан вместе с плейсхолдером токена.
+# .env, .ini, .conf, .properties, .toml исключены намеренно: в таких файлах
+# лежат токены, а индекс может покрывать весь домашний каталог.
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".rst", ".csv", ".tsv", ".log",
     ".json", ".yml", ".yaml", ".xml", ".html", ".htm",
     ".py", ".sh", ".sql", ".java", ".kt", ".ipynb",
 }
-# Легаси .doc/.xls включены в белый список: их читает демон через конвертер
-# Р7, а без демона мост отказывает с подсказкой.
+# Легаси .doc/.xls читает только демон (конвертер Р7); без него — отказ с
+# подсказкой.
 OFFICE_EXTENSIONS = {".doc", ".docx", ".pdf", ".pptx", ".xls", ".xlsx"}
 
 _FOLDERS_TTL = 5.0
@@ -1319,7 +1297,7 @@ def _indexed_roots():
     for folder in data.get("folders") or []:
         if not isinstance(folder, str):
             continue
-        roots.append(os.path.realpath(os.path.expanduser(folder)))
+        roots.append(os.path.abspath(os.path.expanduser(folder)))
     _folders_cache["ts"] = now
     _folders_cache["roots"] = roots
     return roots
@@ -1329,18 +1307,62 @@ def _inside(path, root):
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
 
+# Имена, которые обход индексатора пропускает, — копия exclude_pattern из
+# src/indexer/exclude.py: мост на stdlib и импортировать src/ не может.
+# Расхождение ловит tests/test_read_sandbox.py.
+_EXCLUDED_NAME = re.compile(
+    r"^(?:\..+|node_modules|__pycache__|venv|env|site-packages|snap|dist|build"
+    r"|Thumbs\.db|~.*)$",
+    re.IGNORECASE,
+)
+
+
+def _sandbox_refusal(path, roots):
+    """Почему файл не отдаётся: None — отдаётся, иначе "outside" или "excluded".
+
+    Правило обхода индексатора: файл внутри корня, и ни одно имя ниже корня не
+    скрыто и не служебное. path сверяется как есть (ссылки не раскрыты — так
+    индексатор хранит файлы за ссылками) и после realpath — тот же файл по
+    настоящему пути. Демон проверяет так же: read_refusal в src/indexer/exclude.py.
+    """
+    real = os.path.realpath(path)
+    inside = False
+    for root in roots:
+        for candidate, base in ((path, root), (real, os.path.realpath(root))):
+            if not _inside(candidate, base):
+                continue
+            inside = True
+            below = candidate[len(base.rstrip(os.sep)) :].split(os.sep)
+            if not any(_EXCLUDED_NAME.match(part) for part in below):
+                return None
+    return "excluded" if inside else "outside"
+
+
+def _read_part(bundle, name, used):
+    """Часть пакета целиком — только в пределах распаковки (zip-бомба).
+
+    Размер — из центрального каталога: zipfile больше заявленного не отдаёт.
+    used — [сколько байт этого файла уже распаковано].
+    """
+    info = bundle.getinfo(name)
+    size = info.file_size
+    # Большая часть сама по себе не бомба (общие строки выгрузки, длинный docx):
+    # отказ — при сжатии больше MAX_RATIO:1 или сверх общего потолка.
+    bomb = size > MAX_XML_BYTES and size > MAX_RATIO * max(info.compress_size, 1)
+    if bomb or used[0] + size > MAX_UNPACKED_BYTES:
+        raise ValueError("%s: %d Б после распаковки — больше лимита" % (name, size))
+    used[0] += size
+    return bundle.read(name)
+
+
 def _extract_docx(path):
-    # OOXML разбирается сам, без библиотек: в поставке мост живёт на системном
-    # python3, где нет docx2txt, а тесты моста гоняют его подпроцессом из
-    # venv, где она есть. Один код вместо двух путей — расхождение
-    # «у разработчика работает, у пользователя ImportError» исключено.
+    # Без docx2txt: на системном python3 поставки её нет, а тесты в venv с ней
+    # не поймали бы ImportError.
     W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
     with zipfile.ZipFile(path) as bundle:
-        root = ET.fromstring(bundle.read("word/document.xml"))
-    # Параграфы бывают вложенными (текстбоксы внутри w:p): root.iter(W+"p")
-    # обходит и внешние, и внутренние, а paragraph.iter() внешнего параграфа
-    # уже захватывает узлы внутреннего — без seen-set текстбокс попал бы в
-    # выдачу дважды. Узел элемента уникален как объект, id() надёжен.
+        root = ET.fromstring(_read_part(bundle, "word/document.xml", [0]))
+    # w:p бывают вложенными (текстбоксы): paragraph.iter() внешнего уже
+    # захватывает узлы внутреннего, и без seen текстбокс попал бы в текст дважды.
     seen = set()
     paragraphs = []
     for paragraph in root.iter(W + "p"):
@@ -1375,6 +1397,7 @@ def _extract_pdf(path):
 def _extract_pptx(path):
     A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
     slides = []
+    used = [0]
     with zipfile.ZipFile(path) as bundle:
         parts = []
         for name in bundle.namelist():
@@ -1384,7 +1407,7 @@ def _extract_pptx(path):
         # По номеру, а не по имени файла: лексикографически slide10 идёт
         # раньше slide2, и порядок слайдов переворачивался бы с десятого.
         for number, name in sorted(parts):
-            root = ET.fromstring(bundle.read(name))
+            root = ET.fromstring(_read_part(bundle, name, used))
             lines = []
             for paragraph in root.iter(A + "p"):
                 line = "".join(t.text or "" for t in paragraph.iter(A + "t"))
@@ -1402,20 +1425,21 @@ def _extract_xlsx(path):
     R = "{http://schemas.openxmlformats.org/package/2006/relationships}"
     RD = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
     blocks = []
+    used = [0]
     with zipfile.ZipFile(path) as bundle:
         names = bundle.namelist()
         shared = []
         if "xl/sharedStrings.xml" in names:
-            items = ET.fromstring(bundle.read("xl/sharedStrings.xml"))
+            items = ET.fromstring(_read_part(bundle, "xl/sharedStrings.xml", used))
             for item in items.iter(NS + "si"):
                 shared.append("".join(t.text or "" for t in item.iter(NS + "t")))
         titles = {}
         if "xl/workbook.xml" in names and "xl/_rels/workbook.xml.rels" in names:
             targets = {}
-            rels = ET.fromstring(bundle.read("xl/_rels/workbook.xml.rels"))
+            rels = ET.fromstring(_read_part(bundle, "xl/_rels/workbook.xml.rels", used))
             for rel in rels.iter(R + "Relationship"):
                 targets[rel.get("Id")] = "xl/" + (rel.get("Target") or "").lstrip("/")
-            workbook = ET.fromstring(bundle.read("xl/workbook.xml"))
+            workbook = ET.fromstring(_read_part(bundle, "xl/workbook.xml", used))
             for sheet in workbook.iter(NS + "sheet"):
                 titles[targets.get(sheet.get(RD + "id"), "")] = sheet.get("name")
         parts = []
@@ -1425,7 +1449,7 @@ def _extract_xlsx(path):
                 parts.append((int(match.group(1)), name))
         for number, name in sorted(parts):
             rows = []
-            sheet = ET.fromstring(bundle.read(name))
+            sheet = ET.fromstring(_read_part(bundle, name, used))
             for row in sheet.iter(NS + "row"):
                 cells = []
                 for cell in row.findall(NS + "c"):
@@ -1443,8 +1467,8 @@ def _extract_xlsx(path):
                     cells.append(text)
                 if cells:
                     rows.append("\t".join(cells))
-                # Строк на лист — как в ExcelParserConfig.max_rows индексатора:
-                # без границы книга на сотни тысяч строк уезжала бы в контекст.
+                # Без границы книга на сотни тысяч строк уезжала бы в контекст;
+                # лимит свой, не индексатора (см. MAX_XLSX_ROWS).
                 if len(rows) >= MAX_XLSX_ROWS:
                     rows.append("… лист обрезан на %d строках" % MAX_XLSX_ROWS)
                     break
@@ -1454,8 +1478,7 @@ def _extract_xlsx(path):
     return "\n\n".join(blocks)
 
 
-# Пакет нужен только pdf: у stdlib нет декодера потока PDF. Остальные
-# офисные форматы — zip с XML внутри, их разбирает сам мост.
+# (функция, пакет): пакет нужен только pdf, остальное — zip с XML.
 _OFFICE_EXTRACTORS = {
     ".docx": (_extract_docx, None),
     ".pdf": (_extract_pdf, "pymupdf"),
@@ -1463,8 +1486,6 @@ _OFFICE_EXTRACTORS = {
     ".xlsx": (_extract_xlsx, None),
 }
 
-# Форматы, которые мост читает ТОЛЬКО через демона: pdf зашит в его бинарь
-# (pymupdf), легаси .doc/.xls разбирает конвертер Р7-Офиса.
 _SIDECAR_ONLY_EXTENSIONS = {".doc", ".xls"}
 _SIDECAR_READ_EXTENSIONS = set(_OFFICE_EXTRACTORS) | _SIDECAR_ONLY_EXTENSIONS
 
@@ -1497,13 +1518,12 @@ def _tool_read_file(args):
         raise ToolError(
             "это ключ письма из выдачи поиска, а не путь на диске — прочитать нечем"
         )
-    # realpath, а не abspath: иначе симлинк из индексируемой папки наружу
-    # проводит чтение мимо песочницы.
-    path = os.path.realpath(os.path.expanduser(raw_path))
+    # Путь, как его хранит индекс: ~ раскрыт, «..» снят, ссылки не раскрыты.
+    # Он же уходит демону: свои HOME и cwd раскрыли бы raw_path иначе.
+    path = os.path.abspath(os.path.expanduser(raw_path))
 
-    # Список папок берём у сайдкара. Если он недоступен — границы песочницы
-    # неизвестны, и чтение запрещено: открытый доступ ко всей файловой системе
-    # хуже отказа.
+    # Без списка папок от сайдкара границы песочницы неизвестны — отказ лучше
+    # доступа ко всей файловой системе.
     try:
         roots = _indexed_roots()
     except ToolError as exc:
@@ -1514,18 +1534,24 @@ def _tool_read_file(args):
         ) from None
     if not roots:
         raise ToolError("у LocalRAG не настроено ни одной индексируемой папки")
-    if not any(_inside(path, root) for root in roots):
+    refusal = _sandbox_refusal(path, roots)
+    if refusal == "outside":
         raise ToolError(
             "путь %s вне индексируемых папок, чтение запрещено. Разрешены: %s"
             % (path, ", ".join(roots))
         )
+    if refusal == "excluded":
+        raise ToolError(
+            "скрытые файлы и содержимое скрытых и служебных каталогов не "
+            "читаются: %s" % path
+        )
 
     if not os.path.isfile(path):
         raise ToolError("файл не найден или не является обычным файлом: %s" % path)
-    if os.path.basename(path).startswith("."):
-        raise ToolError("скрытые файлы не читаются: %s" % path)
 
-    ext = os.path.splitext(path)[1].lower()
+    # Расширение — у самого файла: ссылка «заметки.txt» на «prod.env» не должна
+    # проводить .env мимо списка.
+    ext = os.path.splitext(os.path.realpath(path))[1].lower()
     if ext not in TEXT_EXTENSIONS and ext not in OFFICE_EXTENSIONS:
         raise ToolError(
             "расширение '%s' не поддерживается. Доступны: %s"
@@ -1533,14 +1559,12 @@ def _tool_read_file(args):
         )
 
     if ext in _SIDECAR_READ_EXTENSIONS:
-        # Сначала спрашиваем демона: у него в бинаре pymupdf для pdf и
-        # конвертер Р7 для легаси .doc/.xls — этого у моста на системном
-        # python3 нет и не будет. На локальный разбор ниже проваливаемся
-        # только когда демона нет или ручки нет (404): прочие ответы демона
-        # (413 больше лимита, 422 пустой текст) — это его честный вердикт
-        # по файлу, и подменять его своей локальной попыткой нельзя.
+        # Сначала демон: pymupdf и конвертер Р7 есть только у него. Локальный
+        # разбор — лишь когда демона нет или нет ручки (404 "Not Found" от
+        # FastAPI); таймаут живого демона, 404 «файл не найден», 413 и 422 — его
+        # вердикт по файлу, подменять его нельзя.
         try:
-            data = _http_json("POST", "/api/v1/read_file", {"absolute_path": raw_path})
+            data = _http_json("POST", "/api/v1/read_file", {"absolute_path": path})
             remote = data.get("text")
             if isinstance(remote, str):
                 truncated = len(remote) > MAX_FILE_CHARS or bool(data.get("truncated"))
@@ -1559,10 +1583,12 @@ def _tool_read_file(args):
                     "truncated": truncated,
                     "chars": len(content),
                 }
+        except ReplyTimeout:
+            raise
         except TransportError:
             pass
         except ApiError as exc:
-            if exc.code != 404:
+            if exc.code != 404 or exc.detail != "Not Found":
                 raise
 
     if ext in _SIDECAR_ONLY_EXTENSIONS:
@@ -1572,9 +1598,6 @@ def _tool_read_file(args):
             "доступны через local_search" % ext
         )
 
-    # Демон отклоняет чтение больше _READ_FILE_MAX_BYTES кодом 413; если его
-    # нет, мост обязан отвергнуть такой же файл сам, а не втягивать распакованный
-    # XML неограниченного объёма в память системного python3.
     if os.path.getsize(path) > MAX_LOCAL_READ_BYTES:
         raise ToolError("файл больше лимита чтения")
     content = _read_text(path, ext)
@@ -1593,9 +1616,6 @@ def _tool_read_file(args):
     return text, {"path": path, "truncated": truncated, "chars": len(content)}
 
 
-# ---------------------------------------------------------------------------
-# Инструменты управления индексацией (скрыты при LQRAG_ALLOW_WRITE=0)
-# ---------------------------------------------------------------------------
 def _get_folders():
     return list(_http_json("GET", "/api/v1/config").get("folders") or [])
 
@@ -1603,9 +1623,9 @@ def _get_folders():
 def _post_folders(folders):
     """Записать список папок.
 
-    POST /config с непустым folders сам делает stop_watcher → stop_index →
-    удаление снятых префиксов → start_reindex → restart_watcher, поэтому
-    отдельная команда переиндексации после него не нужна.
+    POST /config с непустым folders сам перезапускает индексацию (stop_watcher
+    → stop_index → удаление снятых префиксов → start_reindex →
+    restart_watcher), отдельная переиндексация не нужна.
     """
     _http_json("POST", "/api/v1/config", {"folders": folders})
     _folders_cache["roots"] = None
@@ -1613,6 +1633,22 @@ def _post_folders(folders):
 
 def _normalize(path):
     return os.path.abspath(os.path.expanduser(path))
+
+
+def _covering_root(path, folders):
+    """Папка из folders, внутри которой лежит существующий каталог path, или None.
+
+    По realpath, а не по _normalize: папка-ссылка внутри корня ведёт в другое
+    место, и при follow_symlinks: false корень её содержимое не покрывает.
+    """
+    if not os.path.isdir(path):
+        return None
+    real = os.path.realpath(path)
+    for folder in folders:
+        root = _normalize(folder)
+        if _inside(real, os.path.realpath(root)):
+            return root
+    return None
 
 
 def _tool_list_paths(args):
@@ -1639,14 +1675,25 @@ def _tool_add_path(args):
     folders = _get_folders()
     if any(_normalize(folder) == path for folder in folders):
         return "Папка уже индексируется: %s" % path, {"path": path, "added": False}
+    # Вложенную папку не отвергаем: последнюю папку удалить нельзя, и без
+    # отдельной записи список не сузить с корня до папки внутри него.
+    root = _covering_root(path, folders)
     # Существование пути проверяет сам сайдкар (400, конфиг не меняется):
     # сохранённый несуществующий путь роняет наблюдение за файловой системой.
     _post_folders(folders + [path])
-    return (
-        "Папка добавлена: %s. Индексация перезапущена автоматически — "
-        "следите за local_index_status." % path,
-        {"path": path, "added": True},
-    )
+    text = "Папка добавлена: %s." % path
+    if root is not None:
+        text += (
+            " Она внутри индексируемой папки %s и уже входила в индексацию в её "
+            "составе." % root
+        )
+    if _inactive(_safe_status()):
+        text += " " + SAVED_INACTIVE_TEXT
+    else:
+        text += (
+            " Индексация перезапущена автоматически — следите за local_index_status."
+        )
+    return text, {"path": path, "added": True}
 
 
 def _tool_remove_path(args):
@@ -1655,21 +1702,45 @@ def _tool_remove_path(args):
     folders = _get_folders()
     remaining = [folder for folder in folders if _normalize(folder) != path]
     if len(remaining) == len(folders):
+        root = _covering_root(path, folders)
+        if root is not None:
+            raise ToolError(
+                "папка %s не числится отдельно: она внутри индексируемой папки %s "
+                "и входит в индексацию в её составе. Убрать её из индекса можно "
+                "только вместе с %s" % (path, root, root)
+            )
         raise ToolError("папка %s не числится среди индексируемых" % path)
     if not remaining:
-        # Пустой список не «выключает индексацию», а тихо откатывает конфиг к
-        # путям из YAML: Config.scan_paths считает пустой список отсутствием
-        # пользовательской настройки.
+        # Пустой список демон отвергает (400): Config.scan_paths понял бы его
+        # как «настройки нет» и обходил бы пути из YAML, а не выключил бы
+        # индексацию.
         raise ToolError(
-            "нельзя удалить последнюю папку: пустой список молча вернёт пути из "
-            "конфига демона. Сначала добавьте другую папку"
+            "нельзя удалить последнюю папку: пустой список демон не принимает. "
+            "Сначала добавьте другую папку"
         )
     _post_folders(remaining)
-    return (
-        "Папка удалена: %s. Её документы сняты с индекса, индексация перезапущена."
-        % path,
-        {"path": path, "removed": True},
-    )
+    root = _covering_root(path, remaining)
+    inactive = _inactive(_safe_status())
+    if root is not None:
+        # Демон снимет документы папки, но обход root вернёт их обратно.
+        text = (
+            "Папка убрана из списка: %s. Она внутри индексируемой папки %s, "
+            "поэтому её документы снова попадут в индекс при обходе этой папки — "
+            "исключить её отдельно нельзя." % (path, root)
+        )
+        if inactive:
+            text += " " + SAVED_INACTIVE_TEXT
+    elif inactive:
+        text = "Папка удалена: %s. Её документы сняты с индекса. %s" % (
+            path,
+            SAVED_INACTIVE_TEXT,
+        )
+    else:
+        text = (
+            "Папка удалена: %s. Её документы сняты с индекса, индексация "
+            "перезапущена." % path
+        )
+    return text, {"path": path, "removed": True}
 
 
 def _tool_set_email(args):
@@ -1689,9 +1760,14 @@ def _tool_set_email(args):
 def _tool_trigger_rescan(args):
     _reject_unknown(args, ())
     status = _http_json("GET", "/api/v1/status")
+    if _inactive(status):
+        # На выключенной индексации демон только сохранил бы тот же список.
+        raise ToolError(
+            "индексация выключена — переиндексация не запущена. Полный обход "
+            "начнётся после её включения (POST /api/v1/activate)"
+        )
     if status.get("is_indexing"):
-        # POST /config во время активной индексации — то, на чём hunt_crash.py
-        # ловил падения демона. Отказываем, а не рискуем.
+        # POST /config во время индексации ронял демон.
         raise ToolError(
             "индексация уже идёт (фаза «%s», в очереди %s) — переиндексация не "
             "запущена. Дождитесь окончания и повторите"
@@ -1709,9 +1785,6 @@ def _tool_trigger_rescan(args):
     )
 
 
-# ---------------------------------------------------------------------------
-# Контракт инструментов
-# ---------------------------------------------------------------------------
 _SEARCH_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1996,9 +2069,6 @@ def visible_tools():
     return READ_TOOLS + (WRITE_TOOLS if ALLOW_WRITE else [])
 
 
-# ---------------------------------------------------------------------------
-# JSON-RPC диспетчер
-# ---------------------------------------------------------------------------
 def _result(msg_id, payload):
     return {"jsonrpc": "2.0", "id": msg_id, "result": payload}
 
@@ -2024,12 +2094,14 @@ def _handle_tools_call(msg_id, params):
     if not isinstance(args, dict):
         return _error(msg_id, -32602, "поле 'arguments' должно быть объектом")
 
-    if name not in _HANDLERS:
-        return _error(msg_id, -32601, "неизвестный инструмент: %s" % name)
+    # Метод tools/call есть, неверен его параметр name: -32602, как в примере
+    # спецификации MCP (Tools → Error Handling). Не строка — тоже неизвестный.
+    if not isinstance(name, str) or name not in _HANDLERS:
+        return _error(msg_id, -32602, "неизвестный инструмент: %s" % (name,))
     if name in _WRITE_TOOL_NAMES and not ALLOW_WRITE:
         return _error(
             msg_id,
-            -32601,
+            -32602,
             "инструмент %s скрыт в этой установке (LQRAG_ALLOW_WRITE=0): "
             "управление индексацией из агента отключено" % name,
         )
@@ -2067,6 +2139,10 @@ def _handle(msg):
         return None
     if is_notification:
         return None
+    # JSON-RPC допускает params-массив, а эти методы читают его через .get():
+    # иначе AttributeError ронял бы мост.
+    if method in ("initialize", "tools/call") and not isinstance(params, dict):
+        return _error(msg_id, -32602, "поле 'params' должно быть объектом")
 
     if method == "initialize":
         # Проба и автозапуск — в фоне: рукопожатие не ждёт ни сети, ни systemd.
@@ -2098,11 +2174,24 @@ def _handle(msg):
     return _error(msg_id, -32601, "метод не найден: %s" % method)
 
 
+def _safe_handle(msg):
+    """_handle без права уронить мост: сбой на одном сообщении — -32603 на него.
+
+    Упавший процесс оставил бы агента без инструментов до перезапуска сессии.
+    """
+    try:
+        return _handle(msg)
+    except Exception as exc:
+        _log("сбой обработки сообщения: %r" % (exc,))
+        if isinstance(msg, dict) and "id" in msg:
+            return _error(msg.get("id"), -32603, "внутренняя ошибка моста: %s" % exc)
+        return None
+
+
 def main():
     url, source, port_file, checked = _resolve_address()
-    # Путь порт-файла — в лог обязательно: при двух домах ($HOME терминала и
-    # pw_dir службы) «мост смотрит не туда» иначе ничем не выдаёт себя. Там же
-    # живость pid: устаревший файл после аварийной остановки виден сразу.
+    # Путь порт-файла и живость pid — в лог: при двух домах ($HOME терминала и
+    # pw_dir службы) иначе не видно, что мост смотрит не туда.
     origin = {
         "env": "из LQRAG_URL",
         "port-file": "порт из %s, pid: %s"
@@ -2123,9 +2212,8 @@ def main():
         )
     )
     if source == "fallback":
-        # Наиболее частая жалоба пользователя: «инструменты есть, а поиск
-        # падает с отказом соединения». Причина почти всегда в том, что демон
-        # не поднят, а fallback-адрес молча маскирует её. Говорим сразу.
+        # Без порт-файла демон, скорее всего, не поднят, а запасной адрес это
+        # маскирует — предупреждаем сразу.
         if _autostart_enabled():
             consequence = "мост попросит systemd поднять его при первом обращении"
         else:
@@ -2137,9 +2225,8 @@ def main():
             "Проверьте: systemctl --user status lib-local-rag.service, затем "
             "%s/api/v1/health." % (", ".join(checked) or "-", url, consequence, url)
         )
-    # Поток JSON-RPC — всегда UTF-8, независимо от локали. На python3.6 в
-    # локали C текстовые stdin/stdout — ASCII: кириллица запроса приходила
-    # суррогатами, а первый же русский ответ ронял мост UnicodeEncodeError.
+    # JSON-RPC — всегда UTF-8: на python3.6 в локали C текстовые stdin/stdout
+    # ASCII, и первый же русский ответ роняет мост UnicodeEncodeError.
     stdin = getattr(sys.stdin, "buffer", None)
     stdout = getattr(sys.stdout, "buffer", None)
     while True:
@@ -2161,9 +2248,9 @@ def main():
             continue
 
         if isinstance(message, list):
-            responses = [_handle(item) for item in message]
+            responses = [_safe_handle(item) for item in message]
         else:
-            responses = [_handle(message)]
+            responses = [_safe_handle(message)]
         for response in responses:
             if response is None:
                 continue

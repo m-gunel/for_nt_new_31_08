@@ -79,11 +79,12 @@ sh scripts/check_deb.sh ../lib-local-rag_1.0.7_amd64.deb   # последняя 
 
 ### Вариант 2. Локально в Docker
 
-Тот же `Dockerfile`, что в CI. Нужны Docker и токен SberOSC (тот, что в
-`.secret`):
+Тот же `Dockerfile`, что в CI. Нужны Docker с BuildKit (по умолчанию с версии 23)
+и токен SberOSC из `.secret` — он передаётся секретом сборки:
 
 ```bash
-docker build --build-arg OSC_TOKEN=<токен> -t rag-sberos .
+OSC_TOKEN=$(sed -n 's/^[[:space:]]*OSC_TOKEN[[:space:]]*=[[:space:]]*//p' .secret | head -n 1) \
+  docker build --secret id=osc_token,env=OSC_TOKEN -t rag-sberos .
 docker create --name rag-deb rag-sberos /bin/sh
 docker cp rag-deb:/app/lib-local-rag.deb ./lib-local-rag_1.0.7_amd64.deb
 docker rm rag-deb
@@ -97,7 +98,8 @@ docker rm rag-deb
   как в `make docker_build`.
 - `make docker_build` достаёт из образа только `dist/`, пакет он не забирает.
   Для пакета нужны команды выше.
-- Токен из `--build-arg` остаётся в истории образа. Образ никуда не пушьте.
+- Токен есть только внутри шагов установки пакетов: в слои, историю образа и
+  вывод сборки он не попадает.
 
 ### Вариант 3. Нативно на SberOS или Debian (sudo не нужен)
 
@@ -113,7 +115,8 @@ sh scripts/build_deb_nosudo.sh      # debhelper → dpkg-buildpackage → check_
 pypi.org и падает с «invalid peer certificate: UnknownIssuer».
 
 Прав администратора сборке не нужно. Если debhelper и dpkg-dev в системе уже
-есть, `scripts/build_deb_nosudo.sh` просто вызывает `make deb`. Если чего-то нет,
+есть, `scripts/build_deb_nosudo.sh` вызывает `make deb` (при закрытой базе
+dpkg — через `debian/rules`, см. «Чем собирается»). Если чего-то нет,
 он скачивает только недостающие пакеты и распаковывает их в
 `~/.cache/lib-local-rag-debtools`. В систему ничего не ставится, сборка идёт
 тем же путём с debhelper, что и в CI, а `check_deb.sh` проверяет готовый пакет.
@@ -138,8 +141,9 @@ Operation not permitted»), и сборка падала, хотя `.deb` уже
 Пакет получается тот же: на стенде он совпал с собранным через
 `dpkg-buildpackage` файл в файл, включая права и контрольные суммы.
 
-С правами администратора то же самое делается напрямую:
-`sudo apt install debhelper dpkg-dev`, затем `make deb`.
+С правами администратора можно поставить инструменты в систему:
+`sudo apt install debhelper dpkg-dev`, затем `sh scripts/build_deb_nosudo.sh`.
+Голый `make deb` на SberOS упрётся в ту же закрытую базу dpkg.
 
 Пакет появится уровнем выше: `../lib-local-rag_1.0.7_amd64.deb`. umask 077 на
 этой машине не мешает: права выравнивает `dh_fixperms`, и `check_deb.sh` это
@@ -184,7 +188,7 @@ dpkg-buildpackage -T clean          # снести артефакты прошл
   юнит демона вовсе, и пакет поставится, не подняв его ни у кого;
 - есть `units/*.service` и `units/*.path`;
 - есть `source/format`;
-- версия в [`changelog`](changelog) совпадает с `src/version.py`.
+- версии в [`changelog`](changelog) и `pyproject.toml` совпадают с `src/version.py`.
 
 `dpkg-buildpackage` запускается с `--ignore-builtin-builddeps`. Без флага
 `dpkg-checkbuilddeps` неявно требует `build-essential`, которого в образе

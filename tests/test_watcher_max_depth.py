@@ -84,7 +84,7 @@ def watcher_config(config, tmp_path, monkeypatch):
     live = tmp_path / "docs"
     live.mkdir()
     # data_directory во временный каталог: иначе scan_paths прочитает
-    # настоящий ~/.ragsearch/user_conf.yml разработчика.
+    # общий user_conf.yml.
     monkeypatch.setattr(config, "data_directory", str(tmp_path / "ragsearch"))
     config.__dict__.pop("user_conf_path", None)
     config.__dict__.pop("data_directory_path", None)
@@ -121,14 +121,9 @@ def _adapter(
     monkeypatch.setattr(mod, "Observer", lambda: rec)
     adapter = WatchDogAdapter(*paths, **kwargs)
     # Наблюдения ставятся в _start_observer, а не в конструкторе: observer
-    # поднимается пустым, и каждый путь добавляется отдельно, чтобы отказ по
-    # одному не выключал наблюдение по всем остальным. Что именно ставится и
-    # с каким recursive — ниже проверяется по-прежнему.
+    # поднимается пустым, пути добавляются по одному.
     adapter._start_observer()
     return adapter, rec
-
-
-# ------------------------------------------------------------ _dirs_for_watch
 
 
 def test_unbounded_returns_only_root(tmp_path):
@@ -173,9 +168,6 @@ def test_depth_two_does_not_descend_deeper(tmp_path):
     assert "d0/d0/hidden" not in watched
 
 
-# ------------------------------------------------------- WatchDogAdapter
-
-
 def test_adapter_bounded_schedules_each_dir_non_recursive(tmp_path, monkeypatch):
     root = tmp_path / "docs"
     (root / "a").mkdir(parents=True)
@@ -195,9 +187,6 @@ def test_adapter_unbounded_schedules_root_recursive(tmp_path, monkeypatch):
     _, rec = _adapter(monkeypatch, root, max_depth=None)
 
     assert rec.schedules == [(str(root), True)]
-
-
-# --------------------------------------------------------------- base_watcher
 
 
 def test_base_watcher_passes_max_depth(watcher_config, monkeypatch):

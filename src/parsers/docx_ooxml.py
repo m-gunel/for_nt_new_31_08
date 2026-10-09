@@ -11,9 +11,11 @@
 - рамки (w:txbxContent) — после абзаца, без дубля из mc:Fallback; сноски — после абзаца;
 - знаки шрифта Symbol (w:sym) → Unicode; колонтитулы — один раз, в начале.
 
-Любое исключение отдаётся вызывающему коду: он откатывается на docx2txt.
+Исключения отдаются вызывающему коду (src/parsers/docx.py): кроме MemoryError,
+он откатывается на docx2txt.
 """
 
+import posixpath
 import re
 import zipfile
 from typing import BinaryIO
@@ -22,10 +24,12 @@ from lxml import etree
 
 from ._tables import Budget, table_blocks
 from .doc_model import Block
+from .ooxml_limits import MAX_XML_BYTES
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"
 
 
 def q(tag: str) -> str:
@@ -34,10 +38,7 @@ def q(tag: str) -> str:
 
 VAL = q("val")
 _PARSER = etree.XMLParser(resolve_entities=False, no_network=True, remove_comments=True)
-MAX_XML_BYTES = 64 * 1024 * 1024  # защита от zip-бомбы: больше — откат на docx2txt
 _CAPTION = re.compile(r"^(таблица|табл\.)\s*(№\s*)?[\dIVXА-Я]", re.I)
-
-# ---------- номера ----------
 
 _EN = "abcdefghijklmnopqrstuvwxyz"
 _RU = "абвгдежзиклмнопрстуфхцчшщэюя"  # как Word: без ё, й, ъ, ы, ь
@@ -258,8 +259,6 @@ class Styles:
                 cur, seen = based.get(cur), seen + 1
 
 
-# ---------- текст абзаца ----------
-
 # Шрифт Symbol хранит знаки в частной области F0xx; docx2txt их просто теряет.
 _SYMBOL = {0x2D: "−", 0x2B: "+", 0x3D: "=", 0x3C: "<", 0x3E: ">", 0xA3: "≤", 0xB3: "≥",
            0xB1: "±", 0xB4: "×", 0xB8: "÷", 0xB9: "≠", 0xBB: "≈", 0xBA: "≡", 0xA5: "∞",
@@ -346,19 +345,27 @@ def _clean(s: str) -> str:
     return "\n".join(x.strip() for x in s.split("\n") if x.strip())
 
 
-# ---------- документ ----------
-
-
 class _Doc:
     def __init__(self, z: zipfile.ZipFile, budget: Budget):
         self.z = z
         self.budget = budget
-        styles = self._xml("word/styles.xml")
-        self.num = Numbering(self._xml("word/numbering.xml"), styles)
+        # Основная часть и её стили — по связям пакета: генераторы кладут её и
+        # под другим именем (word/document2.xml). Нет связи или её цели в архиве
+        # (OPC сравнивает имена без учёта регистра) — имена Word.
+        names = set(z.namelist())
+        main = self._rels("").get("officeDocument")
+        self.main = main if main in names else "word/document.xml"
+        rels = self._rels(self.main)
+
+        def part(kind: str, word: str) -> str:
+            return rels[kind] if rels.get(kind) in names else word
+
+        styles = self._xml(part("styles", "word/styles.xml"))
+        self.num = Numbering(self._xml(part("numbering", "word/numbering.xml")), styles)
         self.styles = Styles(styles)
         self.notes = {
-            "fn": self._notes("word/footnotes.xml", "footnote"),
-            "en": self._notes("word/endnotes.xml", "endnote"),
+            "fn": self._notes(part("footnotes", "word/footnotes.xml"), "footnote"),
+            "en": self._notes(part("endnotes", "word/endnotes.xml"), "endnote"),
         }
         self.titles: list[str] = []  # абзац стиля «Title», первый заголовок 1-го уровня
         self.tables = 0
@@ -373,6 +380,29 @@ class _Doc:
         if info.file_size > MAX_XML_BYTES:
             raise ValueError(f"{name}: {info.file_size} Б — слишком большой XML")
         return etree.fromstring(self.z.read(name), _PARSER)
+
+    def _rels(self, part: str) -> dict[str, str]:
+        """Связи части (part="" — пакета): тип связи → имя цели в архиве.
+
+        Битый или отсутствующий .rels — пустой словарь: остаются имена Word.
+        """
+        folder, base = posixpath.split(part)
+        try:
+            root = self._xml(posixpath.join(folder, "_rels", base + ".rels"))
+        except etree.XMLSyntaxError:
+            return {}
+        out: dict[str, str] = {}
+        for rel in root.iter(_REL) if root is not None else ():
+            target = rel.get("Target") or ""
+            if not target or rel.get("TargetMode") == "External":
+                continue
+            name = posixpath.normpath(
+                target.lstrip("/")
+                if target.startswith("/")
+                else posixpath.join(folder, target)
+            )
+            out.setdefault((rel.get("Type") or "").rsplit("/", 1)[-1], name)
+        return out
 
     def _notes(self, name: str, tag: str) -> dict[str, str]:
         out = {}
@@ -571,10 +601,10 @@ def parse_docx(file: BinaryIO, budget: Budget) -> tuple[list[Block], list[str]]:
     """Блоки документа и кандидаты в название (абзац «Title», первый заголовок 1-го уровня)."""
     with zipfile.ZipFile(file) as z:
         d = _Doc(z, budget)
-        doc = d._xml("word/document.xml")
+        doc = d._xml(d.main)
         body = doc.find(q("body")) if doc is not None else None
         if body is None:
-            raise ValueError("в архиве нет word/document.xml с w:body")
+            raise ValueError(f"в архиве нет {d.main} с w:body")
         out = d.headers()
         d.body(body, out)
         return out, d.titles

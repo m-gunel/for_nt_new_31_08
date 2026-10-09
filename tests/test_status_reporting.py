@@ -1,17 +1,19 @@
-"""Регрессия на /status: итог прохода не должен теряться при его завершении.
+"""/status: итог прохода не теряется при его завершении.
 
-`files_indexed` и `progress` считались только пока поднят `main_index`, а он
-снимается в тот же момент, когда проход завершается. Клиент, дождавшийся
-`is_indexing=false`, читал «проиндексировано 0»: в НТ 27.08 стенд записал
-`bulk_index_end {'indexed': 0, 'progress': 0.0}` для прогона, где реально
-обработано 680 файлов.
+`main_index` снимается в момент завершения прохода: если считать
+`files_indexed` и `progress` только при нём, клиент, дождавшийся
+`is_indexing=false`, прочитает «проиндексировано 0».
 """
+
+from types import SimpleNamespace
 
 import pytest
 
+from src.common import FileMetadata
+from src.indexer import indexer as indexer_module
 from src.indexer.indexer import Index
 
-# Фикстуры поднимают Index на временном хранилище — переиспользуем их.
+# Index на временном хранилище.
 from tests.test_indexing_live import index, isolated_config  # noqa: F401
 
 
@@ -60,3 +62,54 @@ async def test_status_is_zero_before_any_pass(index: Index):  # noqa: F811
     assert status.files_indexed == 0
     assert status.total_files == 0
     assert status.progress == 0.0
+
+
+@pytest.mark.asyncio
+async def test_status_is_idle_after_pass_with_repeated_path(
+    index: Index,  # noqa: F811
+    monkeypatch,
+):
+    """Путь, дважды попавший в очередь с той же meta, не держит «индексация идёт».
+
+    Счётчик выставляется по размеру очереди вместе с повтором, а повтор
+    отбрасывается до разбора. Если его не вычесть, `/status` и MCP
+    `local_index_status` после прохода рапортуют работу до следующего прохода
+    (по умолчанию час), а `local_trigger_rescan` всё это время отказывает.
+    """
+    b = FileMetadata(path="/дом/b.txt", size=0, mtime_seconds=1)
+    c = FileMetadata(path="/дом/c.txt", size=0, mtime_seconds=1)
+
+    async def fake_collect():
+        index.queued_files = 3
+        return 3
+
+    async def fake_count_to_index():
+        index.preindex_cnt = 3
+        index.counter.reset(3)
+
+    async def queue():
+        for meta in (b, c, b):
+            yield meta
+
+    async def empty_files(files, *, fail_cb, with_emails: bool = False):
+        # Разбор без текста: чанков нет, файл уходит в fail_cb.
+        async for meta in files:
+            await fail_cb(meta, permanent=True)
+        return
+        yield  # асинхронный генератор, как настоящий async_parse_files
+
+    async def noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(index, "count_to_index", fake_count_to_index)
+    monkeypatch.setattr(index, "ensure_index", noop)
+    monkeypatch.setattr(index, "create_index", noop)
+    monkeypatch.setattr(indexer_module, "async_parse_files", empty_files)
+    scanner = SimpleNamespace(iter=lambda endless=False: queue())
+
+    await index._run_pass(fake_collect, scanner, index.files_store)
+
+    status = await index.status()
+    assert status.files_to_index == 0
+    assert status.is_indexing is False, "проход закончен, а статус «индексация идёт»"
+    assert status.type == "idle"

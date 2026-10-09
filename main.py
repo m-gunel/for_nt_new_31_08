@@ -18,27 +18,22 @@ import uvicorn
 
 from src.malloc_tuning import apply_arena_limit, memory_state
 
-# До импорта нативных расширений: abort() внутри C-библиотеки (LSM, Lance,
-# OpenVINO) иначе оставляет в логе одну строку ассерта и ни следа Python —
-# по такому логу нельзя понять, какой вызов упал. С faulthandler на SIGABRT
-# и SIGSEGV печатается стек всех потоков.
+# До импорта нативных расширений: при SIGABRT/SIGSEGV в LSM, Lance или OpenVINO
+# в лог попадёт стек всех потоков, а не одна строка ассерта.
 faulthandler.enable()
 
 # До импорта src.config и src.server: они тянут OpenVINO, Lance и polars, чьи
 # потоки иначе успеют получить собственные арены glibc, и лимит опоздает.
 apply_arena_limit()
 
-from src.config import reset_storage_if_requested
+from src.config import protect_storage, reset_storage_if_requested
 from src.port_file import publish_pid, publish_port, remove_published
 from src.server import app
 from src.utils import set_config
 
-reset_storage_if_requested()
-
 cfg = set_config()
 
-# Формат держим в константах: тот же самый нужен файловому хендлеру, а
-# разъехавшиеся форматы в двух стоках одного лога читать невозможно.
+# Общий формат для stderr и файлового хендлера.
 _LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 _LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
 
@@ -53,27 +48,25 @@ logging.getLogger("app").setLevel(cfg.app_logging_level)
 
 lg = logging.getLogger("app")
 
+# После настройки логирования, иначе строка о сбросе никуда не попадёт; до
+# файлового лога — он лежит внутри сносимого lsm_root.
+reset_storage_if_requested(cfg)
+protect_storage(cfg)
+
 
 def _attach_file_log() -> logging.Handler | None:
-    """Продублировать лог в файл, независимо от политики journald.
+    """Продублировать лог в файл cfg.log_file — на случай, если journald его не хранит.
 
-    Демон пишет в stderr, и при исправном journald этого хватает. Но настройки
-    журнала задаёт образ ОС: при Storage=none или SplitMode=none
-    пользовательского журнала нет вовсе, а MaxLevelStore=warning выбрасывает
-    всё, что мы пишем на INFO. Со стороны это неотличимо — «сервис работает,
-    логов нет», — и диагностировать нечем.
-
-    Отказ файла демон НЕ роняет: лог — вспомогательная вещь, и остаться без
-    индексатора из-за неудачного mkdir было бы хуже, чем без файла лога.
+    Отказ файла демон не роняет: без лога лучше, чем без индексатора.
     """
     path = (cfg.log_file or "").strip()
     if not path:
         return None
     target = Path(path).expanduser()
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # В логе оседают пути к личным файлам пользователя — каталог закрываем.
-        os.chmod(target.parent, 0o700)
+        # В логе оседают пути к личным файлам пользователя: свой каталог
+        # создаём закрытым, а существующий (дом, /tmp) не трогаем — он не наш.
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         handler = RotatingFileHandler(
             target,
             maxBytes=cfg.log_max_bytes,
@@ -92,19 +85,16 @@ def _attach_file_log() -> logging.Handler | None:
     return handler
 
 
-# Вешаем ДО первых сообщений: иначе «настройка памяти» и публикация порта
-# в файл не попадут, а это ровно те строки, по которым разбирают старт.
+# До первых сообщений: строки о памяти и порте нужны в файле для разбора старта.
 _file_handler = _attach_file_log()
 
 
 def _attach_file_log_to_uvicorn() -> None:
     """Добавить файловый сток логгерам uvicorn.
 
-    uvicorn в своём LOGGING_CONFIG ставит им propagate=False и собственные
-    хендлеры, поэтому до корневого логгера его строки не доходят — и хендлер,
-    навешенный только на root, их не увидит. Звать эту функцию можно ТОЛЬКО
-    после конструирования uvicorn.Config: именно его __init__ применяет
-    dictConfig, и сделанное раньше он бы затёр.
+    У них propagate=False, и хендлер на root их строк не видит. Звать только
+    после создания uvicorn.Config: его __init__ применяет dictConfig и затёр бы
+    сделанное раньше.
     """
     if _file_handler is None:
         return
@@ -124,7 +114,7 @@ def _uvicorn_log_level(value: str) -> str:
     return level if level in _UVICORN_LEVELS else "info"
 
 
-# Не в момент применения ручек: там логирование ещё не настроено.
+# Здесь, а не в apply_arena_limit(): там логирование ещё не настроено.
 lg.info("настройка памяти: %s", memory_state())
 
 
@@ -161,17 +151,14 @@ def _log_startup_context() -> None:
         )
 
 
-# Вызов на уровне модуля, а НЕ внутри самой функции. Раньше он стоял с отступом
-# в её теле: до него не доходило исполнение, и вся стартовая диагностика была
-# мёртвым кодом — ни CONFIG_PATH, ни списка каталогов, ни предупреждения о
-# запуске от root в логе не появлялось никогда.
 _log_startup_context()
 
 if __name__ == "__main__":
-    host = os.environ.get("RAG_HOST", "0.0.0.0")
-    # RAG_PORT=0 отдаёт выбор порта ядру — этого требует БТ §4.2. Сокет биндим
-    # сами, а не силами uvicorn: иначе фактический номер известен только внутри
-    # сервера, и опубликовать его для MCP-моста уже неоткуда.
+    # Внешний интерфейс — только явным RAG_HOST: у API нет аутентификации.
+    # Пустое значение — тоже умолчание, а не «все интерфейсы».
+    host = os.environ.get("RAG_HOST") or "127.0.0.1"
+    # Сокет биндим сами: при RAG_PORT=0 (БТ §4.2) порт выбирает ядро, и номер
+    # нужно опубликовать для MCP-моста до старта uvicorn.
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, int(os.environ.get("RAG_PORT", "8000"))))
@@ -180,12 +167,8 @@ if __name__ == "__main__":
     published_port = publish_port(cfg.lsm_root, bound_port)
     published_pid = publish_pid(cfg.lsm_root)
 
-    # Своя строка о старте, потому что uvicorn свою НЕ напечатает: при
-    # переданном готовом сокете Server.startup() пропускает
-    # _log_started_message, считая, что адрес уже сообщил bind_socket(), —
-    # а его мы не звали. Без этой строки в логе нет ни одного упоминания
-    # фактического адреса, и документация годами обещала «Uvicorn running»,
-    # которого не бывает.
+    # С готовым сокетом uvicorn не печатает «Uvicorn running»: Server.startup()
+    # пропускает _log_started_message. Адрес пишем сами.
     lg.info(
         "слушаю http://%s:%d (Swagger: http://127.0.0.1:%d/docs). Идёт прогрев "
         "модели OpenVINO, 40-45 c — до его конца API не отвечает",

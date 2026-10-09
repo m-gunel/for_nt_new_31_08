@@ -1,7 +1,7 @@
 """Файлы и письма живут в разных таблицах, и поиск по умолчанию — по файлам.
 
-В общей таблице один `.limit(top_k)` отдавал письмам места документов, а
-вектор-индекс обучался на смешанном корпусе.
+В общей таблице один `.limit(top_k)` отдавал бы письмам места документов, а
+вектор-индекс обучался бы на смешанном корпусе.
 """
 
 import numpy as np
@@ -73,9 +73,6 @@ def _paths(store) -> set[str]:
     return {row["path"] for row in store.table.search().limit(1000).to_list()}
 
 
-# --------------------------------------------------- разделение таблиц ----
-
-
 @pytest.mark.asyncio
 async def test_emails_and_files_land_in_separate_tables(index: Index):
     await index.scan_all()
@@ -108,9 +105,6 @@ async def test_files_are_indexed_before_emails(index: Index, monkeypatch):
     assert order[0] == index.files_store.table_name, (
         "файлы обязаны индексироваться первыми"
     )
-
-
-# ------------------------------------------------------ дефолт поиска ----
 
 
 def test_search_request_defaults_to_files():
@@ -172,9 +166,6 @@ async def test_search_does_not_create_missing_email_table(index: Index):
     assert frames == []
     assert not index.email_store.has_table
     assert SearchResponse.from_dataframes(frames).results == []
-
-
-# ----------------------------------------------------------- миграция ----
 
 
 def _mixed_rows(dim: int) -> pa.Table:
@@ -259,9 +250,6 @@ async def test_migration_leaves_no_email_rows_behind(index: Index):
     await index.migrate_emails_out_of_files_table()
 
     assert index.files_store.count_matching(EMAIL_ROWS_PREDICATE) == 0
-
-
-# ------------------------------------------- один проход одновременно ----
 
 
 @pytest.mark.asyncio

@@ -19,7 +19,6 @@ def get_config(**kwargs):
 
 
 def set_config(cfg: typing.Optional["Config"] = None) -> "Config":
-    """Set the global config instance."""
     from src.config import Config
 
     global _config

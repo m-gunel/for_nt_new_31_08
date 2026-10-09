@@ -25,8 +25,23 @@ class Watcher(AbstractFilesWatcher):
     async def on_delete(self, file: FileMetadata) -> None:
         lg.info(f"File deleted: {file.path}")
         await self.index.delete_path(file.path)
-        # Иначе удаление не дойдёт до поиска: он читает кэшированный хендл
-        # таблицы, а тот обновляется при пересборке индексов.
+        # Поиску удаление видно и без этого: delete_where помечает хендл
+        # таблицы устаревшим (_mark_stale). Здесь — обслуживание индексов с
+        # дебаунсом: дообновление, в простое — компакция.
+        await self.index.ensure_index()
+
+    async def on_delete_many(self, files: list[FileMetadata]) -> None:
+        """Снять с индекса пачку файлов одним фильтром.
+
+        Не по файлу за раз: перенос папки в корзину даёт сотни удалений, а
+        delete_path на каждый — по версии Lance и deletion-файлу.
+        """
+        for file in files:
+            lg.info(f"File deleted: {file.path}")
+        await self.index.delete_paths([file.path for file in files])
+        # Поиску удаление видно и без этого: delete_where помечает хендл
+        # таблицы устаревшим (_mark_stale). Здесь — обслуживание индексов с
+        # дебаунсом: дообновление, в простое — компакция.
         await self.index.ensure_index()
 
     async def on_delete_dir(self, path: str) -> None:
@@ -47,10 +62,8 @@ class Watcher(AbstractFilesWatcher):
         for file in files:
             if not check_has_parser(Path(file.path)):
                 continue
-            # Лимит max_size (100 МиБ) полный проход применяет в
-            # FilesScanner.preindex, а watcher — не применял: файл на
-            # гигабайты, скопированный в наблюдаемую папку, уходил прямо
-            # в парсер.
+            # max_size — как в FilesScanner.preindex: иначе многогигабайтный
+            # файл из наблюдаемой папки уходит прямо в парсер.
             if filter_meta is not None and not filter_meta(file):
                 continue
             if not await self.index.check_meta(file):
@@ -63,14 +76,13 @@ class Watcher(AbstractFilesWatcher):
         lg.info("indexing %s changed file(s)", len(to_index))
         for f in to_index:
             lg.debug("changed: %s", f.path)
-        # Показываем эту работу в /status, иначе демон выглядит простаивающим,
-        # пока разбирает пачку файлов.
+        # Учитывается в /status: иначе демон выглядит простаивающим, пока
+        # разбирает пачку файлов.
         self.index.watch_pending += len(to_index)
         try:
             await self.index.process_stream(to_index, count=False)
         finally:
             self.index.watch_pending = max(0, self.index.watch_pending - len(to_index))
-        # Индексы (FTS/векторный) строятся в конце scan_all. Файлы, пришедшие
-        # через watcher, туда не попадают, поэтому обновляем индексы здесь —
-        # иначе полнотекстовый поиск падает с «no INVERTED index».
+        # Индексы строятся в конце scan_all, мимо которого идут файлы из
+        # watcher'а: без этого FTS падает с «no INVERTED index».
         await self.index.ensure_index()

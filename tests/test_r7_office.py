@@ -7,6 +7,7 @@ x2t падает по SIGSEGV) и цепочка кандидатов конве
 в docker-образе CI его нет, и там он честно пропускается.
 """
 
+import os
 import shutil
 from pathlib import Path
 
@@ -97,3 +98,65 @@ def test_xlsx_parser_reads_legacy_xls_via_r7(config):
     assert chunks, "легаси .xls обязан индексироваться через конвертер Р7"
     joined = "\n".join(chunk["text"] for chunk in chunks)
     assert "Контрольная фраза листа Отчёт" in joined
+
+
+@pytest.fixture
+def fake_x2t(tmp_path, monkeypatch):
+    """x2t «есть» (find_x2t проверяет только isfile), но запускать его нельзя."""
+    fake = tmp_path / "x2t"
+    fake.write_bytes(b"#!/bin/sh\n")
+    monkeypatch.setenv("LQRAG_R7_X2T", str(fake))
+
+    def no_spawn(*args, **kwargs):
+        raise AssertionError("x2t не должен запускаться")
+
+    monkeypatch.setattr("src.utils.r7_office.subprocess.run", no_spawn)
+    return fake
+
+
+def test_convert_returns_false_when_dst_is_directory(tmp_path, fake_x2t):
+    """Контракт «исключений наружу не бросает» держится и на подготовке dst."""
+    src = tmp_path / "book.xls"
+    src.write_bytes(b"\xd0\xcf\x11\xe0")
+    dst = tmp_path / "book.xlsx"
+    dst.mkdir()
+    assert convert_via_r7(str(src), str(dst)) is False
+
+
+def test_convert_returns_false_when_input_vanishes(tmp_path, fake_x2t, monkeypatch):
+    """Гонка: вход удалён между isfile и getsize."""
+    src = tmp_path / "book.xls"
+    src.write_bytes(b"\xd0\xcf\x11\xe0")
+    real_getsize = os.path.getsize
+
+    def vanishing(path):
+        if os.fspath(path) == str(src):
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+        return real_getsize(path)
+
+    monkeypatch.setattr("src.utils.r7_office.os.path.getsize", vanishing)
+    assert convert_via_r7(str(src), str(tmp_path / "book.xlsx")) is False
+
+
+def test_convert_returns_false_when_output_vanishes(tmp_path, monkeypatch):
+    """Гонка на проверке результата: dst удалён между isfile и getsize."""
+    fake = tmp_path / "x2t"
+    fake.write_bytes(b"#!/bin/sh\n")
+    monkeypatch.setenv("LQRAG_R7_X2T", str(fake))
+    src = tmp_path / "book.xls"
+    src.write_bytes(b"\xd0\xcf\x11\xe0")
+    dst = tmp_path / "book.xlsx"
+
+    def x2t_writes_dst(argv, **kwargs):
+        Path(argv[2]).write_bytes(b"PK")
+
+    real_getsize = os.path.getsize
+
+    def vanishing(path):
+        if os.fspath(path) == str(dst):
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+        return real_getsize(path)
+
+    monkeypatch.setattr("src.utils.r7_office.subprocess.run", x2t_writes_dst)
+    monkeypatch.setattr("src.utils.r7_office.os.path.getsize", vanishing)
+    assert convert_via_r7(str(src), str(dst)) is False

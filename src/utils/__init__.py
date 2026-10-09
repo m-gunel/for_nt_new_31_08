@@ -12,8 +12,6 @@ __all__ = [
     "AppConfig",
     "ExpectedError",
     "ConfigMixin",
-    # "LanceWrapper",
-    # "OpenVINOEmbedder",
     "async_embed_documents_into_batches",
     "set_config",
     "get_config",
@@ -21,6 +19,4 @@ __all__ = [
     "wrap_exception_logger",
     "wrap_iter_to_async",
     "get_logger",
-    # "ChunkWithMeta",
-    # "chunk_with_meta_schema",
 ]

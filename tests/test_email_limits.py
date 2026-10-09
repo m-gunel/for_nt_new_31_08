@@ -1,8 +1,8 @@
 """Пороги размера в почтовом тракте.
 
 Письмо разбирается только целиком в памяти, поэтому вложение на 80 МБ — это
-80 МБ RSS ради пары строк текста. Здесь же регресс на то, что обход за
-метаданными не читает письмо целиком: ему нужен один заголовок Date.
+80 МБ RSS ради пары строк текста. Обход за метаданными письмо целиком не
+читает: ему нужен один заголовок Date.
 """
 
 import builtins
@@ -114,18 +114,12 @@ async def _chunks(mail_root, meta: FileMetadata):
             yield chunk
 
 
-# ------------------------------------------------- обход за метаданными ----
-
-
 class _ReadSpy:
     """Файловый объект, считающий объём чтения: пиковый буфер и сумма по read().
 
-    Считает и `readline()`: построение TOC (`_generate_toc_lazy`) идёт именно
-    им, отдельным дескриптором. Без этого «суммарно прочитано мало» означало бы
-    лишь то, что инструмент не видит основного читателя.
-
-    Инвариант по памяти — размер ОДНОГО буфера: и построчный обход, и чтение
-    заголовков кусками держат в памяти немного, сколько бы ни весило письмо.
+    Считает и `readline()`: TOC (`_generate_toc_lazy`) строится им, отдельным
+    дескриптором. Инвариант по памяти — размер одного буфера, сколько бы ни
+    весило письмо.
     """
 
     def __init__(self, wrapped):
@@ -177,20 +171,16 @@ def test_metadata_pass_reads_only_headers(mail_root, monkeypatch):
     ]
 
     assert len(metas) == 3
-    # без этого тест проходил бы и на пустой фикстуре: в ней обязано быть
-    # письмо крупнее одного куска чтения
+    # в фикстуре обязано быть письмо крупнее куска чтения, иначе проверять нечего
     biggest = max(m.size for m in metas)
     assert biggest > _HEADER_CHUNK
     assert spies, "mbox так и не был открыт"
     # ни один буфер в памяти не превышает куска чтения — ни при построчном
     # обходе TOC, ни при чтении заголовков
     assert max(spy.max_buffer for spy in spies) <= _HEADER_CHUNK
-    # через read() (то есть за метаданными) прочитано меньше, чем весит одно
-    # тяжёлое письмо: тела в память не поднимаются
+    # через read() прочитано меньше, чем весит одно тяжёлое письмо: тела в
+    # память не поднимаются
     assert sum(spy.total_read for spy in spies) < biggest
-
-
-# ----------------------------------------------------- очередь и офсеты ----
 
 
 @pytest.mark.asyncio
@@ -215,8 +205,8 @@ async def test_oversized_message_not_queued(
 def test_unknown_offsets_folder_ignored(email_config, mail_root, tmp_path, monkeypatch):
     """offsets из конфига не должны рождать папки, которых нет на диске.
 
-    Swagger подставляет в тело запроса additionalProp1 — и каждый проход
-    потом писал по такой «папке» «mbox file not found».
+    Swagger подставляет в тело запроса additionalProp1, и каждый проход писал
+    бы по такой «папке» «mbox file not found».
     """
     monkeypatch.setattr(
         email_config,
@@ -231,9 +221,6 @@ def test_unknown_offsets_folder_ignored(email_config, mail_root, tmp_path, monke
 
     assert "INBOX" in scanner.folder_state
     assert "additionalProp1" not in scanner.folder_state
-
-
-# -------------------------------------------------------------- парсер ----
 
 
 @pytest.mark.asyncio
@@ -278,9 +265,6 @@ async def test_large_attachment_skipped_body_kept(email_config, mail_root, monke
     assert all(p.endswith(":body") for p in paths)
 
 
-# ------------------------------------------------- согласованность порогов --
-
-
 def test_message_limit_fits_a_full_size_attachment():
     """Порог письма обязан вмещать вложение предельного размера.
 
@@ -298,10 +282,8 @@ def test_message_limit_fits_a_full_size_attachment():
 def test_message_with_late_date_header_is_not_lost(tmp_path):
     """`Date`, вытесненный за первый кусок чтения, не должен терять письмо.
 
-    MTA дописывают Received СВЕРХУ, поэтому в длинной цепочке `Date` легко
-    оказывается за десятками килобайт заголовков. Чтение фиксированным куском
-    теряло такое письмо целиком и молча: без Date оно не доходило даже до
-    очереди.
+    MTA дописывают Received сверху, и в длинной цепочке `Date` оказывается за
+    десятками килобайт заголовков. Без Date письмо не дошло бы даже до очереди.
     """
     received = b"".join(
         b"Received: from relay%d.sberbank.ru by mx.sberbank.ru with ESMTP id %s;\r\n"
@@ -356,8 +338,7 @@ _HEADER_CASES = {
 def test_header_block_matches_full_read(case):
     """Чтение блоком обязано давать те же заголовки, что и чтение целиком.
 
-    Это единственная причина, по которой блочное чтение вообще допустимо:
-    выигрыш по памяти не должен менять то, что видит парсер.
+    Выигрыш по памяти не должен менять то, что видит парсер.
     """
     raw = _HEADER_CASES[case]
 
@@ -375,9 +356,8 @@ async def test_clear_resets_offsets_even_when_config_has_them(
 ):
     """`clear()` обязан обнулять позиции чтения, а не возвращать их из конфига.
 
-    Его зовут в паре с `delete_prefix("email_")` при выключении почты: индекс
-    уже стёрт. Вернись сюда офсет из конфига — следующее чтение началось бы с
-    его позиции, и удалённые письма не вернулись бы в индекс никогда.
+    Его зовут в паре с `delete_prefix("email_")` при выключении почты: с
+    офсетом из конфига удалённые письма не вернулись бы в индекс никогда.
     """
     monkeypatch.setattr(
         email_config,
@@ -404,8 +384,8 @@ def test_config_offsets_override_is_logged(
 ):
     """Перекрытие offsets из конфига сохранённым состоянием не должно быть немым.
 
-    Приоритет offsets.json намеренный, но раньше он не оставлял следа: попытка
-    выставить offsets через конфиг выглядела как неработающая ручка.
+    Приоритет offsets.json намеренный, но без записи в лог offsets из конфига
+    выглядят неработающей ручкой.
     """
     import json
     import logging

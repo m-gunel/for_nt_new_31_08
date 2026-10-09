@@ -1,7 +1,7 @@
 """Почта выключена — значит индексатор не должен её ни искать, ни читать.
 
 Все проверки строят Config с собственным data_directory: от него считается путь
-к user_conf.yml, и без изоляции тест подхватит личный ~/.ragsearch разработчика
+к user_conf.yml, и без изоляции тест подхватит общий user_conf.yml
 вместе с CONFIG_PATH из pytest-env.
 """
 
@@ -14,10 +14,9 @@ from src.indexer.scanners.email_scanner import EmailsScanner
 def isolated_config(tmp_path, **overrides) -> Config:
     """Config, гарантированно изолированный от реального ~/.ragsearch.
 
-    Поля проставляются ПОСЛЕ конструктора намеренно: без CONFIG_PATH
-    `settings_customise_sources` выбрасывает init_settings из цепочки
-    источников, и `Config(data_directory=...)` молча возвращает дефолт —
-    тест начинал читать настоящий конфиг пользователя вместо tmp_path.
+    Поля проставляются после конструктора: без CONFIG_PATH
+    `settings_customise_sources` выбрасывает init_settings из цепочки, и
+    `Config(data_directory=...)` молча вернул бы дефолт.
     """
     cfg = Config()
     cfg.data_directory = str(tmp_path)
@@ -35,8 +34,8 @@ def test_stray_email_env_does_not_break_config(
     """Переменная EMAIL из оболочки не должна попадать в конфиг.
 
     Она есть в окружении многих Linux-машин (её ставят git и почтовые утилиты),
-    а поле конфига ждёт объект EmailConfig — без префикса демон падал на старте
-    с ValidationError.
+    а поле конфига ждёт объект EmailConfig — без префикса демон падал бы на
+    старте с ValidationError.
     """
     monkeypatch.setenv("EMAIL", "ivanov@sberbank.ru")
     cfg = isolated_config(tmp_path)  # не должно бросить
@@ -44,19 +43,13 @@ def test_stray_email_env_does_not_break_config(
 
 
 def test_prefixed_env_still_configures(tmp_path, monkeypatch: pytest.MonkeyPatch):
-    """Настройка через окружение не потеряна — она переехала под префикс."""
+    """Настройка через окружение работает под префиксом RAG_."""
     monkeypatch.setenv("RAG_APP_LOGGING_LEVEL", "DEBUG")
     assert isolated_config(tmp_path).app_logging_level == "DEBUG"
 
 
 def test_isolated_config_never_reads_real_user_conf(tmp_path, monkeypatch):
-    """Сторож изоляции: тесты не должны читать настоящий ~/.ragsearch.
-
-    Без CONFIG_PATH (например, когда не установлен pytest-env) kwargs
-    конструктора Config игнорируются, и без явной установки полей тест
-    подхватывал реальный конфиг пользователя — падая или проходя в
-    зависимости от того, что у него на машине.
-    """
+    """Сторож изоляции: и без CONFIG_PATH тест не читает настоящий ~/.ragsearch."""
     monkeypatch.delenv("CONFIG_PATH", raising=False)
     cfg = isolated_config(tmp_path)
     assert cfg.data_directory == str(tmp_path)

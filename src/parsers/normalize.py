@@ -13,7 +13,8 @@ import re
 import unicodedata
 
 # Шрифт Symbol кладёт свои знаки в область U+F020–U+F0FF (код знака + 0xF000).
-# Греческие буквы — по раскладке Symbol (буква латиницы → греческая).
+# Греческие буквы — по раскладке Symbol (буква латиницы → греческая). Те же коды
+# у Wingdings — маркеры списков; в PDF их заранее заменяет «•» src/parsers/pdf.py.
 _SYMBOL_GREEK = dict(
     zip(
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
@@ -131,7 +132,7 @@ FIELD_MAX = 300
 
 
 def normalize_text(text: str, *, pdf: bool = False) -> str:
-    """Нормализовать текст блока (правила 1–4 плана)."""
+    """Текст блока: невидимые символы, пробелы, знаки Symbol, лишние пустые строки."""
     if not text:
         return ""
     text = unicodedata.normalize("NFC", text).replace("\r\n", "\n").replace("\r", "\n")

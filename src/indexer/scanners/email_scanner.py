@@ -19,7 +19,9 @@ lg = get_logger("app.email")
 
 # Версия формата offsets.json. v1 — плоский {folder: offset}; v2 добавляет
 # size/mtime файла на момент последнего успешного обхода: без них нельзя ни
-# пропустить неизменившуюся папку, ни заметить компакцию mbox.
+# пропустить неизменившуюся папку, ни заметить компакцию mbox. Поля
+# min_date/max_size версию не меняют: старый код их пропускает, а файл с
+# version=3 он разобрал бы как v1 и принял ключ "version" за папку.
 _STATE_VERSION = 2
 
 _UNKNOWN = -1
@@ -35,6 +37,30 @@ class FolderState(NamedTuple):
     offset: int = 0
     size: int = _UNKNOWN
     mtime: int = _UNKNOWN
+    # Границы, с которыми папка прочитана: нижняя дата окна index_last_n_days
+    # (unix-время) и max_message_size. Письма за ними пропущены, а offset ушёл
+    # дальше них. None — без ограничения или неизвестно (файл старой версии).
+    min_date: int | None = None
+    max_size: int | None = None
+
+
+def _limits_widened(state: FolderState, min_date: int | None, max_size: int) -> bool:
+    """Шире ли текущие границы тех, с которыми папка уже прочитана.
+
+    None в состоянии перечитывания не требует: без ограничения шире некуда,
+    а границы из offsets.json старой версии неизвестны, и полный обход всех
+    папок после обновления был бы лишним.
+    """
+    date_widened = state.min_date is not None and (
+        min_date is None or min_date < state.min_date
+    )
+    size_widened = state.max_size is not None and max_size > state.max_size
+    return date_widened or size_widened
+
+
+def _optional_int(value) -> int | None:
+    # min_date/max_size есть не во всех v2-файлах.
+    return None if value is None else int(value)
 
 
 class EmailsScanner(AbstractBaseScanner):
@@ -67,10 +93,8 @@ class EmailsScanner(AbstractBaseScanner):
     def _apply_configured_offsets(self) -> None:
         """Наложить offsets из конфига на состояние уже известных папок.
 
-        Только на известные: в конфиг легко попадают посторонние имена —
-        Swagger подставляет в тело запроса `additionalProp1`, и такие ключи
-        раньше создавали папки, которых нет на диске. Каждый проход потом
-        писал по ним «mbox file not found».
+        Только на известные: Swagger подставляет в тело запроса
+        `additionalProp1`, и такие ключи создавали бы несуществующие папки.
         """
         email_cfg = self.cfg.email_config
         if not (email_cfg and email_cfg.offsets):
@@ -82,12 +106,10 @@ class EmailsScanner(AbstractBaseScanner):
             self.folder_state[name] = FolderState(offset=offset)
 
     def _warn_about_overridden_offsets(self, saved: dict[str, FolderState]) -> None:
-        """Сказать вслух, что offsets.json победил offsets из конфига.
+        """Сообщить в лог, что offsets.json перекрыл offsets из конфига.
 
-        Приоритет такой намеренно: сохранённое состояние отражает то, что
-        реально прочитано. Но раньше конфиг перекрывался молча, и попытка
-        поддержки «выставьте offsets и перечитайте папку» выглядела как
-        неработающая ручка — API отвечал 200, а offset оставался прежним.
+        Приоритет намеренный: сохранённое состояние отражает реально
+        прочитанное. Без сообщения offsets в конфиге выглядят неработающими.
         """
         email_cfg = self.cfg.email_config
         if not (email_cfg and email_cfg.offsets):
@@ -108,10 +130,10 @@ class EmailsScanner(AbstractBaseScanner):
     def _load_state(p: Path) -> dict[str, FolderState]:
         """Прочитать offsets.json. Битый файл — не повод не индексировать.
 
-        Файл пишется неатомарно, поэтому переживает обрыв процесса в
-        полузаписанном виде. Раньше JSONDecodeError отсюда поднимался до
-        конструктора Index и убивал старт демона целиком — вместе с
-        индексацией обычных файлов.
+        _save_state пишет атомарно, но файл всё равно может оказаться битым:
+        ручная правка, сбой диска, файл от старой версии демона. Исключение
+        отсюда ушло бы в конструктор Index и остановило бы старт демона вместе
+        с индексацией файлов.
         """
         try:
             raw = json.loads(p.read_text())
@@ -124,6 +146,8 @@ class EmailsScanner(AbstractBaseScanner):
                         offset=int(st.get("offset", 0)),
                         size=int(st.get("size", _UNKNOWN)),
                         mtime=int(st.get("mtime", _UNKNOWN)),
+                        min_date=_optional_int(st.get("min_date")),
+                        max_size=_optional_int(st.get("max_size")),
                     )
                     for name, st in folders.items()
                     if isinstance(st, dict)
@@ -185,11 +209,9 @@ class EmailsScanner(AbstractBaseScanner):
     async def clear(self):
         """Полный сброс почтового состояния: очередь, offsets.json, позиции.
 
-        Офсеты из конфига здесь НЕ применяются, хотя в конструкторе применяются.
-        Разница принципиальна: `clear()` зовут вместе с `delete_prefix("email_")`
-        при выключении почты, то есть индекс уже стёрт. Вернув сюда офсет из
-        конфига, мы бы начали следующее чтение с его позиции — и все письма до
-        неё, только что удалённые из индекса, не вернулись бы никогда.
+        Офсеты из конфига здесь НЕ применяются, в отличие от конструктора:
+        `clear()` зовут вместе с `delete_prefix("email_")`, и чтение с офсета
+        навсегда потеряло бы письма до него, уже стёртые из индекса.
         """
         await super().clear()
         if (p := self.queu_path.parent / "offsets.json").exists():
@@ -217,9 +239,9 @@ class EmailsScanner(AbstractBaseScanner):
         """Папки, чей индекс больше не соответствует файлу на диске.
 
         Возвращает имена папок, для которых вызывающая сторона должна
-        удалить из индекса всё по префиксу ``email_<folder>:`` — состояние
-        папки здесь же сбрасывается, так что следующий scan() переиндексирует
-        её с нуля.
+        удалить из индекса всё по префиксу ``email_<folder>:`` и затем
+        вызвать `forget_folder`. Состояние здесь не сбрасывается: если
+        удаление упадёт или проход отменят, папка будет найдена снова.
 
         Два случая:
         - mbox исчез, а мы из него что-то индексировали;
@@ -227,10 +249,9 @@ class EmailsScanner(AbstractBaseScanner):
           или offset больше не указывает на начало письма. Старые ключи
           (offset-диапазоны) после этого указывают на чужие байты.
 
-        Ограничение: компакция, совпавшая с притоком новых писем большим,
-        чем удалённый объём, по размеру не детектится — её ловит проверка
-        ``From `` по offset'у. Точечная сверка по Message-ID — отдельная
-        оптимизация (см. план), пока папка переиндексируется целиком.
+        Компакцию, совпавшую с притоком писем больше удалённого объёма, по
+        размеру не видно — её ловит проверка ``From `` по offset'у. Папка
+        переиндексируется целиком.
         """
         self.refresh_folders()
         stale: list[str] = []
@@ -244,7 +265,10 @@ class EmailsScanner(AbstractBaseScanner):
                         name,
                     )
                     stale.append(name)
-                    self.folder_state[name] = FolderState()
+                else:
+                    # Удалять из индекса нечего, а оставленный ключ давал бы
+                    # WARNING «mbox file not found» на каждом поллинге.
+                    del self.folder_state[name]
                 continue
             if not indexed_something:
                 continue
@@ -263,16 +287,26 @@ class EmailsScanner(AbstractBaseScanner):
                     state.offset,
                 )
                 stale.append(name)
-                self.folder_state[name] = FolderState()
         return stale
+
+    def forget_folder(self, name: str) -> None:
+        """Сбросить состояние папки после удаления её чанков из индекса.
+
+        Исчезнувшую папку убираем из состояния совсем: иначе preindex писал
+        бы по ней WARNING на каждом поллинге. Компактированную обнуляем —
+        следующий scan() перечитает её с нуля.
+        """
+        if (self.path / name).is_file():
+            self.folder_state[name] = FolderState()
+        else:
+            self.folder_state.pop(name, None)
 
     def refresh_folders(self) -> list[str]:
         """Добавить в состояние папки, появившиеся на диске после прошлого прохода.
 
-        Демон живёт долго, а сканер создаётся один раз, поэтому читать
-        список папок только в конструкторе нельзя: папка, созданная в
-        Thunderbird при работающем демоне, иначе не проиндексируется до
-        рестарта. Возвращает имена новых папок (для лога).
+        Сканер создаётся один раз на жизнь демона: без этого папка, созданная
+        в Thunderbird при работающем демоне, ждала бы рестарта. Возвращает
+        имена новых папок (для лога).
         """
         from src.thunderbird.find_files import list_email_folders
 
@@ -294,13 +328,15 @@ class EmailsScanner(AbstractBaseScanner):
         if new_folders := self.refresh_folders():
             lg.info("обнаружены новые почтовые папки: %s", len(new_folders))
         max_message_size = self.cfg.email_scan_cfg.max_message_size
+        # Одна граница на проход: ею читаем и её же запоминаем в состоянии.
+        min_date = self.cfg.email_begin_date
+        min_ts = int(min_date.timestamp()) if min_date else None
         # list(): refresh_folders/детект могли изменить словарь.
         for prefix, state in list(self.folder_state.items()):
             p = self.path / prefix
             if not p.is_file():
-                # Папка есть в состоянии (конфиг или offsets.json), но файла
-                # на диске нет — например, «Входящие» не синхронизированы
-                # локально. Раньше это роняло весь проход, включая файлы.
+                # Папка есть в состоянии (конфиг или offsets.json), а файла
+                # нет — например, «Входящие» не синхронизированы локально.
                 lg.warning("email folder %s: mbox file not found, skipping", prefix)
                 continue
             try:
@@ -310,20 +346,30 @@ class EmailsScanner(AbstractBaseScanner):
             # Снимок до обхода: изменения, пришедшие во время скана, увидит
             # следующий цикл (mtime уже будет другим).
             size, mtime = st.st_size, int(st.st_mtime)
-            if size == state.size and mtime == state.mtime:
+            # Окно или лимит размера расширили: письма, отсечённые прежними
+            # границами, лежат до offset'а, и чтением хвоста их не достать.
+            # Уже проиндексированные отсеет check_meta в scan().
+            reread = _limits_widened(state, min_ts, max_message_size)
+            if reread:
+                lg.info(
+                    "почта %s: окно или лимит размера расширены — читаю mbox с начала",
+                    prefix,
+                )
+            elif size == state.size and mtime == state.mtime:
                 # Файл не менялся с прошлого прохода — не читаем его вовсе.
                 # На поллинге раз в email_poll_interval это основной путь.
                 lg.debug("email preindex %s: mbox unchanged, skipping", prefix)
                 continue
+            start_offset = 0 if reread else state.offset
             # Фазовые логи на INFO: обход большого mbox идёт десятки секунд,
             # и без них по логу не отличить «читаю mbox» от «завис».
-            to_read = max(0, size - state.offset)
+            to_read = max(0, size - start_offset)
             lg.info(
                 "почта %s: читаю mbox (%.1f МБ из %.1f МБ, offset=%s)",
                 prefix,
                 to_read / _MB,
                 size / _MB,
-                state.offset,
+                start_offset,
             )
             cnt = 0
             skipped_old = 0
@@ -338,8 +384,8 @@ class EmailsScanner(AbstractBaseScanner):
                     iter_emails_as_metadata(
                         str(p),
                         prefix=f"email_{prefix}:",  # type: ignore
-                        start_offset=state.offset,
-                        min_date=self.cfg.email_begin_date,
+                        start_offset=start_offset,
+                        min_date=min_date,
                         progress=progress,
                     )
                 ):
@@ -348,10 +394,9 @@ class EmailsScanner(AbstractBaseScanner):
                         # не попадает, эмбеддинг для него не считается.
                         skipped_old += 1
                     elif meta.size > max_message_size:
-                        # Размер известен из TOC, так что письмо отсекается,
-                        # ни разу не прочитанное: разбор MIME держит его в
-                        # памяти целиком, и на вложении в 80 МБ это заметный
-                        # скачок RSS ради пары строк текста.
+                        # Размер известен из TOC, и письмо отсекается
+                        # непрочитанным: разбор MIME держал бы его в памяти
+                        # целиком.
                         skipped_big += 1
                         lg.debug(
                             "почта %s: письмо %s Б больше лимита %s Б — пропущено",
@@ -365,7 +410,7 @@ class EmailsScanner(AbstractBaseScanner):
                     max_offset = max(max_offset, start)
                     if (now := time.monotonic()) >= next_report:
                         next_report = now + _PROGRESS_EVERY_SECONDS
-                        done = max(0, start - state.offset)
+                        done = max(0, start - start_offset)
                         share = done / to_read if to_read else 1.0
                         elapsed = now - started
                         eta = elapsed / share - elapsed if share > 0.01 else None
@@ -381,7 +426,11 @@ class EmailsScanner(AbstractBaseScanner):
                             ", осталось ~{0:.0f} c".format(eta) if eta else "",
                         )
                 self.folder_state[prefix] = FolderState(
-                    offset=max_offset, size=size, mtime=mtime
+                    offset=max_offset,
+                    size=size,
+                    mtime=mtime,
+                    min_date=min_ts,
+                    max_size=max_message_size,
                 )
                 lg.info(
                     "почта %s: mbox прочитан за %.0f c — %s писем в очередь, "

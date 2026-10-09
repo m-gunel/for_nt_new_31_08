@@ -54,7 +54,7 @@ def test_last_handout_survives_even_if_oversized(tmp_path):
 
 
 def test_count_limit_still_applies(tmp_path):
-    """Мелкие выдачи вытесняются по числу — прежнее поведение сохранено."""
+    """Мелкие выдачи вытесняются по числу."""
     _reset_registry()
     dirs = [
         _make_dir(tmp_path, f"s{i}", 16)

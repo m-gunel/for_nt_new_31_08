@@ -30,7 +30,8 @@ CONFIG_PATH=cfg/mcp.yml RAG_PORT=8000 .venv/bin/python main.py &
 # (лог /tmp/rag_mcp.log). Строки "Uvicorn running" НЕ будет: main.py передаёт
 # uvicorn уже забинденный сокет, и своё стартовое сообщение тот не печатает.
 ```
-Читается `CONFIG_PATH` из env (см. `src/config.py`, `set_config`). Дефолтный порт — 8000 (`RAG_PORT`).
+Читается `CONFIG_PATH` из env (см. `src/config.py`, `set_config`). Дефолтный адрес — 127.0.0.1:8000
+(`RAG_HOST`, `RAG_PORT`); `RAG_HOST=0.0.0.0` открыл бы API без авторизации всей сети.
 **НЕ использовать `nice` на старте** (зависает OpenVINO); `renice` — только после готовности Uvicorn.
 
 ## Критические "грабли" (НЕ менять)
@@ -64,11 +65,18 @@ CONFIG_PATH=cfg/mcp.yml RAG_PORT=8000 .venv/bin/python main.py &
 
 ## Ядро API (для справки)
 - HTTP sidecar (127.0.0.1:8000): `GET /api/v1/health`, `GET /api/v1/status`,
-  `POST /api/v1/search`, `GET|POST /api/v1/config`, `POST /api/v1/get_file_path`.
+  `POST /api/v1/search`, `GET|POST /api/v1/config`, `POST /api/v1/get_file_path`,
+  `POST /api/v1/read_file` (полный текст файла из индексируемых папок — через неё
+  `local_read_file` читает pdf и офисные форматы).
   Управление индексацией (БТ §5.1-5.3): `POST /api/v1/activate`,
   `POST /api/v1/deactivate`, `POST /api/v1/reset` (query `keep_config`).
-  Других ручек нет — `/paths`, `/email`, `/rescan` не существуют; смена списка
-  папок и тумблер почты идут через `POST /api/v1/config`.
+  Swagger — `/docs` и `/openapi.json` (`/api/v1/docs`, `/api/v1/openapi.json` —
+  редиректы на них). Других ручек нет — `/paths`, `/email`, `/rescan` не
+  существуют; смена списка папок и тумблер почты идут через `POST /api/v1/config`.
+- Запросы с не-loopback `Host` (400) или `Origin` (403) демон отклоняет — защита
+  от DNS rebinding и CSRF из браузера; мост и curl `Origin` не шлют и проходят.
+  Другие имена хоста — `RAG_ALLOWED_HOSTS` (через запятую). Аутентификации нет:
+  процесс другой учётки на том же АРМ до API достучится.
 - MCP-мост: `mcp_server.py` (чистый stdlib) + `mcp_launcher.sh`. По умолчанию
   агенту видны все восемь инструментов: `local_search`,
   `local_index_status`, `local_read_file` и пять управления индексацией

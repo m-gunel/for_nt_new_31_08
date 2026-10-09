@@ -1,9 +1,9 @@
 """Параметры полнотекстового индекса и их миграция на готовом хранилище.
 
-Раньше FTS строился пресетом `ru_stem`, а в нём max_token_length=40 байт
-UTF-8: русские слова от 20 букв выпадали и из индекса, и из запроса. Теперь
-параметры явные (`FtsConfig`), а индекс со старыми пересобирается при старте
-демона (`Index.migrate_fts_config`).
+В пресете `ru_stem` max_token_length=40 байт UTF-8, и русские слова от 20
+букв выпадали бы и из индекса, и из запроса. Поэтому параметры явные
+(`FtsConfig`), а индекс со старыми пересобирается при старте демона
+(`Index.migrate_fts_config`).
 """
 
 from types import SimpleNamespace
@@ -14,7 +14,7 @@ from src.common.fts import FtsConfig
 from src.indexer.indexer import Index
 from src.utils.lance_wrapper import LanceWrapper
 
-# Фикстуры поднимают Index на временном хранилище — переиспользуем их.
+# Index на временном хранилище.
 from tests.test_indexing_live import (  # noqa: F401
     EMBED_DIM,
     _chunk_table,
@@ -22,7 +22,7 @@ from tests.test_indexing_live import (  # noqa: F401
     isolated_config,
 )
 
-# 20 букв = 40 байт UTF-8: ровно столько пресет ru_stem уже отбрасывал.
+# 20 букв = 40 байт UTF-8: такие слова пресет ru_stem отбрасывает.
 LONG = "сельскохозяйственный"
 
 

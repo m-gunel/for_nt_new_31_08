@@ -1,10 +1,8 @@
-"""Индекс, собранный до карточек документов (1.0.8): код из имени и карточки.
+"""Индекс, собранный до появления карточек документов: код из имени и карточки.
 
 Карточку пишет разбор файла, а неизменённый файл проход заново не разбирает
-(LSM сверяет только size и mtime). Поэтому после обновления без сброса
-индекса ни один старый документ карточки не получал: «файл по коду» и
-отметка "card" работали лишь для новых и изменённых файлов. Теперь словарь
-имён строится по первым чанкам, а карточки дописывает миграция из meta.
+(LSM сверяет только size и mtime). Поэтому словарь имён строится по первым
+чанкам, а карточки старым документам дописывает миграция из meta.
 """
 
 from pathlib import Path
@@ -15,6 +13,7 @@ import pytest
 
 from src.common import CARD_IDX, CARD_KIND, document_card_text
 from src.common.doc_meta import doc_meta_schema
+from src.indexer import indexer as indexer_module
 from src.indexer.indexer import Index
 from src.server.model import SearchRequest
 from src.server.router import search as search_endpoint
@@ -132,3 +131,38 @@ async def test_first_indexing_pass_migrates_cards_once(index: Index, monkeypatch
     await index._scan_all()
     await index._scan_all(emails_only=True)
     assert calls == [1], "сверка карточек — раз на процесс, только в файловом проходе"
+
+
+@pytest.mark.asyncio
+async def test_migration_leaves_no_card_of_file_removed_meanwhile(
+    index: Index,  # noqa: F811
+    monkeypatch,
+):
+    """Файл, снятый с индекса, пока считаются векторы карточек, без карточки.
+
+    Миграция читает первые чанки, минутами считает векторы и только потом
+    пишет. Карточку удалённого за это время файла никто больше не снимет:
+    сверка удалённых ходит по ключам LSM, а ключа уже нет.
+    """
+    await _old_index(index)
+    gone, *kept = OLD_DOCS
+    embed = indexer_module.async_embed_documents_into_batches
+
+    def removed_while_embedding(rows, **kwargs):
+        async def batches():
+            # Watcher: файл удалён с диска, пока миграция считает векторы.
+            await index.delete_path(gone)
+            async for batch in embed(rows, **kwargs):
+                yield batch
+
+        return batches()
+
+    monkeypatch.setattr(
+        indexer_module, "async_embed_documents_into_batches", removed_while_embedding
+    )
+
+    assert await index.migrate_document_cards() == len(kept)
+
+    paths = set(index.cfg.lance.files.table.to_arrow().column("path").to_pylist())
+    assert gone not in paths, "карточка удалённого файла осталась в поиске"
+    assert set(_cards(index)) == set(kept)

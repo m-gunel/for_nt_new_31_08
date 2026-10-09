@@ -2,8 +2,7 @@
 
 Карточка несёт имя файла и свойства документа (название, автор, тема…), чтобы
 запрос «найди файл …» и код из имени находили документ одной строкой, а не
-случайным куском текста. Замер на стенде: Hit@1 по запросам «найди файл»
-0,53 → 0,87.
+случайным куском текста.
 """
 
 import aiofiles
@@ -17,8 +16,6 @@ from tests.mbox_fixture import (
     make_profile,
     minimal_docx,
 )
-
-# ---------- текст карточки ----------
 
 
 def test_card_text_lists_nonempty_properties_in_order():
@@ -55,6 +52,33 @@ def test_card_text_drops_values_already_in_card():
     assert document_card_text(meta) == "Документ: Положение 5348-У\nАвтор: Сёмин А."
 
 
+def test_card_text_compares_whole_words_without_labels():
+    # «Иван» — не начало «Иванова», «банк» — не конец «Сбербанк».
+    assert (
+        document_card_text({"original_name": "Отчет_Иванова.docx", "author": "Иван"})
+        == "Документ: Отчет_Иванова\nАвтор: Иван"
+    )
+    assert (
+        document_card_text({"original_name": "Сбербанк_2024.xlsx", "keywords": "банк"})
+        == "Документ: Сбербанк_2024\nКлючевые слова: банк"
+    )
+    assert (
+        document_card_text(
+            {
+                "original_name": "a.txt",
+                "author": "Петрова А.",
+                "last_modified_by": "Петров",
+            }
+        )
+        == "Документ: a\nАвтор: Петрова А.\nИзменил: Петров"
+    )
+    # Подписи полей — не значения: название «Документ» не повтор строки «Документ: …».
+    assert (
+        document_card_text({"original_name": "scan_001.pdf", "title": "Документ"})
+        == "Документ: scan_001\nНазвание: Документ"
+    )
+
+
 def test_card_text_cuts_long_values():
     meta = {"original_name": "a.txt", "description": "слово " * 200}
     line = document_card_text(meta).split("\n")[1]
@@ -66,9 +90,6 @@ def test_card_text_without_name_and_properties_is_empty():
     assert document_card_text({}) == ""
     assert document_card_text(None) == ""
     assert document_card_text({"title": "Без имени"}) == "Название: Без имени"
-
-
-# ---------- карточка в конвейере ----------
 
 
 def _txt(path, text: str):
@@ -107,9 +128,6 @@ def test_no_card_for_document_without_chunks(tmp_path):
 def test_full_text_has_no_card(tmp_path):
     path = _txt(tmp_path / "заметка.txt", "Заметка о встрече по бюджету отдела.")
     assert read_document_text(path) == "Заметка о встрече по бюджету отдела."
-
-
-# ---------- почта ----------
 
 
 @pytest.mark.asyncio

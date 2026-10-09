@@ -1,24 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 #
-# ВНИМАНИЕ: файл поддерживается руками, `make spec` его ПЕРЕЗАПИШЕТ и потеряет
-# фильтр каталога модели ниже. Поэтому `make build` больше не зависит от цели
-# `spec`: она осталась для разового пересоздания болванки.
+# Правится руками: `make spec` перезапишет файл и потеряет фильтр модели ниже.
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all
 
-# Каталог модели приехал из обучения и содержит его артефакты. Заказчику они
-# не нужны и вредны:
-#   * rng_state.pth, scheduler.pt, training_args.bin — pickle. Их распаковка
-#     это исполнение кода, то есть лишняя поверхность атаки в поставке;
-#   * trainer_state.json — история обучения: метрики, шаги, гиперпараметры;
-#   * README.md — карточка модели с HuggingFace, к продукту отношения не имеет.
-#
-# В рантайме модели нужны ровно четыре файла (src/utils/openvino_encoder.py:179-186):
-# openvino/openvino_model_qint8_quantized.{xml,bin} и
-# openvino_tokenizer.{xml,bin}. Остальное оставлено намеренно: отсекаем только
-# то, в чём уверены, а не всё, что кажется лишним. Каталог models/tessdata
-# (языковые данные OCR и их LICENSE) едет целиком тем же фильтром.
+# Артефакты обучения в поставку не берём: pickle-файлы (их распаковка исполняет
+# код), историю обучения и карточку модели с HuggingFace. Рантайму нужны только
+# openvino/openvino_model_qint8_quantized.{xml,bin} и openvino_tokenizer.{xml,bin}
+# (src/utils/openvino_encoder.py), но режем лишь то, что заведомо лишнее.
+# models/tessdata (данные OCR) едет целиком.
 _MODEL_EXCLUDE = {
     "rng_state.pth",
     "scheduler.pt",
@@ -39,13 +30,9 @@ def _model_datas(root="models"):
 
 datas = _model_datas()
 
-# Офлайн-статика Swagger. Кладётся по тому же относительному пути, по которому
-# её ищет src/server/app.py: в бандле корнем служит sys._MEIPASS, и файлы
-# должны оказаться в _MEIPASS/src/server/static.
-#
-# Забирается ПОФАЙЛОВО и только то, что реально нужно: каталог в репозитории
-# содержит ещё README.md, и класть его в поставку незачем. Если файлов нет —
-# список пустой, сборка не падает, а приложение работает через CDN.
+# Офлайн-статика Swagger. В бандле корень — sys._MEIPASS, и src/server/app.py ищет
+# её в _MEIPASS/src/server/static. Берём пофайлово, без README.md каталога;
+# файлов нет — приложение берёт Swagger с CDN.
 def _swagger_datas(root="src/server/static"):
     out = []
     for name in ("swagger-ui-bundle.js", "swagger-ui.css", "favicon.png"):
@@ -57,14 +44,17 @@ def _swagger_datas(root="src/server/static"):
 
 datas += _swagger_datas()
 binaries = []
-hiddenimports = []
+# lance импортируется лениво, внутри lancedb (LanceTable.to_lance).
+hiddenimports = ['lance']
 tmp_ret = collect_all('openvino')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('openvino_tokenizers')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('uvicorn')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('langchain-core')
+# Имя модуля, а не дистрибутива: по «langchain-core» collect_all пакет не
+# находит и собирает одни метаданные.
+tmp_ret = collect_all('langchain_core')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
@@ -77,7 +67,9 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['openvino.torch', 'torch', 'datasets', 'pandas', 'sklearn', 'scipy', 'matplotlib', 'optimum', 'sentence_transformers', 'transformers', 'onnx', 'lance', 'langchain', 'onnxruntime'],
+    # lance (pylance) не исключать: LanceWrapper.optimize_indices дописывает
+    # новые строки в индексы через table.to_lance().
+    excludes=['openvino.torch', 'torch', 'datasets', 'pandas', 'sklearn', 'scipy', 'matplotlib', 'optimum', 'sentence_transformers', 'transformers', 'onnx', 'langchain', 'onnxruntime'],
     noarchive=False,
     optimize=0,
 )

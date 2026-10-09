@@ -18,11 +18,15 @@ import os
 import re
 import sys
 import zipfile
+import zlib
 from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
 from xml.etree import ElementTree as ET
 
+from src.common.doc_meta import datetime_from_timestamp
+
+from . import ooxml_limits
 from .normalize import normalize_field
 
 _OOXML_MIME = {
@@ -45,7 +49,7 @@ def birth_time(path: str, st: os.stat_result | None = None) -> datetime | None:
     st = st or os.stat(path)
     bt = getattr(st, "st_birthtime", None)  # macOS, BSD, Windows
     if bt:
-        return datetime.fromtimestamp(bt)
+        return datetime_from_timestamp(bt)
     if sys.platform.startswith("linux"):
         return _statx_btime(path)
     return None
@@ -73,7 +77,7 @@ def _statx_btime(path: str) -> datetime | None:
         return None
     sec = int.from_bytes(raw[80:88], sys.byteorder, signed=True)  # stx_btime.tv_sec
     nsec = int.from_bytes(raw[88:92], sys.byteorder)
-    return datetime.fromtimestamp(sec + nsec / 1e9) if sec > 0 else None
+    return datetime_from_timestamp(sec + nsec / 1e9) if sec > 0 else None
 
 
 def origin_url(path: str) -> str | None:
@@ -92,7 +96,9 @@ def file_metadata(path: str) -> dict:
     """Поля файловой системы: имя, расширение, размер, даты, источник."""
     p = Path(path)
     st = os.stat(path)
-    modified = datetime.fromtimestamp(st.st_mtime)
+    # Дата, которую не примет колонка timestamp("ns"), — пусто: иначе запись
+    # батча с этим файлом обрывает весь проход.
+    modified = datetime_from_timestamp(st.st_mtime)
     born = birth_time(path, st)
     return {
         "original_name": p.name,
@@ -100,7 +106,7 @@ def file_metadata(path: str) -> dict:
         "size": st.st_size,
         # Копия с сохранённой датой изменения (cp -p, распаковка архива) рождается
         # позже, чем менялось содержимое: документ существовал уже к дате изменения.
-        "date_created": min(born, modified) if born else None,
+        "date_created": min(born, modified) if born and modified else born,
         "date_modified": modified,
         "source_type": "file",
         "source_uri": p.absolute().as_uri(),
@@ -133,8 +139,6 @@ def content_metadata(file: BinaryIO, ext: str) -> dict:
     file.seek(0)
     return {"sha256": h.hexdigest(), "size": size, "mime": sniff_mime(head, ext)}
 
-
-# ---------- даты из свойств файла ----------
 
 _PDF_DATE = re.compile(
     r"^D?:?(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?\s*(Z|[+-]\d{2}'?\d{2}'?)?"
@@ -179,9 +183,6 @@ def parse_w3cdtf(value: str | None) -> datetime | None:
         return None
 
 
-# ---------- свойства PDF и OOXML ----------
-
-
 def pdf_properties(doc) -> tuple[dict, list[str]]:
     """Поля из pymupdf.Document и кандидаты в название: metadata.title, закладка 1-го уровня."""
     md = doc.metadata or {}
@@ -213,7 +214,13 @@ def ooxml_properties(file: BinaryIO, ext: str) -> tuple[dict, list[str]]:
     try:
         with zipfile.ZipFile(file) as z:
             names = z.namelist()
-            if "docProps/core.xml" in names:
+            # Читаются целиком: часть больше предела не трогаем (zip-бомба).
+            small = {
+                i.filename
+                for i in z.infolist()
+                if i.file_size <= ooxml_limits.MAX_XML_BYTES
+            }
+            if "docProps/core.xml" in small:
                 root = ET.fromstring(z.read("docProps/core.xml"))
 
                 def get(tag: str) -> str | None:
@@ -239,17 +246,23 @@ def ooxml_properties(file: BinaryIO, ext: str) -> tuple[dict, list[str]]:
                 meta["page_count"] = sum(
                     1 for n in names if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)
                 )
-            elif ext == "docx" and "word/document.xml" in names:
+            elif ext == "docx" and "word/document.xml" in small:
                 breaks = z.read("word/document.xml").count(b"lastRenderedPageBreak")
                 meta["page_count"] = breaks + 1 if breaks else None
-    except (zipfile.BadZipFile, ET.ParseError, KeyError, OSError):
+    except (
+        zipfile.BadZipFile,
+        zlib.error,
+        EOFError,
+        NotImplementedError,
+        ET.ParseError,
+        KeyError,
+        OSError,
+    ):
         pass
     finally:
         file.seek(0)
     return meta, titles
 
-
-# ---------- название и язык ----------
 
 _MS_PREFIX = re.compile(
     r"^microsoft\s+(office\s+)?(word|excel|powerpoint)\s*-\s*", re.I

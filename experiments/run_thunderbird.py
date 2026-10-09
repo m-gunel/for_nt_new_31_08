@@ -25,7 +25,6 @@ allowed_extensions = list(get_parsers_registry())
 
 
 def filter_files(path: str) -> bool:
-    """Filter files based on allowed extensions."""
     *_, ext = Path(path).name.split(".")
     if ext in {"xlsx", "xls"}:
         return path.startswith("/Users/admin/projects/work/files-search/data/to_index")
@@ -36,9 +35,7 @@ cfg = Config()
 cfg.file_scan_cfg.filter_files = filter_files
 
 
-# # собираем все контакты в паркет
 with Progress() as prog:
-    # собираем все сообщения в паркет
     write_to_pq(
         collect_batches(
             read_messages(
@@ -64,7 +61,6 @@ with Progress() as prog:
         "data/contacts.pq",
     )
 
-    # собираем ембединги для сообщений
     data = iter_chunks_from_parquet(
         "data/messages_full.pq",
         splitter=cfg.embed_splitter,
@@ -78,7 +74,6 @@ with Progress() as prog:
     embed = embed_documents_into_batches(
         wrap_with_converter(data, _convert_to_chunk_with_meta),
         embedder=cfg.embed_passages,
-        # text_field="c0body",
         batch_size=64,
     )
     write_to_pq(
@@ -107,7 +102,6 @@ with Progress() as prog:
         .drop("from_", "to", "cc")
         .collect()
     )
-    # conversations
     write_to_pq(
         embed_documents_into_batches(
             (

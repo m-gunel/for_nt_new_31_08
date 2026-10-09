@@ -4,9 +4,9 @@ import concurrent.futures
 import email
 import io
 import zipfile
+import zlib
 from collections.abc import AsyncIterable, Iterable, Iterator
 from contextlib import AsyncExitStack
-from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Protocol
 from xml.etree import ElementTree
@@ -27,6 +27,7 @@ from src.common import (
     document_card_text,
     is_email_path,
 )
+from src.common.doc_meta import datetime_from_timestamp
 from src.thunderbird.get_body import Attachment, Body, process_message
 from src.thunderbird.lazy_iter_mbox import _decode_filename
 from src.utils import get_config, get_logger, wrap_iter_to_async
@@ -54,16 +55,20 @@ __all__ = [
     "file_extension",
     "get_parsers_registry",
     "parse_files",
-    "parse_files_io",
     "read_document_text",
 ]
 
 lg = get_logger(__name__)
 
 # Порча содержимого: разбор не удастся, пока файл не изменится. Временные причины
-# (OSError — файл занят или исчез, MemoryError) сюда не входят.
+# (OSError — файл занят или исчез, MemoryError) сюда не входят. zlib.error,
+# EOFError и NotImplementedError — порча сжатых данных внутри zip (docx/xlsx/pptx)
+# при целом центральном каталоге: оборванный поток, неизвестный метод сжатия.
 _CORRUPT = (
     zipfile.BadZipFile,
+    zlib.error,
+    EOFError,
+    NotImplementedError,
     ElementTree.ParseError,
     etree.XMLSyntaxError,
     pymupdf.FileDataError,
@@ -99,6 +104,7 @@ def document_chunks(
     io: BinaryIO | None = None,
     doc_meta: DocumentMetadata | None = None,
     file_meta: FileMetadata | None = None,
+    ocr_generation: int | None = None,
 ) -> Iterator[ChunkWithMeta]:
     """Конвейер разбора одного документа — общий для индексации, стенда и вложений.
 
@@ -115,13 +121,17 @@ def document_chunks(
                 io=f,
                 doc_meta=doc_meta or parser.get_metadata(str(path)),
                 file_meta=file_meta,
+                ocr_generation=ocr_generation,
             )
         return
     base = dict(doc_meta or {})
     ext = base.get("ext") or file_extension(path)
     base.update(content_metadata(io, ext))
     try:
-        parsed = parser.parse_io(io)
+        # OCR — только внутри parse_io; метка поколения — без yield внутри,
+        # чтобы не пережить генератор в чужом потоке.
+        with ocr.started_in(ocr_generation):
+            parsed = parser.parse_io(io)
     except _CORRUPT as exc:
         raise SkipFile(f"содержимое повреждено ({type(exc).__name__}: {exc})") from exc
     doc = prepare(parsed)
@@ -132,13 +142,10 @@ def document_chunks(
         chunk["text"] = prefix + chunk["text"]
         yield _row(chunk, meta, path, file_meta)
         emitted = True
-    # Карточка — только у документа с текстом: без чанков файл в индекс не
-    # попадает (_process_path помечает его «без текста»), и одинокая карточка
-    # находила бы пустой документ. Последней — индексатор отмечает файл
-    # готовым по чанку следующего файла, и карточка уходит с тем же файлом.
+    # Карточка — только при наличии чанков (иначе она находила бы пустой документ)
+    # и последней: индексатор отмечает файл готовым по чанку следующего файла.
+    # Поля места явно None — читатели строк берут их по ключу, как у чанков.
     if emitted and (card := document_card_text(meta)):
-        # Поля места явно пустые: у карточки нет страницы и позиции в тексте,
-        # а читатели строк (стенд, тесты) берут их по ключу, как у чанков.
         place = dict.fromkeys(_PLACE_FIELDS)
         yield _row(
             {**place, "idx": CARD_IDX, "text": card, "kind": CARD_KIND},
@@ -180,9 +187,11 @@ def read_document_text(path: str | Path) -> str | None:
 class FailCallback(Protocol):
     """Обратный вызов «файл не дал чанков».
 
-    `permanent=True` — разбор прошёл, но текста нет: файл можно пометить
-    обработанным. `permanent=False` — разбор упал: помечать нельзя, иначе
-    файл выпадет из индексации навсегда.
+    `permanent=True` — повторять разбор незачем, пока файл не изменится: текста
+    нет, содержимое повреждено или зашифровано (SkipFile), письмо больше лимита.
+    Файл можно пометить обработанным. `permanent=False` — сбой временный или
+    непредвиденный, в том числе SkipFile(permanent=False) и временный сбой
+    вложения письма: помечать нельзя, иначе файл выпадет из индексации навсегда.
     """
 
     async def __call__(self, meta: "FileMetadata", *, permanent: bool) -> None: ...
@@ -210,18 +219,13 @@ async def _process_email_chunks(
 ):
     cfg = get_config()
     p = meta.path
-    # rsplit, а не split: ключ имеет вид email_<папка>:<start>:<stop>, и имя
-    # почтовой папки само может содержать двоеточие. Смещения — всегда два
-    # последних поля и двоеточий не содержат, поэтому режем справа. При split
-    # такая папка давала ValueError, письмо гасил внешний except (см.
-    # async_parse_files) — и оно не индексировалось уже никогда.
+    # Ключ email_<папка>:<start>:<stop>; rsplit — имя папки может содержать «:».
     prefix, _start, _stop = p.rsplit(":", 2)
     prefix = prefix.removeprefix("email_")
     start, stop = int(_start), int(_stop)
     if stop - start > cfg.email_scan_cfg.max_message_size:
-        # Вторая линия защиты после EmailsScanner: очередь лежит на диске и
-        # переживает рестарт, поэтому может донести письмо, поставленное до
-        # появления лимита. permanent=True — меньше письмо уже не станет.
+        # Дублирует проверку EmailsScanner: очередь на диске переживает рестарт и
+        # может донести письмо, поставленное до появления лимита.
         lg.debug(
             "skip oversized email %s: %s Б больше лимита %s Б",
             p,
@@ -233,18 +237,27 @@ async def _process_email_chunks(
     file = files.get(prefix)
     if not file:
         lg.warning(f"skip indexing email, no file for {prefix=}")
-        # Без fail_cb письмо навсегда осталось бы в счётчике очереди, и
-        # /status вечно показывал бы is_indexing=true.
+        # Без fail_cb письмо осталось бы в счётчике очереди: is_indexing=true навсегда.
         await fail_cb(meta, permanent=False)
         return
     await file.seek(start)
     data = await file.read(stop - start)
     msg = email.message_from_bytes(data)
-    dt = datetime.fromtimestamp(meta.mtime_seconds)
+    # Дата письма вне диапазона колонки дат (1601, 2300 год) — пусто, а не
+    # ArrowInvalid на записи батча.
+    dt = datetime_from_timestamp(meta.mtime_seconds)
     subject = _decode_filename(msg["Subject"])
     sender = normalize_field(_decode_filename(msg["From"]) if msg["From"] else None)
     lg.debug("process email subject=%s", subject)
     chunks_cnt = 0
+    # Исход вложения — не исход письма: письмо решается один раз, в конце.
+    # Пометка в LSM посреди письма опередила бы запись чанков тела.
+    attachment_failed = False
+
+    async def _attachment_cb(_meta: FileMetadata, *, permanent: bool) -> None:
+        nonlocal attachment_failed
+        attachment_failed = attachment_failed or not permanent
+
     for part in process_message(msg):
         if isinstance(part, Body):
             doc_meta = DocumentMetadata(
@@ -267,7 +280,7 @@ async def _process_email_chunks(
                     idx=idx,
                     text=text,
                     meta=doc_meta,
-                    path=f"{p}:body",  # добавляем суффикc body чтобы не путать с остальными частями почтового сообщения
+                    path=f"{p}:body",  # отличает тело от вложений письма
                     file_meta=meta,
                 )
                 chunks_cnt += 1
@@ -294,19 +307,22 @@ async def _process_email_chunks(
                 lg.debug("process email attachment %s", part.original_name)
                 async for chunk in _process_path(
                     meta,
-                    fail_cb=fail_cb,
+                    fail_cb=_attachment_cb,
                     doc_meta=doc_meta,
                     ext=ext,
                     io=io.BytesIO(part.payload),
+                    name=f"{p}:{part.original_name}",
                 ):
                     chunk["path"] = f"{meta.path}:{part.original_name}"
                     yield chunk
                     chunks_cnt += 1
-    if chunks_cnt == 0:
-        # DEBUG, а не WARNING: письмо без индексируемого текста — обычное дело
-        # (автоответ, приглашение, одна картинка), и на ящике в десятки тысяч
-        # писем WARNING на каждое превращает лог в шум. Типы частей отвечают
-        # на вопрос «почему пусто» — например, только application/zip.
+    if attachment_failed:
+        # Вложение не разобрано по временной причине — письмо не помечаем,
+        # даже если тело записано: иначе вложение в индекс не вернётся.
+        await fail_cb(meta, permanent=False)
+    elif chunks_cnt == 0:
+        # DEBUG: письмо без текста (автоответ, приглашение, картинка) — норма,
+        # WARNING на каждое забил бы лог. Типы частей объясняют, почему пусто.
         content_types = ", ".join(sorted({x.get_content_type() for x in msg.walk()}))
         lg.debug(
             "no chunks generated for %s (%s Б, части: %s)",
@@ -324,10 +340,9 @@ async def async_parse_files(
 ):
     """Разобрать поток метаданных в чанки.
 
-    `with_emails=False` — поток заведомо файловый, mbox открывать не нужно:
-    открытие стоит обхода профиля и пула потоков на каждый вызов, а зовут её
-    в том числе на каждую пачку от watcher'а. Проверка `email_` ниже остаётся:
-    очередь переживает рестарт, и чужой ключ лучше отловить.
+    `with_emails=False` — поток заведомо файловый, mbox не открываем: это обход
+    профиля и пул потоков на каждую пачку от watcher'а. Проверка `email_` ниже
+    всё равно нужна — очередь переживает рестарт и может принести письмо.
     """
     from src.utils import get_config
 
@@ -341,8 +356,7 @@ async def async_parse_files(
                 len(email_files) * 2 or 1,
                 thread_name_prefix="read_email_file_pool",
             )
-            # Пул создаётся на каждый проход — без закрытия его потоки
-            # накапливались бы до конца жизни демона.
+            # Пул создаётся на каждый проход: без shutdown потоки копятся.
             stack.callback(executor.shutdown, False)
             for file, prefix in email_files:
                 try:
@@ -353,9 +367,8 @@ async def async_parse_files(
                         5,
                     )
                 except Exception:
-                    # Недоступная папка не должна ронять индексацию: письма
-                    # из неё пропустит _process_email_chunks («no file for
-                    # prefix»), остальные папки и файлы индексируются дальше.
+                    # Недоступная папка не роняет индексацию: её письма
+                    # пропустит _process_email_chunks («no file for prefix»).
                     lg.exception(f"while opening email {file=}")
         async for p in files:
             if is_email_path(p.path):
@@ -367,9 +380,7 @@ async def async_parse_files(
                 except GeneratorExit:
                     return
                 except Exception:
-                    # Ошибка одного письма (битый ключ, сбой чтения) не
-                    # должна обрывать весь поток индексации — симметрично
-                    # файловой ветке в _process_path.
+                    # Ошибка одного письма не обрывает поток индексации.
                     lg.exception("processing email %s", p.path)
                     await fail_cb(p, permanent=False)
             else:
@@ -389,60 +400,56 @@ async def _process_path(
     doc_meta: DocumentMetadata | None = None,
     io: BinaryIO | None = None,
     ext: str | None = None,
+    name: str | None = None,
 ):
+    """`name` — имя в журнале для вложения письма: «<ключ письма>:<имя вложения>»."""
     path = Path(meta.path)
+    shown = name or str(path)
     if ext is None:
         ext = file_extension(path)
     if parser := get_parser(ext.lower()):
         chunks = 0
         try:
-            lg.debug("begin procesing %s", path)
+            lg.debug("begin procesing %s", shown)
             # Метаданные ФС — внутри try: файл, исчезнувший между сканом и
             # разбором, — временный сбой этого файла, а не падение всего прохода.
             async for chunk in wrap_iter_to_async(
-                document_chunks(path, parser, io=io, doc_meta=doc_meta, file_meta=meta)
+                document_chunks(
+                    path,
+                    parser,
+                    io=io,
+                    doc_meta=doc_meta,
+                    file_meta=meta,
+                    # Здесь, в event loop, — до любой остановки индексации.
+                    ocr_generation=ocr.generation(),
+                )
             ):
                 yield chunk
                 chunks += 1
         except SkipFile as skip:
-            # Причина в содержимом (битый, зашифрован, без текста): одна строка
-            # без стека. permanent=True — до изменения файла: дописанный файл
-            # сменит размер и время и вернётся в индексацию сам.
-            lg.warning("файл %s не индексируется: %s", path, skip.reason)
+            # Причина в содержимом — без стека. permanent действует до изменения
+            # файла: новые размер и mtime вернут его в индексацию.
+            lg.warning("файл %s не индексируется: %s", shown, skip.reason)
             await fail_cb(meta, permanent=skip.permanent)
             return
         except (OSError, MemoryError) as exc:
-            # Файл занят, исчез или не хватило памяти — повторить на следующем проходе.
             lg.warning(
                 "файл %s пока не прочитан (%s: %s) — повтор на следующем проходе",
-                path,
+                shown,
                 type(exc).__name__,
                 exc,
             )
             await fail_cb(meta, permanent=False)
             return
         except Exception:
-            # Непредвиденный сбой (ошибка в коде, инференс) — со стеком; файл НЕ
-            # помечаем обработанным, чтобы следующий полный проход к нему вернулся.
-            lg.exception("processing %s", path)
+            # Непредвиденный сбой — со стеком; не помечаем, следующий проход повторит.
+            lg.exception("processing %s", shown)
             await fail_cb(meta, permanent=False)
             return
         if chunks == 0:
-            # Разобрали успешно, но текста нет — возвращаться незачем.
-            lg.warning("no chunks generated for %s", path)
+            # Разбор прошёл, текста нет — повторять незачем. Пустое вложение
+            # письма — норма (DEBUG, как пустое письмо).
+            (lg.debug if name else lg.warning)("no chunks generated for %s", shown)
             await fail_cb(meta, permanent=True)
     else:
-        lg.debug("no parser found for %s", path)
-
-
-def parse_files_io(files: Iterable[tuple[io.BytesIO, str, DocumentMetadata | None]]):
-    for file, ext, meta in files:
-        if parser := get_parser(ext.lower()):
-            for chunk in parser.iter_chunks_io(file):
-                yield ChunkWithMeta(
-                    **chunk,
-                    meta=meta,
-                    path="",
-                )
-        else:
-            lg.debug("no parser found for %s", ext)
+        lg.debug("no parser found for %s", shown)

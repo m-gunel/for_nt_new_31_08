@@ -17,6 +17,7 @@ from src.indexer import serve_indexer
 from src.utils import get_config, get_logger
 from src.version import __version__
 
+from .loopback_guard import LoopbackOnlyMiddleware
 from .router import router
 
 lg = get_logger(__name__)
@@ -25,13 +26,13 @@ lg = get_logger(__name__)
 def _static_dir() -> Path | None:
     """Каталог с офлайн-статикой Swagger, если она вообще положена.
 
-    Путь резолвится так же, как остальные ресурсы проекта (см. src/config.py):
-    в бандле PyInstaller корнем служит sys._MEIPASS, при запуске из исходников —
-    корень репозитория.
+    В бандле PyInstaller корень — sys._MEIPASS, как у ресурсов в src/config.py.
+    При запуске из исходников — корень репозитория по пути этого модуля, а не
+    cwd, от которого считает свои ресурсы config.py: статика находится при
+    любом рабочем каталоге.
 
-    Возвращает None, если статики нет. Это штатная ситуация, а не ошибка:
-    каталог в репозитории намеренно пустой, и без файлов страница /docs просто
-    работает по-старому, через CDN.
+    None — статики нет. Это штатно: в репозитории каталог пуст, и /docs
+    берёт скрипты с CDN.
     """
     if getattr(sys, "frozen", False):
         base = Path(sys._MEIPASS)  # type: ignore[attr-defined]
@@ -49,26 +50,19 @@ STATIC_DIR = _static_dir()
 @asynccontextmanager
 async def app_life(app: FastAPI):
     cfg = get_config()
-    # get_event_loop() внутри работающего цикла устарел — берём текущий явно.
     get_running_loop().set_default_executor(
         ThreadPoolExecutor(max_workers=cfg.asyncio_num_workers)
     )
     if STATIC_DIR is None:
-        # Не ошибка, но знать об этом надо: в закрытом контуре страница
-        # откроется пустой, и без этой строки причина ниоткуда не видна.
+        # В закрытом контуре /docs откроется пустой — причина должна быть в логе.
         lg.warning(
             "офлайн-статика Swagger не найдена: /docs будет тянуть скрипты с "
             "cdn.jsdelivr.net и в сети без интернета откроется пустой. "
             "Как положить файлы — см. src/server/static/README.md"
         )
-    # Прогреваем оба канала инференса, чтобы первый живой запрос не платил
-    # за создание infer-request'а. Обращение к cfg.ov_model — это cached_property,
-    # то есть именно здесь происходит компиляция модели OpenVINO, и она
-    # занимает почти всё время старта.
-    #
-    # Замер нужен не ради красоты: раньше единственной отметкой о прогреве был
-    # lg.debug в src/config.py, невидимый на штатном INFO, и 40-45 секунд старта
-    # выглядели в логе как зависание без единой строки.
+    # Прогрев обоих каналов инференса, чтобы первый запрос не ждал создания
+    # infer request. Первое обращение к cfg.ov_model компилирует модель — это
+    # почти всё время старта; без строк на INFO 40–45 с выглядят как зависание.
     started = monotonic()
     lg.info("прогрев модели OpenVINO: компиляция и два канала инференса")
     await cfg.ov_model.async_encode(["test"], role="search")
@@ -85,19 +79,24 @@ app = FastAPI(
         "Локальный индексатор и семантический поиск по файлам пользователя.\n\n"
         "Индексация стартует вместе с демоном (бесшовная поставка); остановить "
         "на сессию — `POST /api/v1/deactivate`.\n\n"
-        "Порт назначает ядро (`RAG_PORT=0`); фактический опубликован в "
-        "`~/.files-search/port`."
+        "Адрес задают `RAG_HOST` и `RAG_PORT`, по умолчанию `127.0.0.1:8000`; "
+        "в поставке `RAG_PORT=0`, и порт выбирает ядро. Фактический порт "
+        "опубликован в `~/.files-search/port`.\n\n"
+        "Запросы, у которых `Host` или `Origin` не loopback, отклоняются "
+        "(400/403): защита от DNS rebinding и запросов со сторонних сайтов."
     ),
-    # Свой роут /docs регистрируем только когда есть локальная статика:
-    # иначе оставляем штатный, чтобы поведение не менялось там, где CDN доступен.
+    # Без локальной статики — штатный /docs через CDN.
     docs_url=None if STATIC_DIR is not None else "/docs",
-    # ReDoc выключен намеренно. Офлайн-варианта для него мы не держим, а тянет
-    # он вчетверо больше внешнего: redoc.standalone.js, favicon и шрифты Google.
-    # Одной работающей страницы документации достаточно.
+    # ReDoc выключен: офлайн-версии нет, а внешнего он тянет ещё больше
+    # (скрипт, favicon, шрифты Google).
     redoc_url=None,
     openapi_url="/openapi.json",
     lifespan=app_life,
 )
+
+# Снаружи всего приложения, включая /docs и статику: чужой Host/Origin не
+# доходит ни до одной ручки.
+app.add_middleware(LoopbackOnlyMiddleware)
 
 app.include_router(router, prefix="/api/v1")
 
@@ -109,8 +108,8 @@ if STATIC_DIR is not None:
         return get_swagger_ui_html(
             openapi_url=app.openapi_url,
             title="%s %s — Swagger UI" % (app.title, app.version),
-            # Все три ссылки локальные. Достаточно упустить одну, чтобы
-            # страница снова полезла в интернет и снова оказалась пустой.
+            # Все три ссылки локальные: одна внешняя — и в закрытом контуре
+            # страница пустая.
             swagger_js_url="/static/swagger-ui-bundle.js",
             swagger_css_url="/static/swagger-ui.css",
             swagger_favicon_url="/static/favicon.png",
@@ -122,10 +121,8 @@ if STATIC_DIR is not None:
         return get_swagger_ui_oauth2_redirect_html()
 
 
-# Алиасы под префиксом роутера. Swagger и схема живут в КОРНЕ приложения —
-# include_router(prefix=...) на них не распространяется. Но все рабочие ручки
-# лежат под /api/v1, поэтому рука тянется туда же, и /api/v1/docs отдаёт 404
-# ровно в тот момент, когда человек пытается разобраться, что вообще есть в API.
+# Swagger и схема живут в корне приложения, а ищут их под /api/v1 рядом с
+# ручками — редиректы вместо 404.
 @app.get("/api/v1/docs", include_in_schema=False)
 async def docs_alias():
     return RedirectResponse("/docs")

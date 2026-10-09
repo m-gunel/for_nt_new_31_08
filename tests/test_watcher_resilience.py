@@ -1,22 +1,13 @@
 """Устойчивость наблюдения за файловой системой.
 
-Пять боевых дефектов АРМ, из-за которых демон оставался без слежения за ФС
-или сносил лишнее:
-
-* исключаемые каталоги (`.cache`, `node_modules`, `venv`) выбирали
-  `fs.inotify.max_user_watches` наравне с полезными;
-* один отказавший `observer.schedule()` на старте выключал наблюдение СРАЗУ
-  ПО ВСЕМ путям;
-* каталог с правами `0o000` проходил проверку `is_dir()` и считался
-  наблюдаемым, хотя inotify по нему молча не вставал;
-* пустой `src_path` от watchdog превращался в `os.path.abspath("")`, то есть
-  в текущий рабочий каталог демона;
-* watcher не применял лимит `max_size`, и гигабайтный файл, скопированный в
-  наблюдаемую папку, уходил прямо в парсер.
+Исключаемые каталоги не тратят `fs.inotify.max_user_watches`, отказ по одному
+пути не гасит наблюдение остальных, нечитаемый каталог не считается
+наблюдаемым, пустой путь от watchdog не становится cwd демона, watcher
+применяет лимит `max_size`.
 
 Реальный отказ inotify на macOS невоспроизводим (там FSEvents), поэтому
-Observer здесь подменён заглушкой — иначе ветки обработки ошибок не
-исполняются ни одним тестом и ломаются незаметно до самого АРМ.
+Observer подменён заглушкой — иначе ветки обработки ошибок не исполнялись бы
+ни одним тестом.
 """
 
 import errno
@@ -35,9 +26,8 @@ from src.indexer.watcher.watchdog_adapter import (
     WatchDogAdapter,
     _dirs_for_watch,
 )
-# Конфиг с временным data_directory (иначе scan_paths прочитает настоящий
-# ~/.ragsearch разработчика) — фикстура общая на три набора тестов про
-# watcher, чтобы правки шли пачкой, а не расползались по копиям.
+# Конфиг с временным data_directory (иначе scan_paths прочитает общий
+# user_conf.yml) — общая фикстура тестов watcher'а.
 from tests.test_watcher_max_depth import watcher_config  # noqa: F401
 
 # Логгеры watchdog_adapter, base_watcher и watcher срезаны до одного имени.
@@ -60,8 +50,8 @@ class _NoopWatcher(AbstractFilesWatcher):
 class _FlakyObserver:
     """Observer, у которого schedule() отказывает по заданным путям.
 
-    Пишет вызовы в общий журнал `calls`: важен не только факт постановки, но и
-    то, что observer поднимается ПУСТЫМ, а наблюдения добавляются после старта.
+    Журнал `calls` показывает, что observer поднимается пустым, а наблюдения
+    добавляются после старта.
     """
 
     def __init__(self, failing=(), fail_all: bool = False):
@@ -100,16 +90,11 @@ def _names(paths: list[Path]) -> set[str]:
     return {p.name for p in paths}
 
 
-# ------------------------------- дефект 1: исключения при постановке watch'ей
-
-
 def test_excluded_dirs_do_not_take_inotify_watches(tmp_path):
-    """`.cache`/`node_modules`/`venv` не должны попадать в список наблюдения.
+    """`.cache`/`node_modules`/`venv` не попадают в список наблюдения.
 
-    Было: `_dirs_for_watch` собирал ВСЕ подкаталоги до max_depth. На домашнем
-    каталоге кэши и зависимости — основная статья расхода
-    `fs.inotify.max_user_watches`, и лимит выбирался мусором, а на полезные
-    папки watch'ей не оставалось. Их содержимое всё равно отсеивает фильтр.
+    На домашнем каталоге кэши и зависимости — основная статья расхода
+    `fs.inotify.max_user_watches`, а их содержимое всё равно отсеивает фильтр.
     """
     root = tmp_path / "docs"
     for name in ("проекты", ".cache", ".git", "node_modules", "venv", "__pycache__"):
@@ -122,10 +107,7 @@ def test_excluded_dirs_do_not_take_inotify_watches(tmp_path):
 
 
 def test_subtree_of_excluded_dir_is_not_walked(tmp_path):
-    """В исключаемый каталог не спускаемся — иначе экономия мнимая.
-
-    Было: `node_modules/пакет` и всё, что глубже, тоже получало по watch'у.
-    """
+    """В исключаемый каталог не спускаемся — иначе экономия мнимая."""
     root = tmp_path / "docs"
     (root / "node_modules" / "пакет").mkdir(parents=True)
     (root / "проекты" / "вложенный").mkdir(parents=True)
@@ -137,26 +119,18 @@ def test_subtree_of_excluded_dir_is_not_walked(tmp_path):
     assert "node_modules" not in watched
 
 
-# Отдельного адаптерного теста на тот же отбор здесь нет намеренно:
-# `_start_observer` только итерирует результат `_dirs_for_watch`, а что он
-# ставит по watch'у на каждый возвращённый каталог и с recursive=False —
-# проверено в tests/test_watcher_max_depth.py
-# (test_adapter_bounded_schedules_each_dir_non_recursive).
-
-
-# --------------------------- дефект 2: отказ по одному пути гасил наблюдение
+# Что _start_observer ставит watch на каждый каталог из `_dirs_for_watch` с
+# recursive=False, проверено в tests/test_watcher_max_depth.py.
 
 
 def test_one_failing_path_does_not_disable_watching_of_the_rest(
     tmp_path, monkeypatch, caplog
 ):
-    """Отказ по одному каталогу не должен снимать наблюдение с остальных.
+    """Отказ по одному каталогу не снимает наблюдение с остальных.
 
-    Было: всё расписание создавалось в конструкторе до старта observer'а, и
-    первый же OSError (упёрлись в `fs.inotify.max_user_watches`, каталог
-    исчез, нет прав) срывал постановку ВСЕХ путей — демон оставался без
-    слежения за файловой системой целиком. Стало: observer стартует пустым,
-    пути ставятся по одному, отказавший считается пропущенным.
+    OSError по одному пути (лимит `fs.inotify.max_user_watches`, каталог исчез,
+    нет прав) штатен: observer стартует пустым, пути ставятся по одному,
+    отказавший считается пропущенным.
     """
     root = tmp_path / "docs"
     for name in ("a", "b", "c"):
@@ -172,9 +146,6 @@ def test_one_failing_path_does_not_disable_watching_of_the_rest(
         [str(root), str(root / "a"), str(root / "c")]
     )
     assert not observer.stopped, "частичный отказ — не повод гасить наблюдение"
-    # Ср. tests/test_watcher_new_dirs.py::test_watch_dir_returns_false_on_oserror:
-    # там та же инвариантность проверяется на самом watch_dir, здесь — что её
-    # не теряет стартовая постановка.
     assert str(root / "b") not in adapter._watched, (
         "путь, на который watch не встал, нельзя считать наблюдаемым: "
         "повторная попытка из watch_dir тогда не состоится"
@@ -188,14 +159,11 @@ def test_one_failing_path_does_not_disable_watching_of_the_rest(
 async def test_total_failure_is_reported_as_oserror(tmp_path, monkeypatch):
     """Ни одного наблюдения — это отказ, а не деградация.
 
-    Было: конструктор бросал OSError на первом же пути, и решать было нечего.
-    Стало: пустой результат отличается от частичного — `_start_observer`
-    гасит observer и поднимает ENOSPC, чтобы base_watcher написал в лог errno
-    и подсказал про `fs.inotify.max_user_watches`.
+    `_start_observer` гасит observer и поднимает ENOSPC, чтобы base_watcher
+    написал errno и подсказку про `fs.inotify.max_user_watches`.
 
-    Поднимаем через `start_async`, а не вызовом `_start_observer` напрямую:
-    только он захватывает цикл (`self._loop = asyncio.get_running_loop()`),
-    поэтому сброс `_loop` в ветке отказа проверяется по-настоящему.
+    Запуск через `start_async`: только он захватывает цикл, и сброс `_loop` в
+    ветке отказа проверяется по-настоящему.
     """
     root = tmp_path / "docs"
     root.mkdir()
@@ -213,19 +181,14 @@ async def test_total_failure_is_reported_as_oserror(tmp_path, monkeypatch):
     )
 
 
-# ------------------------------ дефект 3: нечитаемый каталог считался живым
-
-
 @pytest.fixture
 def scan_paths_config(watcher_config, tmp_path, monkeypatch):  # noqa: F811
     """scan_paths из читаемого каталога и каталога, недоступного на чтение.
 
-    Правами файловой системы в эту ветку не загнать: прогон, который гейтит
-    сборку, идёт от root (Dockerfile зовёт pytest, USER не задан), а для root
-    `os.access` на каталоге с правами 0o000 всё равно вернёт True — тест
-    молча превращался бы в skip. Плюс chmod 0o000 внутри tmp_path мешает
-    pytest'у убирать временные каталоги. Поэтому подменяем саму проверку:
-    base_watcher резолвит `os.access` из глобалей модуля в момент вызова.
+    Правами ФС сюда не загнать: прогон в Docker идёт от root, а для root
+    `os.access` на 0o000 вернёт True; к тому же chmod 0o000 мешает pytest
+    убирать tmp_path. Поэтому подменяется сама проверка: base_watcher резолвит
+    `os.access` из глобалей модуля в момент вызова.
     """
     config, readable = watcher_config
     closed = tmp_path / "закрытый"
@@ -245,12 +208,10 @@ def scan_paths_config(watcher_config, tmp_path, monkeypatch):  # noqa: F811
 
 
 def test_unreadable_dir_is_not_counted_as_watched(scan_paths_config, caplog):
-    """Каталог без прав не должен считаться наблюдаемым.
+    """Каталог без прав не считается наблюдаемым.
 
-    Было: `_watch_paths` проверял только `is_dir()`, а у каталога с правами
-    0o000 он возвращает True. inotify по такому пути молча не встаёт
-    (watchdog глотает EACCES), и путь выглядел наблюдаемым, не будучи им:
-    файлы в нём не индексировались, а в логе не было ни строчки.
+    `is_dir()` для каталога 0o000 возвращает True, а inotify по нему молча не
+    встаёт (watchdog глотает EACCES).
     """
     _cfg, readable, closed = scan_paths_config
 
@@ -262,9 +223,6 @@ def test_unreadable_dir_is_not_counted_as_watched(scan_paths_config, caplog):
     assert str(closed) in caplog.text, "в логе должен быть конкретный путь"
 
 
-# ---------------------------- дефект 4: пустой путь — это текущий каталог
-
-
 def _emitted(event) -> list[tuple[Change, str]]:
     """Что MyEventHandler кладёт в очередь по одному событию перемещения."""
     events: list[tuple[Change, str]] = []
@@ -273,12 +231,11 @@ def _emitted(event) -> list[tuple[Change, str]]:
 
 
 def test_move_from_outside_tree_does_not_emit_empty_path(tmp_path):
-    """Перемещение ИЗВНЕ дерева не должно порождать событие по пустому пути.
+    """Перемещение извне дерева не порождает событие по пустому пути.
 
-    Было: `on_moved` эмитил оба события всегда, а watchdog для переноса
-    снаружи отдаёт пустой `src_path`. Дальше base_watcher звал
-    `os.path.abspath("")` — то есть текущий рабочий каталог демона — и мог
-    снять с индекса его целиком (`on_delete_dir` по всему поддереву).
+    watchdog для переноса снаружи отдаёт пустой `src_path`, а
+    `os.path.abspath("")` — это cwd демона: `on_delete_dir` снял бы с индекса
+    всё его поддерево.
     """
     dest = tmp_path / "перенесённый.txt"
 
@@ -286,7 +243,7 @@ def test_move_from_outside_tree_does_not_emit_empty_path(tmp_path):
         (Change.added, str(dest))
     ]
 
-    # Контроль: обычное перемещение внутри дерева по-прежнему даёт оба события,
+    # Контроль: обычное перемещение внутри дерева даёт оба события,
     # иначе исчезнувший исходный путь останется в индексе навсегда.
     src = tmp_path / "было.txt"
     assert _emitted(FileMovedEvent(src_path=str(src), dest_path=str(dest))) == [
@@ -296,11 +253,7 @@ def test_move_from_outside_tree_does_not_emit_empty_path(tmp_path):
 
 
 def test_move_out_of_tree_does_not_emit_empty_path(tmp_path):
-    """Симметрично: пустой `dest_path` не должен давать «добавлен» по cwd.
-
-    Было: пустой путь уходил в индексацию, и обход текущего рабочего каталога
-    демона попадал в очередь на разбор.
-    """
+    """Симметрично: пустой `dest_path` не даёт «добавлен» по cwd демона."""
     src = tmp_path / "ушёл.txt"
 
     assert _emitted(FileMovedEvent(src_path=str(src), dest_path="")) == [
@@ -308,15 +261,11 @@ def test_move_out_of_tree_does_not_emit_empty_path(tmp_path):
     ]
 
 
-# ----------------------------- дефект 5: watcher не применял лимит размера
-
-
 class _StubIndex:
-    """Минимальный протокол Index для Watcher.on_upsert — без живого индекса.
+    """Минимальный протокол Index для Watcher.on_upsert.
 
-    `watch_pending` — свойство, а не поле: `Watcher.on_upsert` возвращает
-    счётчик обратно в `finally`, поэтому по остатку после вызова отличить
-    старое поведение от нового невозможно. Запоминаем пик.
+    `watch_pending` — свойство с запоминанием пика: on_upsert возвращает
+    счётчик обратно в `finally`, и по остатку после вызова ничего не видно.
     """
 
     def __init__(self) -> None:
@@ -364,11 +313,10 @@ def size_limited_watcher(config, monkeypatch):
 async def test_oversized_file_from_watcher_is_not_parsed(
     size_limited_watcher, tmp_path
 ):
-    """Файл больше max_size не должен доходить до парсера через watcher.
+    """Файл больше max_size не доходит до парсера и через watcher.
 
-    Было: лимит применял только полный проход (`FilesScanner.preindex`), а
-    `Watcher.on_upsert` — нет. Файл на гигабайты, скопированный в
-    наблюдаемую папку, уходил прямо в разбор и съедал память демона.
+    Не только через `FilesScanner.preindex`: гигабайтный файл, скопированный в
+    наблюдаемую папку, съел бы память демона.
     """
     watcher, index = size_limited_watcher
     huge = FileMetadata(path=str(tmp_path / "дамп.txt"), size=2048, mtime_seconds=1)
@@ -385,11 +333,8 @@ async def test_oversized_file_from_watcher_is_not_parsed(
 async def test_batch_of_only_oversized_files_does_not_touch_index(
     size_limited_watcher, tmp_path
 ):
-    """Пачка из одних отсеянных файлов не должна дёргать индекс вообще.
-
-    Было: такой файл проходил в `process_stream`, накручивал `watch_pending`
-    в `/status` и вызывал пересборку индексов впустую.
-    """
+    """Пачка из одних отсеянных файлов не дёргает индекс вообще: ни
+    `process_stream`, ни `watch_pending` в `/status`, ни пересборку индексов."""
     watcher, index = size_limited_watcher
     huge = FileMetadata(
         path=str(tmp_path / "образ.txt"), size=10 * 1024, mtime_seconds=1

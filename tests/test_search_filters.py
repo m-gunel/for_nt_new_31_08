@@ -25,8 +25,6 @@ from tests.mcp_fixture import bridge_factory, call_text, stub  # noqa: F401
 from tests.test_indexing_live import index, isolated_config  # noqa: F401
 from tests.test_search_documents import _frame, _index, _Table
 
-# ---------------------------------------------------- перевод в where ----
-
 
 def test_no_filters_give_no_condition():
     assert SearchFilters().where() is None
@@ -132,8 +130,6 @@ def test_swagger_examples_are_valid_and_the_first_has_no_filters():
         SearchRequest(**example["value"])
 
 
-# --------------------------------------- where в каждом запросе к таблице ----
-
 WHERE = "meta.ext IN ('pdf')"
 
 
@@ -168,8 +164,6 @@ async def test_without_filter_where_is_not_called():
     ((_, builder),) = table.searches
     assert all(name != "where" for name, _ in builder.calls)
 
-
-# ------------------------------------------------- живой индекс (LanceDB) ----
 
 # путь → meta (поверх original_name и sha256); у каждого документа один чанк
 # про отчёт и карточка. Ключ "text" — свой текст чанка и карточки вместо них.
@@ -391,9 +385,6 @@ async def test_live_date_filter_uses_the_date_shown_in_results(index: Index):  #
             assert {i.absolute_path for i in items} == expected, (query_type, filters)
 
 
-# ------------------------------------------- фильтр и разделы IVF-индекса ----
-
-
 def _clustered_table(tmp_path, author_rows: int = 20):
     """6400 строк в 64 кластерах, IVF-PQ на 80 разделов (как create_vector_index).
 
@@ -438,8 +429,8 @@ def _clustered_table(tmp_path, author_rows: int = 20):
 async def test_narrow_filter_is_not_lost_in_unprobed_ivf_partitions(
     tmp_path, query_type
 ):
-    """nprobes(32) ограничивал и максимум разделов: строки под узким фильтром
-    вне 32 ближайших к запросу разделов не находились вовсе (0 из 20)."""
+    """Строки под узким фильтром находятся и вне ближайших к запросу разделов
+    IVF: nprobes ограничивает и максимум разделов, под фильтром потолок снят."""
     table, centers = _clustered_table(tmp_path)
     found = []
     for cluster in (2, 3, 4):
@@ -462,7 +453,7 @@ async def test_narrow_filter_is_not_lost_in_unprobed_ivf_partitions(
 
 @pytest.mark.asyncio
 async def test_filter_lifts_the_ivf_probe_ceiling_only_with_filter():
-    """Без фильтра — прежний предел разделов: поиск по всей таблице их и так находит.
+    """Без фильтра предел разделов остаётся: поиск по всей таблице их и так находит.
 
     refine — в обеих ветках: под фильтром порядок тоже задают полные векторы.
     """
@@ -488,8 +479,6 @@ async def test_filter_lifts_the_ivf_probe_ceiling_only_with_filter():
             assert all(call in builder.calls for call in expected), query_type
             assert all(name != absent for name, _ in builder.calls), query_type
 
-
-# ---------------------------------------------------------------- MCP ----
 
 SEARCH = "/api/v1/search"
 STATUS = "/api/v1/status"

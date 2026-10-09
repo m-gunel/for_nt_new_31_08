@@ -1,7 +1,9 @@
 import asyncio
 import errno
 import os
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import suppress
 from pathlib import Path
 from typing import NamedTuple
 
@@ -23,42 +25,37 @@ from src.utils import get_logger
 
 from ..exclude import exclude_pattern
 
+try:
+    # Только Linux: на других ОС модуль не импортируется (в libc нет inotify).
+    from watchdog.observers.inotify import InotifyObserver as _InotifyObserver
+    from watchdog.observers.inotify_c import Inotify as _Inotify
+except Exception:
+    _InotifyObserver = None  # type: ignore[assignment,misc]
+    _Inotify = None  # type: ignore[assignment,misc]
+
 lg = get_logger(__name__, slice=-1)
 
-# Потолок очереди событий. При массовом копировании файлов события сыплются
-# быстрее, чем индексатор их разбирает; без потолка очередь росла бы
-# неограниченно.
+# Потолок очереди событий: при массовом копировании они приходят быстрее,
+# чем индексатор их разбирает.
 DEFAULT_MAX_QUEUE = 10_000
-# Окно, в течение которого собираем события в один батч, чтобы не гонять
-# полный цикл парсинга и эмбеддинга на каждое отдельное событие.
+# Окно сбора событий в один батч: не гонять парсинг и эмбеддинг на каждое.
 DEFAULT_BATCH_WINDOW = 1.0
 DEFAULT_MAX_BATCH = 200
 
 
-def _dirs_for_watch(root: Path, max_depth: int | None) -> list[Path]:
-    """Каталоги, на которые ставить inotify-наблюдение.
+def _walk_dirs(root: Path, max_depth: int | None) -> Iterator[Path]:
+    """Каталоги поддерева root до max_depth включительно (None — без предела).
 
-    None — только корень: watchdog с recursive=True всё равно обходит дерево
-    сам и ставит по одному watch на каждый подкаталог, а здесь мы не
-    дублируем обход. Число — обходим дерево сами до max_depth включительно и
-    возвращаем каждый каталог на этих уровнях: на каждый из них ставится
-    отдельное наблюдение с recursive=False, то есть общее число watch'ей
-    ограничено числом каталогов до глубины, а не всем домашним деревом.
-
-    Исключаемые каталоги (`.cache`, `node_modules`, `.git`, `venv`) в список
-    не попадают: наблюдение за ними всё равно бесполезно — их содержимое
-    отсеет фильтр, — а лимит `fs.inotify.max_user_watches` они выбирают
-    наравне с полезными. На домашнем каталоге это основная статья расхода.
+    Исключаемые каталоги (`.cache`, `node_modules`, `.git`, `venv`) и
+    символьные ссылки пропускаем вместе с поддеревом: их содержимое всё равно
+    отсеет фильтр, а лимит `fs.inotify.max_user_watches` на домашнем каталоге
+    уходит в основном на них.
     """
-    if max_depth is None:
-        return [root]
-
-    watched: list[Path] = []
     stack: list[tuple[Path, int]] = [(root, 0)]
     while stack:
         current, depth = stack.pop()
-        watched.append(current)
-        if depth >= max_depth:
+        yield current
+        if max_depth is not None and depth >= max_depth:
             continue
         try:
             with os.scandir(current) as it:
@@ -76,7 +73,42 @@ def _dirs_for_watch(root: Path, max_depth: int | None) -> list[Path]:
             # Каталог недоступен — на него всё равно поставим watch (если он
             # станет доступен, событие появится).
             continue
-    return watched
+
+
+def _dirs_for_watch(root: Path, max_depth: int | None) -> list[Path]:
+    """Каталоги под отдельное наблюдение.
+
+    Нужны observer'у без inotify и inotify без ожидаемых внутренностей watchdog.
+
+    None — только корень: наблюдение рекурсивное. Число — каталоги до
+    max_depth включительно (см. `_walk_dirs`), на каждый — recursive=False.
+    """
+    if max_depth is None:
+        return [root]
+    return list(_walk_dirs(root, max_depth))
+
+
+def _close_leaked_inotify(exc: BaseException) -> None:
+    """Закрыть inotify-экземпляр, брошенный watchdog'ом при отказе эмиттера.
+
+    `Inotify.__init__` открывает экземпляр и ставит watch'и до того, как
+    эмиттер попадёт в observer; отказ на середине (ENOSPC) оставляет fd
+    открытым до выхода процесса вместе с уже поставленными watch'ами.
+    Ссылка на недостроенный объект есть только в трассировке.
+    """
+    if _Inotify is None:
+        return
+    tb = exc.__traceback__
+    while tb is not None:
+        obj = tb.tb_frame.f_locals.get("self")
+        if isinstance(obj, _Inotify):
+            for name in ("_inotify_fd", "_kill_r", "_kill_w"):
+                fd = vars(obj).get(name)
+                if isinstance(fd, int):
+                    with suppress(OSError):
+                        os.close(fd)
+            return
+        tb = tb.tb_next
 
 
 class WatchEvent(NamedTuple):
@@ -88,10 +120,9 @@ class WatchEvent(NamedTuple):
 class MyEventHandler(FileSystemEventHandler):
     """Обработчик событий watchdog.
 
-    ВАЖНО: методы вызываются из потока watchdog.Observer, а не из потока
-    event loop, поэтому класть в asyncio.Queue напрямую нельзя — она не
-    потокобезопасна, и пробуждение ожидающего потребителя может потеряться.
-    Всё уходит в цикл через `call_soon_threadsafe`.
+    Методы вызываются из потока watchdog.Observer, а asyncio.Queue не
+    потокобезопасна (пробуждение потребителя может потеряться), поэтому
+    события уходят в цикл через `call_soon_threadsafe`.
     """
 
     def __init__(self, emit: Callable[[WatchEvent], None]) -> None:
@@ -105,9 +136,8 @@ class MyEventHandler(FileSystemEventHandler):
         self._emit(WatchEvent(Change.deleted, event.src_path, event.is_directory))
 
     def on_moved(self, event: DirMovedEvent | FileMovedEvent) -> None:
-        # Пустой путь отбрасываем: os.path.abspath("") даёт текущий рабочий
-        # каталог, и удаление/индексация уходили бы по нему. watchdog отдаёт
-        # пустой src_path для перемещения ИЗВНЕ наблюдаемого дерева.
+        # При перемещении извне дерева watchdog отдаёт пустой src_path, а
+        # os.path.abspath("") — это рабочий каталог процесса.
         if event.src_path:
             self._emit(WatchEvent(Change.deleted, event.src_path, event.is_directory))
         if event.dest_path:
@@ -139,53 +169,81 @@ class WatchDogAdapter:
         self._roots = [Path(path) for path in paths]
         self._max_depth = max_depth
         self._recursive = max_depth is None
-        # Пути, на которых наблюдение уже стоит: watch_dir зовут на каждый
-        # появившийся каталог, и без этого один и тот же путь получал бы по
-        # эмиттеру на событие.
+        # Пути с собственным эмиттером: watch_dir зовут на каждый появившийся
+        # каталог, и без этого путь получал бы по эмиттеру на событие.
         self._watched: set[str] = set()
+        # ObservedWatch по пути — снять эмиттер исчезнувшего каталога.
+        self._watches: dict[str, object] = {}
+        # Постановка наблюдений — под замком, флаг остановки ставится до него:
+        # поток _start_observer, ещё обходящий дерево, после close() не
+        # заводит эмиттеров, которые уже никто не остановит.
+        self._lock = threading.Lock()
+        self._closing = threading.Event()
+        self._last_errno: int | None = None
         self.observer = Observer()
-        # Наблюдения ставятся не здесь, а в _start_observer: до старта
-        # observer'а отказ по одному пути срывает постановку всех остальных
-        # (см. комментарий там же).
+        # Наблюдения ставит _start_observer — по одному, после старта observer'а.
 
-    # Типы событий, на которые подписываемся. Вынесено в атрибут класса, чтобы
-    # список не расходился между стартовой постановкой и watch_dir.
     EVENT_FILTER = [
         FileModifiedEvent,
         FileMovedEvent,
         FileDeletedEvent,
         FileCreatedEvent,
-        # Каталоги нужны для удаления: перемещение папки в корзину —
-        # это один rename, и событий по вложенным файлам может не
-        # прийти вовсе, а без них записи о них остаются в индексе.
+        # Перенос папки (в корзину или внутрь дерева извне) — один rename без
+        # событий по вложенным файлам: удаление и появление видны только по
+        # событию самого каталога.
         DirDeletedEvent,
         DirMovedEvent,
-        # ...и для появления: без DirCreatedEvent факт «в наблюдаемом дереве
-        # возник каталог» до адаптера не доходил вообще, поэтому каталог,
-        # перенесённый снаружи внутрь, оставался непроиндексированным.
         DirCreatedEvent,
     ]
 
-    def watch_dir(self, path: str | Path) -> bool:
-        """Поставить наблюдение на каталог, появившийся после старта.
+    def _inotify_mode(self) -> bool:
+        return _InotifyObserver is not None and isinstance(
+            self.observer, _InotifyObserver
+        )
 
-        Нужно из-за особенности inotify: у `IN_MOVED_TO` нет бита `IN_CREATE`,
-        поэтому watchdog не добавляет watch на каталог, ПЕРЕМЕЩЁННЫЙ внутрь
-        наблюдаемого дерева (обычный `mkdir` при этом работает — расхождение
-        неочевидное и потому опасное). Без этого файлы, созданные в таком
-        каталоге уже после переноса, не замечаются до перезапуска демона.
+    def _inotify_for(self, root: str):
+        """inotify-экземпляр эмиттера корня или None (не inotify, эмиттер снят).
+
+        В watchdog нет API добавить каталог в уже работающий эмиттер; цепочка
+        `InotifyEmitter._inotify._inotify` закреплена тестом
+        tests/test_watcher_instances.py.
         """
-        directory = str(path)
-        if directory in self._watched:
-            return False
+        watch = self._watches.get(root)
+        if watch is None or _Inotify is None:
+            return None
+        for emitter in list(getattr(self.observer, "emitters", ())):
+            if emitter.watch == watch:
+                inotify = getattr(getattr(emitter, "_inotify", None), "_inotify", None)
+                return inotify if isinstance(inotify, _Inotify) else None
+        return None
+
+    def _root_of(self, directory: str) -> tuple[str | None, int]:
+        """Ближайший корень, под которым лежит каталог, и глубина от него."""
+        best: str | None = None
+        best_abs = ""
+        for root in self._roots:
+            root_abs = os.path.abspath(root)
+            prefix = root_abs.rstrip(os.sep) + os.sep
+            if directory == root_abs or directory.startswith(prefix):
+                if len(root_abs) > len(best_abs):
+                    best, best_abs = str(root), root_abs
+        if best is None:
+            return None, 0
+        rel = os.path.relpath(directory, best_abs)
+        return best, 0 if rel == os.curdir else len(Path(rel).parts)
+
+    def _schedule(self, directory: str, recursive: bool) -> bool:
+        """Отдельный эмиттер на каталог. Звать под self._lock."""
         try:
-            self.observer.schedule(
+            watch = self.observer.schedule(
                 self._handler,
                 directory,
-                recursive=self._recursive,
+                recursive=recursive,
                 event_filter=self.EVENT_FILTER,
             )
         except OSError as exc:
+            _close_leaked_inotify(exc)
+            self._last_errno = exc.errno
             level = (
                 lg.debug
                 if self._ignore_permission_denied and exc.errno == errno.EACCES
@@ -199,7 +257,134 @@ class WatchDogAdapter:
             )
             return False
         self._watched.add(directory)
+        self._watches[directory] = watch
         return True
+
+    def _unschedule(self, directory: str) -> None:
+        """Снять эмиттер каталога. Звать под self._lock."""
+        self._watched.discard(directory)
+        watch = self._watches.pop(directory, None)
+        unschedule = getattr(self.observer, "unschedule", None)
+        if watch is None or unschedule is None:
+            return
+        try:
+            unschedule(watch)
+        except (KeyError, OSError):
+            # Эмиттер уже снят вместе с остановленным observer'ом.
+            lg.debug("наблюдение за %s уже снято", directory)
+
+    def _add_watches(
+        self, inotify, top: Path, max_depth: int | None
+    ) -> tuple[int, int]:
+        """Добавить каталоги поддерева в inotify-экземпляр эмиттера корня.
+
+        Без нового экземпляра: `fs.inotify.max_user_instances` (128) общий на
+        всего пользователя. Повторный add_watch на уже наблюдаемый каталог
+        безвреден — ядро возвращает тот же watch.
+        """
+        added = failed = 0
+        for directory in _walk_dirs(top, max_depth):
+            with self._lock:
+                if self._closing.is_set():
+                    break
+                try:
+                    inotify.add_watch(os.fsencode(directory))
+                except OSError as exc:
+                    failed += 1
+                    if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+                        # Каталог исчез во время обхода.
+                        continue
+                    self._last_errno = exc.errno
+                    # ENOSPC — исчерпан fs.inotify.max_user_watches: дальше
+                    # отказы пойдут на каждый каталог.
+                    lg.warning(
+                        "не удалось поставить наблюдение на %s (errno=%s %s), "
+                        "остальная часть дерева — только периодическим проходом",
+                        directory,
+                        exc.errno,
+                        exc.strerror,
+                    )
+                    break
+            added += 1
+        return added, failed
+
+    def _watch_tree(self, root: Path) -> tuple[int, int] | None:
+        """inotify: один экземпляр на корень, подкаталоги — add_watch в него.
+
+        Возвращает (поставлено, пропущено); None — эмиттер без ожидаемых
+        внутренностей watchdog: тогда на каждый каталог ставится свой эмиттер.
+        """
+        top = str(root)
+        with self._lock:
+            if self._closing.is_set():
+                return 0, 0
+            if top in self._watched:
+                return 0, 1
+            # recursive=False: обход со своими исключениями делаем сами,
+            # рекурсия watchdog'а их не знает.
+            if not self._schedule(top, recursive=False):
+                return 0, 1
+        inotify = self._inotify_for(top)
+        if inotify is None:
+            with self._lock:
+                self._unschedule(top)
+            return None
+        return self._add_watches(inotify, root, self._max_depth)
+
+    def watch_dir(self, path: str | Path) -> bool:
+        """Поставить наблюдение на каталог, появившийся после старта.
+
+        У `IN_MOVED_TO` нет бита `IN_CREATE`, поэтому watchdog не ставит watch
+        на каталог, ПЕРЕМЕЩЁННЫЙ внутрь дерева. На inotify каталог и его
+        поддерево добавляются в экземпляр корня, а не в новый эмиттер; без
+        inotify рекурсивное наблюдение корня уже покрывает каталог. Каталоги
+        глубже max_depth не наблюдаются, как и на старте.
+        """
+        directory = str(path)
+        root, depth = self._root_of(os.path.abspath(directory))
+        if root is not None and self._max_depth is not None:
+            if depth > self._max_depth:
+                return False
+        inotify_mode = self._inotify_mode()
+        inotify = self._inotify_for(root) if root is not None and inotify_mode else None
+        if inotify is not None:
+            limit = None if self._max_depth is None else self._max_depth - depth
+            added, _failed = self._add_watches(inotify, Path(directory), limit)
+            return added > 0
+        with self._lock:
+            if self._closing.is_set():
+                return False
+            # На inotify без доступа к экземпляру корня рекурсия watchdog'а не
+            # покрывает каталог, перенесённый извне, — ему нужен свой эмиттер.
+            if (
+                root is not None
+                and self._recursive
+                and root in self._watched
+                and not inotify_mode
+            ):
+                return False
+            if directory in self._watched:
+                return False
+            return self._schedule(directory, recursive=self._recursive)
+
+    def unwatch_dir(self, path: str | Path) -> None:
+        """Снять эмиттеры исчезнувшего каталога и его поддерева.
+
+        Иначе путь числится наблюдаемым навсегда, а `schedule()` по тому же
+        пути новый эмиттер не создаёт, пока старый лежит в observer: каталог,
+        созданный заново, остался бы без наблюдения. Корни не трогаем.
+        """
+        directory = str(path)
+        prefix = directory.rstrip(os.sep) + os.sep
+        roots = {str(root) for root in self._roots}
+        with self._lock:
+            gone = [
+                p
+                for p in self._watched
+                if (p == directory or p.startswith(prefix)) and p not in roots
+            ]
+            for p in gone:
+                self._unschedule(p)
 
     def _emit(self, event: WatchEvent) -> None:
         """Вызывается из потока watchdog — только через call_soon_threadsafe."""
@@ -230,38 +415,47 @@ class WatchDogAdapter:
             pass
 
     def _start_observer(self):
-        """Блокирующий старт наблюдения. Зовётся либо из потока, либо из теста.
+        """Блокирующий старт наблюдения. Зовётся из потока или из теста.
 
-        Observer поднимается ПУСТЫМ, наблюдения ставятся после — по одному.
-        Раньше всё расписание создавалось в конструкторе, и первый же отказ на
-        старте (упёрлись в `fs.inotify.max_user_watches`, каталог исчез,
-        нет прав) выключал наблюдение СРАЗУ ПО ВСЕМ путям. На домашнем
-        каталоге упор в лимит вероятен, и терять из-за него слежение за всеми
-        папками нельзя: лучше наблюдать за частью, чем ни за чем.
+        Observer поднимается пустым, наблюдения ставятся после — по одному:
+        отказ на одном пути (лимит `fs.inotify.max_user_watches`, каталог
+        исчез, нет прав) иначе снял бы наблюдение со всех остальных.
         """
-        try:
-            self.observer.start()
-        except OSError:
-            # Часть эмиттеров могла успеть подняться: без остановки их потоки
-            # переживут неудачный старт, а close() вызван не будет.
-            self.observer.stop()
-            self._loop = None
-            raise
+        with self._lock:
+            if self._closing.is_set():
+                return
+            try:
+                self.observer.start()
+            except OSError:
+                # Часть эмиттеров могла успеть подняться: без остановки их потоки
+                # переживут неудачный старт, а close() вызван не будет.
+                self.observer.stop()
+                self._loop = None
+                raise
+        inotify_mode = self._inotify_mode()
         scheduled = 0
         skipped = 0
         for root in self._roots:
+            counts = self._watch_tree(root) if inotify_mode else None
+            if counts is not None:
+                scheduled += counts[0]
+                skipped += counts[1]
+                continue
             for directory in _dirs_for_watch(root, self._max_depth):
                 if self.watch_dir(directory):
                     scheduled += 1
                 else:
                     skipped += 1
+        if self._closing.is_set():
+            return
         if not scheduled:
-            # Ни одного наблюдения — это уже не деградация, а отказ: пусть
-            # вызывающая сторона решает, что с этим делать.
+            # Ни одного наблюдения — уже отказ, а не деградация: решает
+            # вызывающая сторона. errno — настоящей причины: по нему run()
+            # выбирает подсказку (max_user_watches или max_user_instances).
             self.observer.stop()
             self._loop = None
             raise OSError(
-                errno.ENOSPC,
+                self._last_errno or errno.ENOSPC,
                 "не удалось поставить ни одного наблюдения "
                 f"(путей: {len(self._roots)})",
             )
@@ -271,11 +465,9 @@ class WatchDogAdapter:
     async def start_async(self):
         """Поднять наблюдение, не занимая event loop.
 
-        `observer.start()` для inotify выполняет обход всех подкаталогов и по
-        системному вызову на каждый, причём в потоке вызывающего: watchdog зовёт
-        `on_thread_start()` синхронно, до создания собственного потока. В
-        корутине это означает, что на старте демона и на каждом POST /config не
-        отвечают ни /health, ни /status, ни /search.
+        Постановка обходит дерево и делает по системному вызову на каждый
+        каталог; в корутине на это время не отвечали бы ни /health, ни
+        /status, ни /search — на старте демона и на каждом POST /config.
 
         Цикл захватывается здесь, а не в рабочем потоке: `call_soon_threadsafe`
         из колбэков watchdog'а должен знать, куда слать события.
@@ -285,12 +477,18 @@ class WatchDogAdapter:
         return self
 
     def close(self):
+        """Остановить наблюдение. Блокирует до конца текущей постановки —
+        из корутины звать через asyncio.to_thread."""
+        self._closing.set()
+        with self._lock:
+            # Дождаться постановки, идущей прямо сейчас: иначе её эмиттер
+            # переживёт observer.stop().
+            pass
         self.observer.stop()
         self._loop = None
 
     def __enter__(self):
-        # Синхронный вход остаётся для вызова вне event loop: цикл здесь тоже
-        # нужен, поэтому требуется работающий loop.
+        # Блокирующий вариант start_async: обход дерева идёт в потоке event loop.
         self._loop = asyncio.get_running_loop()
         self._start_observer()
         return self
@@ -315,8 +513,8 @@ class WatchDogAdapter:
                 except TimeoutError:
                     break
             if self.watch_filter:
-                # Каталоги мимо фильтра: он отбирает файлы по расширению,
-                # а у каталога расширения нет — иначе удаление папки терялось.
+                # Каталоги мимо фильтра: он отбирает файлы по расширению, и
+                # удаление папки иначе терялось бы.
                 batch = [
                     e
                     for e in batch

@@ -2,7 +2,7 @@ from typing import BinaryIO
 from zipfile import BadZipFile
 
 from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 from pptx.oxml.ns import qn
 
 from ._tables import Budget, split_parts, table_blocks
@@ -10,6 +10,7 @@ from .base import Parser, SkipFile, parser
 from .doc_model import Block, ParsedDoc
 from .docx_ooxml import letters, roman
 from .metadata import ooxml_properties
+from .ooxml_limits import oversize_reason
 
 BUDGET_TOKENS = 450  # чанк таблицы; «Документ: <имя>» сверху уложит его в 500
 
@@ -67,6 +68,8 @@ class PptxParser(Parser):
     def parse_io(self, file: BinaryIO) -> ParsedDoc:
         """Слайд — страница: заголовок слайда — раздел, текст фигур (группы раскрыты,
         автонумерация восстановлена), таблицы — сериями с шапкой, заметки — отдельно."""
+        if reason := oversize_reason(file):
+            raise SkipFile(reason)  # python-pptx распаковывает в память весь пакет
         meta, titles = ooxml_properties(file, "pptx")
         try:
             prs = Presentation(file)
@@ -93,6 +96,11 @@ class PptxParser(Parser):
                 if getattr(sh, "has_table", False) and sh.has_table:
                     tables.append(sh.table)
                 elif getattr(sh, "has_text_frame", False) and sh.has_text_frame:
+                    if (
+                        sh.is_placeholder
+                        and sh.placeholder_format.type == PP_PLACEHOLDER.SLIDE_NUMBER
+                    ):
+                        continue  # номер слайда — не содержание, в отличие от «85%»
                     if text := _frame_text(sh.text_frame):
                         blocks.append(Block(text, page=n))
             # Нет фигуры-заголовка: короткая первая строка слайда и есть его заголовок.

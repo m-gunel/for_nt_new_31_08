@@ -1,4 +1,4 @@
-"""Шаг 6: копии одного файла в выдаче, пропуск битых файлов, кодировки, регистр."""
+"""Копии одного файла в выдаче, пропуск битых файлов, кодировки, регистр."""
 
 import codecs
 from pathlib import Path
@@ -142,6 +142,34 @@ def test_txt_encoding_detection(data, encoding):
     assert text.lstrip("﻿").startswith("Отчёт")
 
 
+_LOG = b"2026-10-08 12:00:01 INFO connection pool ok, host=db01 port=5432\n" * 800
+_RU = ("Отчёт о проверке филиала банка.\n" * 50).encode()
+
+
+@pytest.mark.parametrize(
+    "tail", ["Ошибка подключения к базе", "Ок"], ids=["phrase", "word"]
+)
+def test_cp1251_words_in_long_ascii_log(tail):
+    """Русских букв меньше одной на тысячу символов — всё равно cp1251, а не ромбы."""
+    text, found = decode_text(_LOG + (tail + "\n").encode("cp1251"))
+    assert found == "cp1251"
+    assert text.endswith(tail + "\n") and "\ufffd" not in text
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        _LOG + "Ошибка подключения к базе\n".encode() + b"\xff",
+        _RU + b"\xff\xfe\xfd",
+        _RU[:-2],  # обрезан посреди последней буквы
+    ],
+    ids=["log", "three-bad", "truncated"],
+)
+def test_utf8_with_few_broken_bytes_stays_utf8(data):
+    text, found = decode_text(data)
+    assert (found, text) == ("utf-8", data.decode("utf-8", "replace"))
+
+
 def test_request_parameters_ignore_case():
     request = SearchRequest(
         query="отчёт", query_type="Hybrid", sources=["Files", " EMAIL "]
@@ -172,20 +200,38 @@ async def _fail_calls(path: Path) -> list[bool]:
 
 
 @pytest.mark.asyncio
-async def test_pdf_without_text_is_retried_and_explained(tmp_path, caplog):
-    path = tmp_path / "скан.pdf"
+async def test_pdf_without_text_and_scans_is_skipped_until_changed(tmp_path, caplog):
+    path = tmp_path / "пустой.pdf"
     with pymupdf.open() as doc:
         doc.new_page()
         doc.new_page()
         doc.save(str(path))
     with caplog.at_level("WARNING"):
-        assert await _fail_calls(path) == [
-            False
-        ]  # не готов навсегда: повтор на следующем проходе
+        # Распознавать нечего: повтор дал бы то же — пропуск до изменения файла.
+        assert await _fail_calls(path) == [True]
     assert any(
-        "нет текстового слоя (2 стр." in r.getMessage() and r.exc_info is None
+        "нет текстового слоя (2 стр., из них сканов 0" in r.getMessage()
+        and r.exc_info is None
         for r in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_pdf_scan_without_ocr_is_retried(tmp_path, monkeypatch, caplog):
+    import src.parsers.pdf as pdf_parser
+
+    path = tmp_path / "скан.pdf"
+    with pymupdf.open() as doc:
+        page = doc.new_page()
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 60, 80), False)
+        pix.clear_with(200)
+        page.insert_image(page.rect, pixmap=pix)  # страница-картинка: скан
+        doc.save(str(path))
+    monkeypatch.setattr(pdf_parser, "recognize", lambda file, pages: {})  # OCR нет
+    with caplog.at_level("WARNING"):
+        # OCR может появиться (tessdata, включение в конфиге) — повтор на проходе.
+        assert await _fail_calls(path) == [False]
+    assert any("сканов 1, распознано OCR 0" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio

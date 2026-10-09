@@ -1,18 +1,13 @@
-"""Тесты регистрации MCP-моста в конфигах агентов.
+"""Регистрация MCP-моста в конфигах агентов.
 
-Фиксируют ровно ту схему, на которой продукт сломался: запись клалась в
-`mcp.servers.<имя>`, хотя ключи внутри `mcp` — это сами имена серверов. Агент
-читал её как сервер с именем "servers" без обязательных type и command, не
-проходил валидацию и отбрасывал ВЕСЬ конфиг — в интерфейсе это выглядело как
-«MCP не настроены». Регрессия сюда молча вернуться не должна.
+Запись лежит в `mcp.<имя>`, а не в `mcp.servers.<имя>`: ключи внутри `mcp` —
+сами имена серверов, и сервер "servers" без type и command агент счёл бы
+невалидным и отбросил бы весь конфиг.
 
-Второй слой — дома. На SberOS у пользователя pw_dir и $HOME терминала — разные
-каталоги, и 1.0.6 писал только в $HOME. Здесь проверяется обход домов, защита
-от запуска под root и --doctor, который по одному выводу объясняет, почему
-у агента нет инструментов (в том числе нечитаемые юниты, как у 1.0.6).
+На SberOS pw_dir и $HOME терминала — разные каталоги, писать надо в оба.
+Проверяются обход домов, отказ от записи под root и --doctor.
 
 Скрипт лежит в scripts/ и пакетом не является, поэтому грузится по пути.
-Тяжёлых зависимостей у него нет — только stdlib.
 """
 
 import importlib.util
@@ -62,10 +57,8 @@ def _isolate_homes(tmp_path, monkeypatch):
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("SUDO_USER", raising=False)
     monkeypatch.setenv(reg.UNIT_DIR_ENV, str(tmp_path / "no-units"))
-    # Сборка в Dockerfile гоняет pytest от root, а от root скрипт не пишет
-    # вовсе (root_refusal). Запрет проверяют тесты с _as_root, остальным нужен
-    # обычный запуск: подменяем только euid, по которому решает root_refusal,
-    # а uid и права ФС остаются настоящими.
+    # pytest в Dockerfile идёт от root, а от root скрипт не пишет (root_refusal).
+    # Подменяем только euid, по которому он решает; uid и права ФС — настоящие.
     if os.geteuid() == 0:
         monkeypatch.setattr(os, "geteuid", lambda: 1000)
 
@@ -161,9 +154,6 @@ def _tree(path):
     return result
 
 
-# --- схема opencode (Workspace Computer) ------------------------------------
-
-
 def test_opencode_entry_lies_directly_under_mcp(home, launcher):
     """Ключ — mcp.<имя>. Никакого промежуточного "servers"."""
     (home / ".wsc" / "config").mkdir(parents=True)
@@ -247,7 +237,7 @@ def test_idempotent_second_run_does_not_rewrite(home, launcher):
 
 
 def test_keeps_existing_file_mode(home, launcher):
-    """Права чужого конфига не понижаем — раньше он безусловно уезжал в 0600."""
+    """Права чужого конфига не понижаются."""
     cfg_dir = home / ".wsc" / "config"
     cfg_dir.mkdir(parents=True)
     target = cfg_dir / "wsc.json"
@@ -316,11 +306,8 @@ def test_remove_drops_entry_but_keeps_the_rest(home, launcher):
     assert "mcp" not in data
 
 
-# --- миграция со сломанной схемы --------------------------------------------
-
-
 def test_migration_removes_broken_servers_key(home, launcher):
-    """Наследство прежней версии: невалидный mcp.servers надо снять."""
+    """Невалидный mcp.servers от прежней схемы снимается."""
     cfg_dir = home / ".wsc" / "config"
     cfg_dir.mkdir(parents=True)
     (cfg_dir / "wsc.json").write_text(
@@ -363,9 +350,6 @@ def test_legacy_target_is_cleaned_but_not_written_to(home, launcher):
     assert "mcp" not in data
 
 
-# --- схема mcpServers (GigaCode) --------------------------------------------
-
-
 def test_gigacode_uses_flat_mcp_servers_with_string_command(home, launcher):
     """У GigaCode схема ДРУГАЯ: command строкой, args отдельно, env — и всё."""
     (home / ".gigacode").mkdir()
@@ -403,6 +387,117 @@ def test_gigacode_rewrites_old_entry_with_type_stdio(home, launcher):
     assert entry["command"] == launcher
 
 
+def _opt_out_wsc_entry(launcher, **override):
+    """Запись WSC закрытой установки: выключена в агенте, write-инструменты скрыты."""
+    entry = {
+        "type": "local",
+        "command": [launcher],
+        "enabled": False,
+        "timeout": reg.MCP_TIMEOUT_MS,
+        "environment": {"LQRAG_TIMEOUT": reg.BRIDGE_TIMEOUT_S, "LQRAG_ALLOW_WRITE": "0"},
+    }
+    entry.update(override)
+    return entry
+
+
+def test_wsc_opt_out_is_not_rewritten(home, launcher):
+    """enabled: false и LQRAG_ALLOW_WRITE=0 — выбор пользователя: файл не трогаем."""
+    cfg = home / ".wsc" / "config" / "wsc.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(json.dumps({"mcp": {"localrag": _opt_out_wsc_entry(launcher)}}), encoding="utf-8")
+    before = cfg.read_bytes()
+
+    assert _run("wsc", home, launcher) == reg.UNCHANGED
+
+    assert cfg.read_bytes() == before
+
+
+def test_stale_wsc_entry_is_updated_but_keeps_opt_out(home, launcher):
+    """Свои поля (command, timeout, LQRAG_TIMEOUT) обновляем, поля пользователя сохраняем."""
+    cfg = home / ".wsc" / "config" / "wsc.json"
+    cfg.parent.mkdir(parents=True)
+    old = _opt_out_wsc_entry(
+        "/old/mcp_launcher.sh",
+        timeout=5000,
+        environment={"LQRAG_TIMEOUT": "30", "LQRAG_ALLOW_WRITE": "0", "LQRAG_AUTOSTART": "0"},
+    )
+    cfg.write_text(json.dumps({"mcp": {"localrag": old}}), encoding="utf-8")
+
+    assert _run("wsc", home, launcher) == reg.WRITTEN
+
+    entry = _read(cfg)["mcp"]["localrag"]
+    assert entry["command"] == [launcher]
+    assert entry["timeout"] == reg.MCP_TIMEOUT_MS
+    assert entry["enabled"] is False
+    assert entry["environment"] == {
+        "LQRAG_TIMEOUT": reg.BRIDGE_TIMEOUT_S,
+        "LQRAG_ALLOW_WRITE": "0",
+        "LQRAG_AUTOSTART": "0",
+    }
+
+
+def test_wsc_entry_keys_outside_schema_are_still_dropped(home, launcher):
+    """Сохраняются только enabled и environment: лишний ключ отверг бы весь конфиг."""
+    cfg = home / ".wsc" / "config" / "wsc.json"
+    cfg.parent.mkdir(parents=True)
+    entry = _opt_out_wsc_entry(launcher, env={"LQRAG_TIMEOUT": "30"})
+    cfg.write_text(json.dumps({"mcp": {"localrag": entry}}), encoding="utf-8")
+
+    assert _run("wsc", home, launcher) == reg.WRITTEN
+
+    entry = _read(cfg)["mcp"]["localrag"]
+    assert "env" not in entry
+    assert entry["enabled"] is False
+    assert entry["environment"]["LQRAG_ALLOW_WRITE"] == "0"
+
+
+def test_gigacode_entry_keeps_opt_out_in_env(home, launcher):
+    """У GigaCode opt-out — в env: command и type прежней версии чинятся, env пользователя остаётся."""
+    settings = home / ".gigacode" / "settings.json"
+    settings.parent.mkdir()
+    env = {"LQRAG_TIMEOUT": reg.BRIDGE_TIMEOUT_S, "LQRAG_ALLOW_WRITE": "0"}
+    old = {"type": "stdio", "command": "/old/mcp_launcher.sh", "args": [], "env": dict(env)}
+    settings.write_text(json.dumps({"mcpServers": {"localrag": old}}), encoding="utf-8")
+
+    assert _run("gigacode", home, launcher) == reg.WRITTEN
+
+    assert _read(settings)["mcpServers"]["localrag"] == {"command": launcher, "args": [], "env": env}
+    assert _run("gigacode", home, launcher) == reg.UNCHANGED
+
+
+def test_unit_run_keeps_opt_out_in_both_agents(home, launcher, capsys):
+    """Ровно запуск юнита (--all): opt-out в обоих агентах переживает прогон."""
+    wsc = home / ".wsc" / "config" / "wsc.json"
+    wsc.parent.mkdir(parents=True)
+    wsc.write_text(json.dumps({"mcp": {"localrag": _opt_out_wsc_entry(launcher)}}), encoding="utf-8")
+    giga = home / ".gigacode" / "settings.json"
+    giga.parent.mkdir()
+    env = {"LQRAG_TIMEOUT": reg.BRIDGE_TIMEOUT_S, "LQRAG_ALLOW_WRITE": "0"}
+    giga.write_text(
+        json.dumps({"mcpServers": {"localrag": {"command": launcher, "args": [], "env": env}}}),
+        encoding="utf-8",
+    )
+    before = [wsc.read_bytes(), giga.read_bytes()]
+
+    assert _main(launcher, "--all") == 0
+
+    assert [wsc.read_bytes(), giga.read_bytes()] == before
+    assert capsys.readouterr().out.count("без изменений") == 2
+
+
+def test_allow_write_flag_overrides_opt_out(home, launcher):
+    """Явный --allow-write сильнее записанного LQRAG_ALLOW_WRITE=0; enabled не трогает."""
+    cfg = home / ".wsc" / "config" / "wsc.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(json.dumps({"mcp": {"localrag": _opt_out_wsc_entry(launcher)}}), encoding="utf-8")
+
+    assert _run("wsc", home, launcher, allow_write=True) == reg.WRITTEN
+
+    entry = _read(cfg)["mcp"]["localrag"]
+    assert entry["environment"]["LQRAG_ALLOW_WRITE"] == "1"
+    assert entry["enabled"] is False
+
+
 def test_broken_config_in_one_target_does_not_stop_another(home, launcher):
     """Юнит дёргается автоматически: один битый файл не должен ронять прогон."""
     (home / ".wsc" / "config").mkdir(parents=True)
@@ -428,6 +523,42 @@ def test_backup_is_made_once_before_first_edit(home, launcher):
     assert backup.read_text(encoding="utf-8") == original
 
 
+def test_every_rewrite_of_commented_file_is_backed_up(home, launcher, capsys):
+    """Комментарии JSON не сохраняет: копия — при каждой перезаписи файла с ними, а не только первой."""
+    cfg_dir = home / ".wsc" / "config"
+    cfg_dir.mkdir(parents=True)
+    cfg = cfg_dir / "wsc.json"
+    first = "// первый\n{}\n"
+    cfg.write_text(first, encoding="utf-8")
+    assert _run("wsc", home, launcher) == reg.WRITTEN
+    later = []
+    for comment in ("// второй", "// третий"):
+        # Агент переписал конфиг без нашей записи и с новыми комментариями.
+        text = '%s\n{"permission": {"bash": "ask"}}\n' % comment
+        cfg.write_text(text, encoding="utf-8")
+        later.append(text)
+        assert _run("wsc", home, launcher) == reg.WRITTEN
+
+    assert (cfg_dir / "wsc.json.localrag-backup").read_text(encoding="utf-8") == first
+    copies = sorted(cfg_dir.glob("wsc.json.localrag-backup-*"))
+    assert sorted(p.read_text(encoding="utf-8") for p in copies) == sorted(later)
+    assert "комментарии при записи не сохраняются" in capsys.readouterr().err
+
+
+def test_rewrite_without_comments_adds_no_copies(home, launcher):
+    """Без комментариев терять нечего: копии рядом с конфигом не копятся."""
+    cfg_dir = home / ".wsc" / "config"
+    cfg_dir.mkdir(parents=True)
+    cfg = cfg_dir / "wsc.json"
+    cfg.write_text(json.dumps({"permission": {}}), encoding="utf-8")
+    _run("wsc", home, launcher)
+    cfg.write_text(json.dumps({"permission": {"bash": "ask"}}), encoding="utf-8")
+
+    assert _run("wsc", home, launcher) == reg.WRITTEN
+
+    assert sorted(p.name for p in cfg_dir.iterdir()) == ["wsc.json", "wsc.json.localrag-backup"]
+
+
 def test_dry_run_changes_nothing(home, launcher):
     cfg_dir = home / ".wsc" / "config"
     cfg_dir.mkdir(parents=True)
@@ -435,9 +566,6 @@ def test_dry_run_changes_nothing(home, launcher):
     _run("wsc", home, launcher, dry_run=True)
 
     assert not (cfg_dir / "wsc.json").exists()
-
-
-# --- дома -------------------------------------------------------------------
 
 
 def test_discover_homes_puts_pw_dir_first_and_adds_sberos_pair(sberos):
@@ -620,9 +748,6 @@ def test_list_shows_targets_for_each_home(home, launcher, capsys):
     assert str(home / ".wsc" / "config" / "wsc.json") in capsys.readouterr().out
 
 
-# --- статусы целей и --strict -----------------------------------------------
-
-
 def test_process_target_returns_status(home, launcher):
     """По статусу main() решает про код --strict и про фразу о перезапуске."""
     assert _run("gigacode", home, launcher) == reg.SKIPPED
@@ -644,7 +769,7 @@ def test_strict_zero_when_agent_found(home, launcher):
 def test_strict_three_when_no_agent_anywhere(home, launcher):
     """Ни одного агента ни в одном доме — не ошибка, но и не «выполнено»."""
     assert _main(launcher, "--strict") == 3
-    assert _main(launcher) == 0  # без --strict код прежний
+    assert _main(launcher) == 0  # без --strict — 0
 
 
 def test_strict_one_when_a_target_fails(home, launcher, capsys):
@@ -671,6 +796,40 @@ def test_strict_one_when_legacy_cleanup_fails(home, launcher):
     assert _main(launcher, "--strict") == 1
 
 
+def test_non_utf8_config_fails_only_its_target(home, launcher, capsys):
+    """Конфиг не в UTF-8 — ОШИБКА своей цели; следующая цель регистрируется, прогон не падает."""
+    settings = home / ".gigacode" / "settings.json"
+    settings.parent.mkdir()
+    raw = '{"ide": {}, "note": "закрытая установка"}'.encode("cp1251")
+    settings.write_bytes(raw)
+    (home / ".wsc").mkdir()
+
+    assert _main(launcher) == 0
+
+    err = capsys.readouterr().err
+    assert "ОШИБКА" in err and "UTF-8" in err
+    assert settings.read_bytes() == raw
+    assert "localrag" in _read(home / ".wsc" / "config" / "wsc.json")["mcp"]
+    assert _main(launcher, "--strict") == 1
+
+
+def test_unexpected_error_in_one_target_does_not_stop_others(home, launcher, capsys):
+    """Непредвиденный сбой цели — её ОШИБКА, а не обрыв прогона.
+
+    Одиночный суррогат в JSON читается, но обратно в UTF-8 не кодируется.
+    """
+    settings = home / ".gigacode" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_text('{"note": "\\ud800"}', encoding="utf-8")
+    (home / ".wsc").mkdir()
+
+    assert _main(launcher) == 0
+
+    assert "ОШИБКА" in capsys.readouterr().err
+    assert "localrag" in _read(home / ".wsc" / "config" / "wsc.json")["mcp"]
+    assert _main(launcher, "--strict") == 1
+
+
 def test_strict_one_when_no_homes_found(tmp_path, launcher, monkeypatch):
     monkeypatch.delenv(reg.HOMES_ENV)
     monkeypatch.setattr(reg, "_passwd_entry", lambda: (None, None))
@@ -687,6 +846,7 @@ def test_strict_with_config(tmp_path, launcher):
     cfg.write_text("[1, 2", encoding="utf-8")
     assert _main(launcher, "--strict", "--config", str(cfg)) == 1
     assert _main(launcher, "--strict", "--config", str(tmp_path / "nope" / "cfg.json")) == 3
+    assert not (tmp_path / "nope").exists()
 
 
 def test_restart_hint_only_when_something_written(home, launcher, capsys):
@@ -724,9 +884,6 @@ def test_restart_hint_not_for_legacy_cleanup_only(home, launcher, capsys):
     out = capsys.readouterr().out
     assert "вычищен невалидный mcp.servers" in out
     assert "Перезапустите агента" not in out
-
-
-# --- подложенные симлинки ---------------------------------------------------
 
 
 def _victim(tmp_path, name="victim.txt", mode=0o600):
@@ -829,9 +986,6 @@ def test_new_config_is_created_0600(home, launcher):
     assert stat.S_IMODE((cfg_dir / "wsc.json").stat().st_mode) == 0o600
 
 
-# --- запуск от root ---------------------------------------------------------
-
-
 def test_root_refuses_to_write_without_explicit_homes(sberos, launcher, monkeypatch, capsys):
     """sudo python3 register_mcp.py не должен оставить конфиги с владельцем root."""
     (sberos.pw_dir / ".wsc").mkdir()
@@ -882,8 +1036,7 @@ def test_real_root_may_dry_run_explicit_home(sberos, launcher, monkeypatch, caps
 def test_root_refuses_every_writing_mode(sberos, launcher, monkeypatch, capsys, mode):
     """От root не пишем НИЧЕГО — ни по найденным домам, ни по явным, ни в --config.
 
-    Явный дом и --config раньше пропускались с chown на владельца, и root
-    ходил по подложенным в пользовательский каталог симлинкам.
+    Иначе root ходил бы по симлинкам, подложенным в пользовательский каталог.
     """
     for home in (sberos.pw_dir, sberos.work):
         (home / ".wsc" / "config").mkdir(parents=True)
@@ -919,7 +1072,7 @@ def test_root_refuses_every_writing_mode(sberos, launcher, monkeypatch, capsys, 
 
 
 def test_allow_root_flag_is_gone(launcher, monkeypatch):
-    """Флага, открывавшего root'у запись, больше нет — argparse его не знает."""
+    """Флага --allow-root нет — argparse его не знает."""
     _as_real_root(monkeypatch)
 
     with pytest.raises(SystemExit) as exc:
@@ -939,9 +1092,6 @@ def test_root_refusal_names_owner_of_explicit_home(tmp_path, launcher, monkeypat
     assert _main(launcher, "--home", str(tmp_path)) == 2
 
     assert "runuser -u %s -- python3" % owner in capsys.readouterr().err
-
-
-# --- --doctor ---------------------------------------------------------------
 
 
 def _doctor(launcher, capsys, *argv):
@@ -967,7 +1117,7 @@ def test_doctor_shows_identity_and_homes(sberos, launcher, capsys):
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root читает файл с правами 000")
 def test_doctor_reports_unreadable_unit(tmp_path, launcher, monkeypatch, capsys):
-    """Случай 1.0.6: юниты 0600 root, systemd --user отвечает «could not be found»."""
+    """Юниты 0600 root: systemd --user отвечает «could not be found»."""
     units = tmp_path / "units"
     units.mkdir()
     broken = units / "lib-local-rag.service"
@@ -1039,6 +1189,28 @@ def test_doctor_reports_stale_entry_duplicate_and_hides_env(home, launcher, caps
     assert (cfg_dir / "wsc.json").read_bytes() == before
 
 
+def test_doctor_accepts_opt_out(home, launcher, capsys):
+    """Opt-out — допустимая запись, а не «УСТАРЕЛА»: --doctor не подталкивает его откатить."""
+    cfg_dir = home / ".wsc" / "config"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "wsc.json").write_text(
+        json.dumps({"mcp": {"localrag": _opt_out_wsc_entry(launcher)}}), encoding="utf-8"
+    )
+    (home / ".gigacode").mkdir()
+    env = {"LQRAG_TIMEOUT": reg.BRIDGE_TIMEOUT_S, "LQRAG_ALLOW_WRITE": "0"}
+    (home / ".gigacode" / "settings.json").write_text(
+        json.dumps({"mcpServers": {"localrag": {"command": launcher, "args": [], "env": env}}}),
+        encoding="utf-8",
+    )
+
+    out = _doctor(launcher, capsys)
+
+    states = [line for line in out.splitlines() if "запись:" in line]
+    assert len(states) == 2
+    assert not any("УСТАРЕЛА" in line for line in states)
+    assert "выключена в агенте" in _line(out, "запись:    есть, но")
+
+
 def test_doctor_finds_duplicate_in_gigacode_args(home, launcher, capsys):
     (home / ".gigacode").mkdir()
     (home / ".gigacode" / "settings.json").write_text(
@@ -1049,3 +1221,13 @@ def test_doctor_finds_duplicate_in_gigacode_args(home, launcher, capsys):
     out = _doctor(launcher, capsys)
 
     assert "«rag-sh»" in _line(out, "дубль")
+
+
+def test_doctor_reports_non_utf8_config(home, launcher, capsys):
+    """--doctor не падает на конфиге не в UTF-8, а называет причину."""
+    (home / ".gigacode").mkdir()
+    (home / ".gigacode" / "settings.json").write_bytes('{"note": "привет"}'.encode("cp1251"))
+
+    line = _line(_doctor(launcher, capsys), "НЕ ЧИТАЕТСЯ")
+
+    assert "UTF-8" in line

@@ -1,40 +1,17 @@
-"""Две регрессии на «одна строка данных гасит целую функцию».
+"""Одна строка данных не должна гасить целую функцию.
 
-1. `SearchResponse.from_dataframes` (src/server/model.py) индексировала
-   `row["meta"]["original_name"]`. Колонка `meta` в схеме чанка nullable
-   (src/common/doc_meta.py), то есть строка с `meta=None` — законное
-   содержимое таблицы: она могла быть записана до появления метаданных,
-   мигрирована из старой схемы или вставлена руками. Одной такой строки в
-   выдаче хватало, чтобы весь POST /search отдал 500 с
-   `TypeError: 'NoneType' object is not subscriptable` — падали и все
-   остальные, совершенно здоровые результаты.
+Колонка `meta` в схеме чанка nullable (src/common/doc_meta.py), и строка с
+`meta=None` не должна ронять весь POST /search в 500.
 
-2. `_process_email_chunks` (src/parsers/__init__.py) разбирала ключ письма
-   через `p.split(":")` в ровно три части. Ключ имеет вид
-   `email_<папка>:<start>:<stop>`, а имя почтовой папки само может содержать
-   двоеточие («Входящие:Архив 2024» — обычное дело для IMAP-иерархии).
-   Тогда `split` давал четыре части и более, распаковка бросала ValueError,
-   письмо гасил внешний `except Exception` в `async_parse_files` — и оно не
-   индексировалось никогда.
-
-   Тот же ключ разбирает и ручка `POST /api/v1/get_file_path`
-   (src/server/router.py): она резала его `split(":", 3)` слева и на папке с
-   двоеточием давала 400 «invalid offsets». Теперь разбор вынесен в
-   `_EMAIL_PATH_RE`, и он стережётся здесь же — так закреплены обе половины
-   контракта: и индексация письма, и его открытие.
-
-Почему второй дефект проверяется прямым вызовом `_process_email_chunks`, а
-не через `async_parse_files`: снаружи дефект НЕОТЛИЧИМ от штатной ситуации.
-`async_parse_files` ловит любое исключение письма и зовёт
-`fail_cb(permanent=False)` — ровно то же самое, что происходит, когда папка
-не открылась («no file for prefix»). Именно поэтому дефект и жил незамеченным:
-в логе — обычная строчка, в очереди — обычный повтор. Различает старый и
-новый код только уровень самой `_process_email_chunks`: раньше на ключе с
-двоеточием в имени папки она бросала ValueError, не дойдя ни до чтения, ни до
-разбора; теперь доходит и отдаёт чанки.
+Ключ письма — `email_<папка>:<start>:<stop>`, а имя IMAP-папки само может
+содержать двоеточие («Входящие:Архив 2024»). Ключ разбирают и индексация
+(`_process_email_chunks`), и ручка `POST /api/v1/get_file_path`
+(`_EMAIL_PATH_RE`). `_process_email_chunks` зовётся напрямую: снаружи
+`async_parse_files` гасит исключение письма в `fail_cb(permanent=False)`, и
+сбой разбора неотличим от штатного повтора.
 
 Модель эмбеддингов не поднимается: mbox подставной, а сплиттер подменён —
-настоящий меряет длину токенизатором OpenVINO и тянет за собой модель.
+настоящий меряет длину токенизатором OpenVINO.
 """
 
 from typing import Any
@@ -52,20 +29,12 @@ from src.server.model import SearchResponse
 from src.server.router import _EMAIL_PATH_RE
 from tests.mbox_fixture import make_plain_email
 
-# ==========================================================================
-# Дефект 1: строка без метаданных в выдаче поиска
-# ==========================================================================
-
 _FILE_PATH = "/home/user/Документы/Договор поставки.pdf"
 
 
 def _frame_with_null_struct_meta(path: str, text: str, score: float) -> pl.DataFrame:
-    """Кадр ровно в той форме, в какой его отдаёт LanceDB: meta — null-struct.
-
-    Схема колонки — настоящая `doc_meta_schema`, значение — null (см.
-    `_mixed_rows` в tests/test_source_separation.py: точно так же там
-    собирается таблица со строками без метаданных).
-    """
+    """Кадр в той форме, в какой его отдаёт LanceDB: meta — null-struct
+    настоящей `doc_meta_schema`."""
     frame = pl.from_arrow(
         pa.table(
             {
@@ -77,9 +46,8 @@ def _frame_with_null_struct_meta(path: str, text: str, score: float) -> pl.DataF
             }
         )
     )
-    # Предпосылка кадра — явно, чтобы смена поведения polars была видна как
-    # падение с внятным сообщением, а не как молча выродившийся тест: если
-    # null-struct вдруг доедет чем-то осмысленным, проверять тут нечего.
+    # Предпосылка проверяется явно: смена поведения polars должна давать
+    # внятное падение, а не молча выродившийся тест.
     row = next(frame.iter_rows(named=True))  # type: ignore[union-attr]
     assert row["meta"] is None or all(v is None for v in row["meta"].values()), (
         "кадр обязан доносить до модели именно отсутствие метаданных"
@@ -90,10 +58,9 @@ def _frame_with_null_struct_meta(path: str, text: str, score: float) -> pl.DataF
 def _frame_with_null_meta_column(path: str, text: str, score: float) -> pl.DataFrame:
     """Тот же случай, но колонка meta собрана polars'ом из чистых None.
 
-    Две формы одного и того же кадра — намеренно. Как polars отдаёт наружу
-    null-struct (`None` или словарь из `None`), зависит от его версии, а вот
-    колонка из одних None доезжает до `from_dataframes` как None при любой.
-    Так хотя бы один из двух прогонов гарантированно воспроизводит дефект.
+    Как polars отдаёт null-struct (`None` или словарь из `None`), зависит от
+    версии, а колонка из одних None доезжает до `from_dataframes` как None при
+    любой.
     """
     return pl.DataFrame(
         {
@@ -127,12 +94,7 @@ def _search_frame(rows: list[tuple[str, str, dict[str, Any] | None, float]]):
     ids=["null-struct", "null-column"],
 )
 def test_row_without_meta_does_not_break_the_whole_search(make_frame):
-    """Строка с meta=None не должна ронять весь ответ поиска.
-
-    Раньше `row["meta"]["original_name"]` на такой строке бросало TypeError,
-    и POST /search отдавал 500 целиком — вместе со всеми здоровыми
-    результатами. Титул при отсутствии метаданных берётся из имени файла.
-    """
+    """Строка с meta=None не роняет весь ответ; титул берётся из имени файла."""
     frame = make_frame(_FILE_PATH, "предмет договора и сроки поставки", 0.73)
 
     response = SearchResponse.from_dataframes([frame])
@@ -153,16 +115,9 @@ def test_row_without_meta_does_not_break_the_whole_search(make_frame):
 def test_row_without_meta_does_not_hide_title_of_its_neighbour():
     """Соседний чанк того же файла с метаданными всё ещё даёт титул.
 
-    Строка без meta стоит ПЕРВОЙ намеренно: старый код падал на ней, не успев
-    дойти до строки с метаданными, и терялся не только титул, а весь ответ.
-
-    Строка без метаданных приходит отдельным кадром, а не соседней строкой
-    arrow-таблицы: `from_dataframes` принимает выдачи нескольких источников и
-    склеивает их строки по порядку, так что первой она быть не перестала,
-    зато колонка из одних None гарантированно доезжает до модели как None
-    (arrow'ов null-struct polars иных версий отдаёт словарём из None — на нём
-    старое `row["meta"]["original_name"]` не упало бы, и тест был бы зелёным
-    ещё до правки).
+    Строка без meta идёт первой и отдельным кадром: `from_dataframes`
+    склеивает кадры по порядку, а колонка из одних None доезжает до модели как
+    None при любой версии polars.
     """
     frames = [
         _frame_with_null_meta_column(_FILE_PATH, "второй кусок договора", 0.41),
@@ -190,10 +145,9 @@ def test_row_without_meta_does_not_hide_title_of_its_neighbour():
 
 
 def test_email_row_without_meta_stays_an_email():
-    """Письмо без метаданных не должно ни падать, ни менять тип на «файл».
+    """Письмо без метаданных не падает и не становится «файлом».
 
-    Тот же TypeError, но на почтовой строке: тип определяется по пути, а не
-    по meta, и титулом становится сам ключ письма.
+    Тип определяется по пути, а не по meta; титул — сам ключ письма.
     """
     key = "email_Входящие:Архив 2024:100:250:body"
     frame = _frame_with_null_meta_column(key, "текст письма без метаданных", 0.5)
@@ -205,10 +159,6 @@ def test_email_row_without_meta_stays_an_email():
     assert item.title == key
     assert item.id == key
 
-
-# ==========================================================================
-# Дефект 2: двоеточие в имени почтовой папки
-# ==========================================================================
 
 _SUBJECT = "Протокол совещания"
 _BODY = "Коллеги, регламент согласован."
@@ -223,11 +173,8 @@ _MBOX = b"F" * _START + _MESSAGE + b"\nFrom hvost@fixture\n\n"
 
 
 class _FakeMbox:
-    """Подставной mbox с интерфейсом aiofiles, запоминающий запросы.
-
-    Настоящий файл здесь не нужен и даже вреден: проверяется, что письмо
-    ищут по правильному смещению, а `seeks`/`reads` говорят об этом прямо.
-    """
+    """Подставной mbox с интерфейсом aiofiles: `seeks`/`reads` показывают,
+    по какому смещению искали письмо."""
 
     def __init__(self, data: bytes) -> None:
         self._data = data
@@ -259,13 +206,10 @@ class _RecordingFailCb:
 
 @fixture
 def one_chunk_splitter(config: Config, monkeypatch):
-    """Сплиттер-заглушка вместо настоящего.
+    """Сплиттер-заглушка: настоящий `cfg.embed_splitter` поднимает OpenVINO.
 
-    Настоящий `cfg.embed_splitter` меряет длину токенизатором OpenVINO, то
-    есть поднимает модель ради разбора одного ключа. Значение cached_property
-    лежит в `__dict__` инстанса (тем же и пользуются соседние тесты, делая
-    `config.__dict__.pop("lance")`), поэтому monkeypatch.setitem подменяет его
-    и возвращает всё как было.
+    Значение cached_property лежит в `__dict__` инстанса, и monkeypatch.setitem
+    подменяет его с откатом.
     """
 
     class _Splitter:
@@ -280,7 +224,7 @@ def one_chunk_splitter(config: Config, monkeypatch):
 @pytest.mark.parametrize(
     "folder",
     [
-        "INBOX",  # контроль: обычная папка, этот случай работал и раньше
+        "INBOX",  # контроль: обычная папка
         "Входящие:Архив 2024",
         "Проекты:2024:Q1",
     ],
@@ -290,10 +234,8 @@ async def test_email_key_offsets_are_the_last_two_fields(
 ):
     """Смещения письма — два последних поля ключа, всё до них — имя папки.
 
-    Раньше ключ резался `split(":")` ровно на три части, поэтому письмо из
-    папки с двоеточием в имени давало ValueError: разбор не доходил ни до
-    чтения mbox, ни до чанков, а внешний `except` в `async_parse_files`
-    превращал это в «попробуем в следующий раз» — то есть навсегда.
+    Иначе письмо из папки с двоеточием падает на разборе, а внешний `except`
+    в `async_parse_files` превращает это в вечный повтор.
     """
     path = f"email_{folder}:{_START}:{_STOP}"
     mbox = _FakeMbox(_MBOX)
@@ -323,10 +265,8 @@ async def test_oversized_email_from_folder_with_colon_is_skipped_not_crashed(
 ):
     """Отсечение по размеру считает письмо, а не поля ключа.
 
-    Гейт по размеру срабатывает ДО чтения mbox, поэтому он первым и натыкался
-    на ValueError от `split(":")`: письмо из папки с двоеточием не отсекалось
-    по размеру, а падало. Здесь оно должно быть тихо помечено permanent=True
-    (меньше оно уже не станет) и не прочитано вовсе.
+    Гейт по размеру срабатывает до чтения mbox: письмо из папки с двоеточием
+    помечается permanent=True (меньше оно не станет) и не читается вовсе.
     """
     monkeypatch.setattr(config.email_scan_cfg, "max_message_size", 1024)
     folder = "Входящие:Архив 2024"
@@ -342,17 +282,12 @@ async def test_oversized_email_from_folder_with_colon_is_skipped_not_crashed(
 
     assert chunks == []
     assert mbox.seeks == [], "отсечённое по размеру письмо не должно искаться"
-    # Без этого чтение с нулевой позиции (без seek) утекло бы незамеченным:
-    # разбор мусора тоже не дал бы чанков, и chunks == [] осталось бы верным.
+    # Иначе чтение с нулевой позиции (без seek) прошло бы незамеченным:
+    # разбор мусора тоже не даёт чанков.
     assert mbox.reads == [], "отсечённое по размеру письмо не должно читаться"
     assert fails.calls == [(path, True)], (
         "permanent=True: письмо не станет меньше, возвращаться к нему незачем"
     )
-
-
-# ==========================================================================
-# Тот же ключ, вторая половина контракта: разбор в ручке get_file_path
-# ==========================================================================
 
 
 @pytest.mark.parametrize(
@@ -390,11 +325,8 @@ def test_email_path_pattern_keeps_colons_in_folder_and_attachment(
 ):
     """Опорные точки разбора ключа — два числовых поля посередине.
 
-    Ручка `get_file_path` берёт из ключа папку, смещения и имя части. Слева
-    (`split`) имя отъедала папка с двоеточием — «Входящие:Архив 2024» давала
-    prefix='email_Входящие' и `int('Архив 2024')`, то есть 400 на письме,
-    которое индексация к тому моменту уже разбирала успешно. Справа
-    (`rsplit`) точно так же отъедало бы имя вложения с двоеточием.
+    Ручка `get_file_path` берёт из ключа папку, смещения и имя части. Разбор
+    слева ломается на папке с двоеточием, справа — на имени вложения с ним.
     """
     match = _EMAIL_PATH_RE.match(key)
 
@@ -420,10 +352,5 @@ def test_email_path_pattern_keeps_colons_in_folder_and_attachment(
     ],
 )
 def test_email_path_pattern_rejects_malformed_keys(key: str):
-    """Битый ключ шаблон не разбирает — ручка отвечает 400, а не 500.
-
-    Раньше несовпадение вылезало как `ValueError` из `int()` внутри
-    обработчика; теперь его ловит сам шаблон, и веток с int-ошибкой не
-    осталось.
-    """
+    """Битый ключ шаблон не разбирает — ручка отвечает 400, а не 500."""
     assert _EMAIL_PATH_RE.match(key) is None

@@ -1,7 +1,9 @@
-from src.utils import OpenVINOEmbedder
+# Запускать из корня репозитория: uv run python -m utils.run_openvino — по пути
+# к файлу пакет src не найдётся.
+from src.utils.openvino_encoder import OpenVINOEmbedder
 
 if __name__ == "__main__":
-    model_dir = "models/rubert-tiny2_001"
+    model_dir = "models/rubert-tiny2_002"
 
     embedder = OpenVINOEmbedder(model_dir, device="CPU")
 
@@ -9,5 +11,3 @@ if __name__ == "__main__":
 
     embeddings = embedder.encode(texts)
     print("Embeddings shape:", embeddings.shape)
-# res = model(tokenizer(["интеллектуальный поиск"]))
-# print(res)

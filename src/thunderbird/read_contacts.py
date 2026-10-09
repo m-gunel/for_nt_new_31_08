@@ -1,3 +1,8 @@
+"""Контакты из базы Gloda Thunderbird (global-messages-db.sqlite).
+
+Демон модуль не использует — он нужен скриптам experiments/.
+"""
+
 import sqlite3
 from typing import TypedDict
 
@@ -36,28 +41,20 @@ def read_contacts(
     db_path: str,
     progress: Progress | None = None,
 ):
-    """
-    Iterate through contacts in the Thunderbird SQLite database.
+    """Словари {id, name, email} (_ContactRow), по одному на адрес контакта.
 
-    Args:
-        db_path: Path to the Thunderbird SQLite database
-        progress: Optional progress bar
-
-    Yields:
-        Contact information as _ContactRow objects
+    NULL в имени или адресе отдаётся пустой строкой.
     """
     task = progress.add_task("Reading contacts...", total=None) if progress else None
 
     with sqlite3.connect(db_path, uri=True) as conn:
         cursor = conn.cursor()
 
-        # First get the total count for the progress bar
         if progress and task is not None:
             cursor.execute("SELECT COUNT(*) FROM contacts")
             total = cursor.fetchone()[0]
             progress.update(task, total=total)
 
-        # Now execute the main query
         cursor.execute(_query_contacts)
 
         while True:

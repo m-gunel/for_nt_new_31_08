@@ -34,9 +34,6 @@ def _local(dt: datetime) -> datetime:
     return dt.astimezone().replace(tzinfo=None)
 
 
-# ---------- PDF ----------
-
-
 def _pdf(path, pages, toc=None, **metadata):
     with pymupdf.open() as doc:
         for text in pages:
@@ -105,8 +102,6 @@ def test_pdf_title_not_confirmed_by_text_is_dropped(tmp_path):
     assert meta["title"] == "Meeting notes about branch openings"  # первая строка
 
 
-# ---------- DOCX ----------
-
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 
@@ -172,9 +167,6 @@ def test_docx_core_properties_and_pages(tmp_path):
     assert rows[0]["text"].startswith("Документ: Положение\n")
 
 
-# ---------- PPTX ----------
-
-
 def test_pptx_slides_and_title_from_first_slide(tmp_path):
     prs = Presentation()
     first = prs.slides.add_slide(prs.slide_layouts[0])
@@ -195,9 +187,6 @@ def test_pptx_slides_and_title_from_first_slide(tmp_path):
     assert (meta["author"], meta["last_modified_by"]) == ("Петров", "Сидоров")
     assert meta["page_count"] == 2
     assert rows[0]["page_start"] == 1 and rows[-1]["page_end"] == 2
-
-
-# ---------- XLSX ----------
 
 
 def test_xlsx_properties_and_sheet_count(tmp_path):
@@ -226,9 +215,6 @@ def test_xlsx_properties_and_sheet_count(tmp_path):
     assert {r["kind"] for r in rows} == {"table_row", "text"}
 
 
-# ---------- TXT ----------
-
-
 def test_txt_lines_title_and_full_text(tmp_path):
     path = tmp_path / "check.txt"
     path.write_text(
@@ -251,19 +237,30 @@ def test_txt_lines_title_and_full_text(tmp_path):
     )
 
 
-# ---------- даты файловой системы ----------
-
-
-def test_date_created_is_not_ctime(tmp_path):
+def test_date_created_is_not_ctime(tmp_path, monkeypatch):
     path = tmp_path / "old.txt"
     path.write_text("Старый документ с содержанием", encoding="utf-8")
-    past = datetime(2020, 1, 1, 12, 0).timestamp()
-    os.utime(path, (past, past))  # ctime становится «сейчас», а документ — из 2020 года
+    past = datetime(2020, 1, 1, 12, 0)
+    os.utime(path, (past.timestamp(), past.timestamp()))  # ctime — «сейчас»
+    born = datetime(2019, 6, 1, 9, 0)
+    monkeypatch.setattr(md, "birth_time", lambda *a: born)
     meta = md.file_metadata(str(path))
-    assert meta["date_modified"] == datetime(2020, 1, 1, 12, 0)
-    if meta["date_created"] is not None:
-        assert meta["date_created"] <= meta["date_modified"]
-        assert meta["date_created"] != datetime.fromtimestamp(path.stat().st_ctime)
+    assert meta["date_modified"] == past
+    assert meta["date_created"] == born  # из birth_time, а не ctime
+    # Копия с сохранённой датой изменения родилась позже — создан не позже изменения.
+    monkeypatch.setattr(md, "birth_time", lambda *a: datetime.now())
+    assert md.file_metadata(str(path))["date_created"] == past
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_birth_time_does_not_fall_back_to_ctime(tmp_path, monkeypatch, platform):
+    """ФС не знает время рождения (нет st_birthtime, statx без btime) — None, а не ctime."""
+    path = tmp_path / "a.txt"
+    path.write_text("текст", encoding="utf-8")
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(md, "_statx_btime", lambda p: None)
+    st = SimpleNamespace(st_ctime=path.stat().st_ctime, st_mtime=0)
+    assert md.birth_time(str(path), st) is None
 
 
 def test_unknown_birth_time_gives_empty_date(tmp_path, monkeypatch):
@@ -282,9 +279,6 @@ def test_statx_birth_time_on_linux(tmp_path):
     born = md._statx_btime(str(path))
     if born is not None:  # ФС может не хранить время рождения (tmpfs старых ядер)
         assert abs((datetime.now() - born).total_seconds()) < 60
-
-
-# ---------- поля по отдельности ----------
 
 
 @pytest.mark.parametrize(

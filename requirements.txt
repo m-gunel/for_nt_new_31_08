@@ -4,9 +4,9 @@
 #
 # Список синхронизирован с [project.dependencies] в pyproject.toml, откуда
 # собирается проект через uv (uv sync, make build, Dockerfile).
-# sentence-transformers сюда не входит: он тянет torch (несколько ГБ) и нужен
-# только при embed_model_cfg.model_type == "st", а по умолчанию используется
-# "ov" (OpenVINO). Зависимости для тестов — в группах pyproject.toml.
+# sentence-transformers сюда не входит: он тянет torch (несколько ГБ), а демону
+# не нужен — эмбеддинги считает OpenVINO; он нужен только утилитам конвертации
+# модели (группа torch). Зависимости для тестов — в группах pyproject.toml.
 
 # --- веб-слой ---
 fastapi>=0.136.1

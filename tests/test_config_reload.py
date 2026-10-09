@@ -1,10 +1,8 @@
-"""Регрессия на POST /config: порядок шагов и холостой сброс почты.
+"""POST /config: порядок шагов и холостой сброс почты.
 
-Боевой дефект: `start_reindex()` создавал фоновую задачу в середине
-обработчика, и она шла сверять удалённые файлы в ту же БД состояния, куда
-`drop_email_index()` в этот же момент писал. `reconfigure_lock` от этого не
-спасает — задача живёт вне лока. Проявлялось как assert_db_state в lsm1
-(SIGABRT) примерно на каждом десятом POST /config.
+Фоновая задача `start_reindex()` живёт вне `reconfigure_lock`, поэтому
+стартует последним шагом: параллельно с `drop_email_index()` она писала бы в
+ту же БД состояния (assert_db_state в lsm1, SIGABRT).
 """
 
 import os
@@ -16,7 +14,7 @@ from src.indexer.indexer import Index
 from src.server.model import UserConfig
 from src.server.router import update_config
 
-# Фикстуры поднимают Index на временном хранилище — переиспользуем их.
+# Index на временном хранилище.
 from tests.test_indexing_live import index, isolated_config  # noqa: F401
 
 
@@ -55,9 +53,8 @@ class RecordingIndex:
     def __init__(self, calls: list):
         self.calls = calls
         self.emails_scanner = None
-        # update_config сверяется с ним, чтобы не запускать сканирование на
-        # деактивированном индексе (БТ §5.4). True — как у демона с
-        # автозапуском, то есть прежнее поведение этих тестов.
+        # update_config не сканирует на деактивированном индексе (БТ §5.4);
+        # True — как у демона с автозапуском.
         self.active = True
 
     async def stop_index(self):
@@ -82,8 +79,8 @@ class RecordingIndex:
 def _nt_body(folder: str) -> UserConfig:
     """Тело, которое реально шлёт нагрузочный стенд (и hunt_crash.py).
 
-    Ключевое здесь — email.enabled=false приходит ЯВНО на каждый запрос,
-    поэтому ветка сброса почты выполняется даже когда почту не включали.
+    email.enabled=false приходит явно на каждый запрос, поэтому ветка сброса
+    почты выполняется, даже когда почту не включали.
     """
     return UserConfig.model_validate(
         {
@@ -100,12 +97,7 @@ def _nt_body(folder: str) -> UserConfig:
 
 @pytest.mark.asyncio
 async def test_reindex_starts_after_email_cleanup(cfg, journal, tmp_path):
-    """Перезапуск индексации — последним шагом, после работы по почте.
-
-    До фикса порядок был stop -> start_reindex -> restart_watcher ->
-    drop_email_index, то есть фоновый скан и чистка почтового состояния
-    работали с БД одновременно.
-    """
+    """Перезапуск индексации — последним шагом, после работы по почте."""
     docs = tmp_path / "docs"
     docs.mkdir()
     fake_index = RecordingIndex(journal)
@@ -163,10 +155,9 @@ async def test_drop_email_index_is_noop_when_nothing_to_drop(
 ):
     """Холостой сброс почты не трогает БД состояния.
 
-    Клиенты шлют конфиг целиком, то есть с email.enabled=false на КАЖДЫЙ
-    POST /config. Без проверки «сбрасывать нечего» любое обновление списка
-    папок тянуло за собой обход всей таблицы состояния и дроп
-    несуществующей почтовой таблицы.
+    Клиенты шлют email.enabled=false на каждый POST /config: без проверки
+    «сбрасывать нечего» любое обновление папок обходило бы всю таблицу
+    состояния.
     """
     monkeypatch.setattr(index, "emails_scanner", None)
     assert not index.email_store.has_table, "почтовой таблицы быть не должно"
@@ -189,14 +180,11 @@ async def test_drop_email_index_is_noop_when_nothing_to_drop(
 async def test_delete_prefix_survives_empty_state_db(
     index: Index,  # noqa: F811
 ):
-    """Снятие префикса на ПУСТОЙ таблице состояния не должно падать.
+    """Снятие префикса на пустой таблице состояния не падает.
 
-    Боевой дефект: обход ключей открывал курсор lsm, а на пустой базе
-    курсор не открывается вовсе — `RuntimeError: Invalid cursor`. Пустая
-    таблица состояния при этом штатна: свежая установка, только что
-    очищенный индекс, первый POST /config. Наружу это выходило как
-    500 на смену списка папок, причём watcher оставался остановленным —
-    его перезапуск идёт после удаления и до него не доходило.
+    На пустой базе курсор lsm не открывается (`RuntimeError: Invalid cursor`),
+    а пустая таблица штатна: свежая установка, очищенный индекс, первый
+    POST /config.
     """
     assert not list(index.lsm_collection.indexed.items()), "таблица должна быть пуста"
 
@@ -209,11 +197,9 @@ async def test_removed_folder_is_deleted_with_trailing_separator(
 ):
     """Убранная из конфига папка снимается со слэшем на конце.
 
-    Боевой дефект: router звал delete_prefix(p) голым путём, а тот удаляет
-    всё, что начинается с этой строки. Убрать из списка ~/Документы значило
-    вычистить из индекса и ~/Документы_архив — молча, без единой ошибки в
-    ответе. Семантику самого delete_prefix проверяет соседний тест; здесь
-    важно ровно место вызова.
+    delete_prefix удаляет всё, что начинается со строки: без слэша снятие
+    ~/Документы задело бы и ~/Документы_архив. Здесь проверяется место вызова
+    в router, семантику delete_prefix — соседний тест.
     """
     docs = tmp_path / "Документы"
     archive = tmp_path / "Документы_архив"
@@ -274,12 +260,10 @@ async def test_folder_change_restarts_watcher_with_real_index(
     tmp_path,
     monkeypatch,
 ):
-    """Смена папки: настоящий Index, не заглушка.
+    """Смена папки на настоящем Index, а не заглушке.
 
-    Прежние тесты подменяли delete_prefix, поэтому его поломка проходила
-    мимо них — а на стенде каждый POST /config со сменой папки отвечал 500.
-    Здесь удаление настоящее: проверяем и код ответа, и то, что watcher
-    подняли обратно.
+    Заглушка delete_prefix скрыла бы его поломку — 500 на каждый POST /config
+    со сменой папки. Проверяются код ответа и подъём watcher'а.
     """
     old_dir = tmp_path / "old"
     new_dir = tmp_path / "new"

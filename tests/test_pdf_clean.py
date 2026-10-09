@@ -104,6 +104,16 @@ def test_split_headings_by_bookmarks():
     ]
 
 
+def test_bookmark_without_letters_marks_no_heading():
+    """Закладка «—»: пустой ключ не делает заголовком первую строку страницы."""
+    page = Block(
+        "Сумма кредита составила 100 млн руб.\nВведение в отчёт\nТекст", page=1
+    )
+    out = split_headings(page, [(1, "—"), (2, "Введение в отчёт")], numbering=False)
+    assert [(b.text, b.heading) for b in out if b.heading] == [("Введение в отчёт", 2)]
+    assert split_headings(page, [(1, "•")], numbering=False) == [page]
+
+
 def test_pdf_headings_set_section_but_keep_text():
     """Заголовок PDF — только путь раздела: полный текст тот же, что у страниц без разметки."""
     pages = [

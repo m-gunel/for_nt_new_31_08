@@ -3,6 +3,7 @@ import concurrent
 import concurrent.futures
 import math
 import threading
+from datetime import timedelta
 from functools import cached_property
 from typing import Any, NamedTuple
 
@@ -28,6 +29,12 @@ MIN_ROWS_FOR_VECTOR_INDEX = 256
 VECTOR_INDEX_REBUILD_FACTOR = 4
 
 lg = get_logger(__name__)
+
+# Сколько держать прежние версии таблицы после компакции. Не ноль: поиск,
+# начатый до компакции, дочитывает файлы прежней версии. Без явного значения
+# LanceDB держит их 7 дней, и всё это время место под переписанные фрагменты
+# не освобождается.
+COMPACT_KEEP_VERSIONS = timedelta(hours=1)
 
 
 # Сколько значений вектора приходится на один подвектор PQ. 8 — обычный
@@ -94,6 +101,8 @@ class LanceWrapper:
         # процесса (LanceDB не сообщает, на скольких строках он обучен).
         self._vector_rows: int | None = None
         self.vector_index_error: str | None = None
+        # Отсутствие модуля lance пишется в журнал один раз, а не каждый цикл.
+        self._lance_missing_logged = False
         self._table = None
         self._table_lock = threading.RLock()
         self._create_lock = threading.RLock()
@@ -158,9 +167,11 @@ class LanceWrapper:
     def create_vector_index(self, force: bool = False):
         """Построить или переобучить IVF-PQ, подобрав партиции под объём данных.
 
-        Звать можно на каждом обновлении — метод сам решает, надо ли работать.
-        `force=True` для массового удаления: таблица сжимается, и правило
-        «выросла в N раз» не сработает.
+        Звать можно на каждом обновлении — метод сам решает, надо ли работать:
+        переобучает, когда таблица выросла или сжалась в
+        VECTOR_INDEX_REBUILD_FACTOR раз. `force=True` — переобучить сразу,
+        после массового удаления: таблица могла сжаться меньше, чем на порог,
+        а партиции обучены на прежнем корпусе.
         """
         table = self.table
         rows = table.count_rows()
@@ -245,8 +256,8 @@ class LanceWrapper:
         параметра считается расходящимся: его построила старая версия lancedb.
 
         Не через self.table: обращение к нему создало бы таблицу почты.
-        Параметры берутся из lancedb, а не из модуля lance: во фризнутой сборке
-        его нет (main.spec исключает).
+        Параметры берутся из lancedb, а не из модуля lance: его может не
+        оказаться в сборке (см. optimize_indices).
         """
         if not self.has_table:
             return None
@@ -267,11 +278,26 @@ class LanceWrapper:
         LanceDB досматривает их полным перебором — стоимость поиска растёт
         вместе с объёмом, накопленным с последнего обновления. Эта операция
         приписывает новые данные к уже обученным партициям, не переобучая
-        индекс и не трогая файлы на диске, поэтому её можно звать часто.
+        индекс и не переписывая данные (новая версия с дельтой индекса),
+        поэтому её можно звать часто.
+
+        Нужен модуль lance (pylance): в lancedb отдельной операции нет, а его
+        optimize() ещё и компактирует таблицу. Без lance индексы догоняет
+        только compact().
         """
         table = self.table
         try:
             table.to_lance().optimize.optimize_indices()
+        except ImportError as exc:
+            if not self._lance_missing_logged:
+                self._lance_missing_logged = True
+                lg.warning(
+                    "нет модуля lance (%s): новые строки %s попадут в индексы "
+                    "только при компакции, до неё поиск досматривает их перебором",
+                    exc,
+                    self.table_name,
+                )
+            return
         except Exception:
             # индексов может ещё не быть — это не повод шуметь на каждый цикл
             lg.debug("optimize_indices пропущен", exc_info=True)
@@ -283,11 +309,12 @@ class LanceWrapper:
 
         Дорого и по CPU, и по памяти, поэтому вызывать только в простое.
         Частые мелкие вставки оставляют тысячи фрагментов и версий; без склейки
-        они копятся монотонно.
+        они копятся монотонно. Удаляются версии старше COMPACT_KEEP_VERSIONS,
+        более свежие уберёт следующая компакция.
         """
         table = self.table
         before = len(table.list_versions())
-        table.optimize()
+        table.optimize(cleanup_older_than=COMPACT_KEEP_VERSIONS)
         self._mark_stale()
         lg.info(
             "table compacted: версий было %s, стало %s",
@@ -325,7 +352,6 @@ class LanceWrapper:
             session=self.lance_session,
         )
 
-    # @cached_once
     async def lancedb_async(self):
         return await ld.connect_async(
             self.ld_db_path,
@@ -333,9 +359,8 @@ class LanceWrapper:
         )
 
     async def table_async(self):
+        """Свежий async-хендл таблицы; таблицы нет — создать её с FTS-индексом."""
         db = await self.lancedb_async()
-        """Lazy initialization of files table in LanceDB"""
-        # Try to open existing table
         loop = asyncio.get_event_loop()
         if not self.has_table:
             await loop.run_in_executor(self._executor, self.create_table)
@@ -387,6 +412,13 @@ class LanceWrapper:
             return 0
         return self.table.count_rows(predicate)
 
+    def paths_matching(self, predicate: str) -> set[str]:
+        """Пути строк под фильтром. Пусто — если таблицы ещё нет."""
+        if not self.has_table:
+            return set()
+        rows = self.table.search().where(predicate).select(["path"]).limit(None)
+        return set(rows.to_arrow().column("path").to_pylist())
+
     def move_rows_to(
         self, target: "LanceWrapper", predicate: str, batch_size: int = 1024
     ) -> int:
@@ -395,19 +427,37 @@ class LanceWrapper:
         Перенос, а не переиндексация: схема одна, векторы уже посчитаны.
         Сначала копирование целиком, потом удаление — удаление по пути между
         батчами снесло бы ещё не скопированные чанки того же письма (путь у
-        них общий). Идемпотентность на вызывающем.
+        них общий).
+
+        Повтор после обрыва безопасен: копии путей, которые ещё лежат здесь,
+        из target сначала удаляются, остальные строки target не трогаются.
+        Чтение — запросом lancedb, а не через модуль lance: его может не быть
+        в сборке.
         """
         if not self.has_table:
             return 0
-        scanner = self.table.to_lance().scanner(filter=predicate, batch_size=batch_size)
+        expected = self.count_matching(predicate)
+        if not expected:
+            return 0
+        copied = sorted(
+            self.paths_matching(predicate) & target.paths_matching(predicate)
+        )
+        for i in range(0, len(copied), 100):
+            quoted = ", ".join(f"'{sql_quote(p)}'" for p in copied[i : i + 100])
+            target.delete_sync(f"path IN ({quoted})")
         moved = 0
-        for batch in scanner.to_batches():
+        query = self.table.search().where(predicate).limit(None)
+        for batch in query.to_batches(batch_size):
             if not batch.num_rows:
                 continue
             target.add_sync(pa.Table.from_batches([batch]))
             moved += batch.num_rows
-        if moved:
-            self.delete_sync(predicate)
+        if moved != expected:
+            # Исходные удаляются тем же фильтром: недочитанные строки пропали бы.
+            raise RuntimeError(
+                f"перенесено {moved} строк из {expected}, исходные оставлены"
+            )
+        self.delete_sync(predicate)
         return moved
 
     def add_sync(self, data) -> None:

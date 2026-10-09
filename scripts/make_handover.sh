@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
-# Сборка архива для передачи тестировщику.
-#
-# Смысл скрипта не в zip, а в проверках перед ним: архив без uv.lock означает,
-# что у принимающей стороны состав пакетов отрезолвится заново по тому, что
-# лежит в зеркале сегодня, и её прогон НТ будет несравним с вашим. Плюс архив
-# не должен унести секреты и чужое локальное состояние.
+# Сборка архива для передачи тестировщику — после проверок: без uv.lock состав
+# пакетов отрезолвится у принимающей стороны заново, и прогон будет несравним;
+# секреты и локальное состояние в архив уходить не должны.
 #
 # Запускать из корня репозитория, на машине с доступом к зеркалу:
 #   ./scripts/make_handover.sh
@@ -18,6 +15,13 @@ FAIL=0
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '  OK   %s\n' "$*"; }
 bad()  { printf '  СТОП %s\n' "$*"; FAIL=1; }
+# Файлы с учётными данными в URL (схема://логин:пароль@); печатаются только имена.
+# Плейсхолдеры не в счёт: $(OSC_TOKEN), ${...} и <...> в шаблон пароля не входят,
+# литерал OSC_TOKEN отсекается отдельно.
+cred_files() {
+  { grep -rHIoE 'https?://[^/@:[:space:]]+:[A-Za-z0-9._~%!*+=-]{8,}@' "$@" 2>/dev/null || true; } \
+    | { grep -v ':OSC_TOKEN@$' || true; } | cut -d: -f1 | sort -u
+}
 
 say "=== 1. Состав пакетов зафиксирован ==="
 if [[ -f uv.lock ]]; then
@@ -32,14 +36,14 @@ else
   say "          uv export --no-hashes --format requirements-txt --no-dev -o requirements.lock.txt"
 fi
 
-say "=== 2. В локе плейсхолдер, а не живой токен ==="
-# Dockerfile подставляет реальный OSC_TOKEN прямо в pyproject.toml при сборке;
-# лок, созданный внутри сборки, унесёт токен в индексные URL.
+say "=== 2. В локе нет живого токена ==="
+# Лок, пересозданный с токеном в адресе индекса, может унести его в свои URL.
+# Живой токен ищется первым: плейсхолдер OSC_TOKEN рядом его не прячет.
 if [[ -f uv.lock ]]; then
-  if grep -q "OSC_TOKEN" uv.lock; then
-    ok "в индексных URL плейсхолдер OSC_TOKEN"
-  elif grep -qE "https://token:[A-Za-z0-9_-]{8,}@sberosc" uv.lock; then
+  if [[ -n "$(cred_files uv.lock)" ]]; then
     bad "в uv.lock похоже лежит РЕАЛЬНЫЙ токен — пересоздайте лок на рабочей машине"
+  elif grep -q "OSC_TOKEN" uv.lock; then
+    ok "в индексных URL плейсхолдер OSC_TOKEN"
   else
     ok "подстановок токена не видно"
   fi
@@ -86,6 +90,8 @@ fi
 say "=== 7. Сборка архива ==="
 rm -rf "/tmp/${NAME}" && mkdir -p "/tmp/${NAME}"
 # Исключаем секреты, локальное состояние индекса и всё, что пересоздаётся само.
+# Dockerfile и pip.conf от git прячет только .git/info/exclude, а rsync его не читает;
+# .planning/, CHANGES.diff и ноутбуки с сохранёнными выводами тестировщику не нужны.
 rsync -a \
   --exclude '__pycache__/' --exclude '*.pyc' \
   --exclude '.pytest_cache/' --exclude '.ruff_cache/' \
@@ -93,16 +99,28 @@ rsync -a \
   --exclude 'data/' --exclude 'tests/tmp/' \
   --exclude '.env' --exclude '.env.*' --exclude '.secret' --exclude '.secret.temp' \
   --exclude '.gigaide/' --exclude '.DS_Store' --exclude '.git/' \
+  --exclude 'Dockerfile' --exclude 'pip.conf' --exclude '.planning/' \
+  --exclude 'CHANGES.diff' --exclude 'notebooks/' \
   ./ "/tmp/${NAME}/lib-local-rag/"
 
-# Зипуем внутренний каталог, чтобы архив распаковывался в lib-local-rag/,
-# а не в лишний уровень с датой в имени.
+# Последний рубеж: учётные данные в URL в любом файле архива, а не только в uv.lock.
+leaked=$(cred_files "/tmp/${NAME}/lib-local-rag")
+if [[ -n "$leaked" ]]; then
+  bad "в архив попали бы учётные данные в URL (значения не печатаются):"
+  printf '%s\n' "$leaked" | sed "s#^/tmp/${NAME}/lib-local-rag/#         #"
+  rm -rf "/tmp/${NAME}"
+  say "Архив НЕ собран."
+  exit 1
+fi
+
+# Архив распаковывается в lib-local-rag/, без лишнего уровня с датой.
 ( cd "/tmp/${NAME}" && rm -f "../${NAME}.zip" && zip -qr "../${NAME}.zip" lib-local-rag )
 mv "/tmp/${NAME}.zip" "$OUT"
 rm -rf "/tmp/${NAME}"
 
 say ""
 say "Готово: $(cd .. && pwd)/${NAME}.zip"
-say "Внутри: uv.lock, код, тесты, MCP-мост, модель. Без .env, .secret и data/."
+say "Внутри: uv.lock, код, тесты, MCP-мост, модель. Без .env, .secret, Dockerfile,"
+say "pip.conf, .planning/ и data/; учётных данных в URL нет."
 say ""
 say "Тестировщику передайте вместе с docs/HANDOVER.md — там порядок запуска."

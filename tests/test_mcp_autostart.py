@@ -1,22 +1,15 @@
 """Мост сам находит и поднимает демон: порт-файл в pw_dir и автозапуск службы.
 
-Два сбоя, которые пользователь поставки видит как одно «поиск не работает»:
+Терминал SberOS живёт с HOME=/home/work/<LOGIN@DOMAIN>, а служба systemd
+--user публикует порт в домашнем каталоге из passwd — мост ищет в обоих. Если
+демон не поднят, мост сам зовёт systemctl (не чаще раза в AUTOSTART_RETRY_S) и
+отвечает раньше таймаута агента.
 
-- терминал SberOS живёт с HOME=/home/work/<LOGIN@DOMAIN>, а служба systemd
-  --user публикует порт в домашнем каталоге из passwd. Мост, запущенный агентом
-  из терминала, искал порт-файл только в $HOME и уходил на 8000;
-- демон не поднят (служба остановлена, сессия не перезапущена после установки),
-  и агент получал голый отказ соединения. Просить пользователя набирать
-  systemctl нельзя — мост делает это сам, не чаще раза в AUTOSTART_RETRY_S, и
-  отвечает быстрее, чем агент оборвёт запрос по своему таймауту.
+Живость демона — по pid рядом с портом: устаревший порт-файл не заслоняет
+живой, а живой, но ещё не слушающий демон — это прогрев, systemd не трогаем.
 
-Живость демона мост определяет по pid, который тот кладёт рядом с портом:
-устаревший порт-файл не должен заслонять живой, а живой, но ещё не
-слушающий демон — это прогрев, и systemd его не трогаем.
-
-systemctl здесь всегда заглушка (LQRAG_SYSTEMCTL): настоящий на машине с
-systemd поднимал бы настоящую службу. Заглушка пишет argv и XDG_RUNTIME_DIR
-в файл — по нему видно, звали ли её, сколько раз и с чем.
+systemctl всегда заглушка (LQRAG_SYSTEMCTL): она пишет argv и XDG_RUNTIME_DIR
+в файл, по которому видно, звали ли её, сколько раз и с чем.
 """
 
 import os
@@ -164,9 +157,6 @@ def _initialize(bridge):
     )
 
 
-# ---------------------------------------------------------------------------
-# Порт-файл: $HOME терминала и pw_dir службы
-# ---------------------------------------------------------------------------
 def test_candidates_cover_home_and_pw_dir(monkeypatch, tmp_path):
     home = tmp_path / "work" / "u@example"
     pw_dir = tmp_path / "example@u"
@@ -202,7 +192,7 @@ def test_pw_dir_port_file_is_used_when_home_has_none(monkeypatch, tmp_path):
 
 
 def test_home_port_file_wins_over_pw_dir(monkeypatch, tmp_path):
-    """При равной живости (pid-файлов нет) порядок прежний: $HOME, затем pw_dir."""
+    """При равной живости (pid-файлов нет) порядок: $HOME, затем pw_dir."""
     home = tmp_path / "work" / "u@example"
     pw_dir = tmp_path / "example@u"
     _write_port(home / ".files-search" / "port", 8126)
@@ -255,11 +245,7 @@ def _two_homes(monkeypatch, tmp_path):
 
 
 def test_stale_home_does_not_shadow_live_pw_dir(stub, monkeypatch, tmp_path):  # noqa: F811
-    """Демон из терминала умер без уборки, служба в pw_dir жива — идём к службе.
-
-    Раньше первый читаемый порт-файл выигрывал, и мост до перезапуска агента
-    отвечал «прогревается», хотя демон службы был жив и здоров.
-    """
+    """Демон из терминала умер без уборки, служба в pw_dir жива — идём к службе."""
     stub.set("GET", "/api/v1/status", {"is_indexing": False, "type": "idle"})
     script, calls = _systemctl_stub(tmp_path)
     monkeypatch.setenv("LQRAG_SYSTEMCTL", str(script))
@@ -310,9 +296,6 @@ def test_dead_pid_candidate_is_not_retried(stub, monkeypatch, tmp_path):  # noqa
     assert stub.requests == []
 
 
-# ---------------------------------------------------------------------------
-# Автозапуск службы
-# ---------------------------------------------------------------------------
 def test_autostart_runs_systemctl_once(monkeypatch, bridge_factory, tmp_path):  # noqa: F811
     """initialize и два вызова инструмента — а systemctl позван ровно один раз.
 
@@ -361,8 +344,8 @@ def test_autostart_disabled_does_not_call_systemctl(bridge_factory, tmp_path):  
     response = bridge.call("local_search", {"query": "договор"})
     time.sleep(0.3)  # фоновой пробе с initialize даём шанс ошибиться
     assert _calls(calls) == []
-    # Живого pid рядом с портом нет, а поднимать службу запрещено: обещать
-    # прогрев нельзя — говорим, почему никто не поднимет демон.
+    # Живого pid нет, а автозапуск запрещён: вместо «прогрева» — почему демон
+    # никто не поднимет.
     text = call_text(response)
     assert WARMING not in text
     assert "Автозапуск: отключён (LQRAG_AUTOSTART=0)" in text
@@ -522,9 +505,6 @@ def test_initialize_is_not_delayed_by_slow_systemctl(bridge_factory, tmp_path): 
     assert result["serverInfo"]["name"] == "localrag-mcp"
 
 
-# ---------------------------------------------------------------------------
-# Ответ агенту: быстро и по-человечески
-# ---------------------------------------------------------------------------
 def test_refused_connection_answers_warming_fast(bridge_factory, tmp_path):  # noqa: F811
     script, _ = _systemctl_stub(tmp_path)
     port_file = _write_port(tmp_path / "port", _closed_port())
@@ -539,7 +519,7 @@ def test_refused_connection_answers_warming_fast(bridge_factory, tmp_path):  # n
     text = call_text(response)
     assert "Индексатор LocalRAG " + WARMING in text
     assert "Повторите запрос через минуту" in text
-    # Прежняя диагностика не потеряна — она в подробностях.
+    # Диагностика адреса — в подробностях.
     assert "недоступен" in text and str(port_file) in text
 
 
@@ -555,10 +535,9 @@ def test_hanging_systemctl_does_not_hold_the_answer(bridge_factory, tmp_path):  
 
 
 def test_missing_unit_points_to_doctor(bridge_factory, tmp_path):  # noqa: F811
-    """Юнит не виден пользователю (случай 1.0.6), живого демона нет.
+    """Юнит не виден пользователю, живого демона нет — не «прогревается».
 
-    «Прогревается» было бы враньём. pid-файла рядом с портом нет — живость
-    неизвестна, и мост идёт к systemd.
+    pid-файла рядом с портом нет: живость неизвестна, и мост идёт к systemd.
     """
     script, calls = _systemctl_stub(
         tmp_path,
@@ -610,9 +589,6 @@ def test_fallback_with_failed_start_keeps_the_old_hint(monkeypatch, tmp_path):
     assert "Failed to connect to bus" in text
 
 
-# ---------------------------------------------------------------------------
-# Долгий отказ: «не поднимается» и повторный автозапуск
-# ---------------------------------------------------------------------------
 def _long_outage(seconds=None, last_refused_ago=1.0):
     """Отказы идут подряд дольше порога, первая попытка автозапуска была тогда же."""
     back = seconds if seconds is not None else mcp_server.STUCK_AFTER_S + 20

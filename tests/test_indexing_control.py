@@ -1,9 +1,8 @@
 """Ручки управления индексацией — БТ Библиотеки §5.1-5.3.
 
-Роутерная часть проверяется прямым вызовом хендлеров с подставным индексом:
-полный lifespan (OpenVINO + LanceDB + watcher) для проверки оркестрации не
-нужен. Состояние самого индекса проверяется на реальном Index из фикстуры
-изолированного хранилища.
+Хендлеры зовутся напрямую с подставным индексом — полный lifespan для
+оркестрации не нужен. Состояние самого индекса проверяется на реальном Index в
+изолированном хранилище.
 """
 
 import asyncio
@@ -22,7 +21,7 @@ from src.server.router import (
 )
 from src.utils.lsm_adapter import to_thread as lsm_to_thread
 
-# Фикстуры поднимают Index на временном хранилище — переиспользуем их.
+# Index на временном хранилище.
 from tests.test_indexing_live import index, isolated_config  # noqa: F401
 
 
@@ -90,9 +89,9 @@ def patched_watcher(monkeypatch):
 def tmp_config(config: Config, tmp_path, monkeypatch):
     """Конфиг, чей user_conf.yml лежит во временном каталоге.
 
-    cached_property снимается и на входе, и на ВЫХОДЕ: monkeypatch вернёт
-    data_directory, а закешированные под временный каталог пути остались бы
-    в объекте и протекли бы в следующий тест.
+    cached_property снимается и на входе, и на выходе: monkeypatch вернёт
+    data_directory, а пути, закешированные под временный каталог, протекли бы
+    в следующий тест.
     """
     monkeypatch.setattr(config, "data_directory", str(tmp_path / "ragsearch"))
     config.__dict__.pop("user_conf_path", None)
@@ -102,9 +101,6 @@ def tmp_config(config: Config, tmp_path, monkeypatch):
     config.__dict__.pop("data_directory_path", None)
 
 
-# --------------------------------------------------------------------------
-# §5.1 Activation
-# --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_activate_starts_indexing_and_watcher(patched_watcher):
     idx = ControlIndex(active=False)
@@ -126,9 +122,6 @@ async def test_activate_is_idempotent(patched_watcher):
     assert result.changed is False
 
 
-# --------------------------------------------------------------------------
-# §5.2 Deactivation
-# --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_deactivate_stops_scanning_and_keeps_index(patched_watcher):
     idx = ControlIndex(active=True)
@@ -149,9 +142,6 @@ async def test_deactivate_is_idempotent(patched_watcher):
     assert result.changed is False
 
 
-# --------------------------------------------------------------------------
-# §5.3 Reset
-# --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_reset_clears_index_and_user_config(tmp_config, patched_watcher):
     tmp_config.update_user_config(UserConfig.model_validate({"folders": None}))
@@ -180,9 +170,6 @@ async def test_reset_can_keep_user_config(tmp_config, patched_watcher):
     assert tmp_config.user_conf_path.exists(), "keep_config=true не сохранил конфиг"
 
 
-# --------------------------------------------------------------------------
-# §5.4 Смена списка папок при остановленной индексации
-# --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_config_change_does_not_scan_while_deactivated(
     tmp_config, patched_watcher, tmp_path
@@ -204,7 +191,7 @@ async def test_config_change_does_not_scan_while_deactivated(
 
 @pytest.mark.asyncio
 async def test_config_change_scans_when_active(tmp_config, patched_watcher, tmp_path):
-    """Обратная сторона: при активной индексации поведение прежнее."""
+    """При активной индексации смена папок запускает проход и watcher."""
     docs = tmp_path / "docs"
     docs.mkdir()
     idx = ControlIndex(active=True)
@@ -217,9 +204,6 @@ async def test_config_change_scans_when_active(tmp_config, patched_watcher, tmp_
     assert "restart_watcher" in patched_watcher
 
 
-# --------------------------------------------------------------------------
-# Состояние реального индекса
-# --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_status_reports_active_flag(index: Index):  # noqa: F811
     """`active` отличает «остановлено» от «простаиваю» — оба дают is_indexing=false."""
@@ -247,10 +231,9 @@ async def test_activate_sets_flag_back(index: Index):  # noqa: F811
 async def test_deactivate_makes_status_honest(index: Index):  # noqa: F811
     """После остановки /status не должен рапортовать «индексация идёт».
 
-    is_indexing считается по `pending > 0`, а в счётчике после отмены прохода
-    остаётся хвост очереди. Без явного обнуления остановленный индексатор
-    вечно показывал бы работу — и MCP-мост говорил бы агенту, что пустая
-    выдача не окончательна.
+    is_indexing считается по `pending > 0`, а после отмены прохода в счётчике
+    остаётся хвост очереди. Без обнуления MCP-мост вечно говорил бы агенту, что
+    пустая выдача не окончательна.
     """
     index.counter.reset(5)
     index.watch_pending = 3

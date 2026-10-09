@@ -17,6 +17,9 @@ from .logging import get_logger
 
 MB = 1024 * 1024
 
+# Сколько путей класть в один фильтр удаления, чтобы не делать коммит на файл.
+DELETE_BATCH = 100
+
 # Ниже этого объёма IVF-PQ индекс не строим: на маленькой таблице полный
 # перебор всё равно быстрее, а KMeans на нескольких векторах просто падает
 # («cannot train N centroids with M vectors»).
@@ -442,8 +445,9 @@ class LanceWrapper:
         copied = sorted(
             self.paths_matching(predicate) & target.paths_matching(predicate)
         )
-        for i in range(0, len(copied), 100):
-            quoted = ", ".join(f"'{sql_quote(p)}'" for p in copied[i : i + 100])
+        for i in range(0, len(copied), DELETE_BATCH):
+            batch_paths = copied[i : i + DELETE_BATCH]
+            quoted = ", ".join(f"'{sql_quote(p)}'" for p in batch_paths)
             target.delete_sync(f"path IN ({quoted})")
         moved = 0
         query = self.table.search().where(predicate).limit(None)

@@ -2073,6 +2073,12 @@ def _result(msg_id, payload):
     return {"jsonrpc": "2.0", "id": msg_id, "result": payload}
 
 
+# Коды ошибок JSON-RPC 2.0.
+METHOD_NOT_FOUND = -32601
+INVALID_PARAMS = -32602
+INTERNAL_ERROR = -32603
+
+
 def _error(msg_id, code, message):
     return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
 
@@ -2092,16 +2098,16 @@ def _handle_tools_call(msg_id, params):
     if args is None:
         args = {}
     if not isinstance(args, dict):
-        return _error(msg_id, -32602, "поле 'arguments' должно быть объектом")
+        return _error(msg_id, INVALID_PARAMS, "поле 'arguments' должно быть объектом")
 
     # Метод tools/call есть, неверен его параметр name: -32602, как в примере
     # спецификации MCP (Tools → Error Handling). Не строка — тоже неизвестный.
     if not isinstance(name, str) or name not in _HANDLERS:
-        return _error(msg_id, -32602, "неизвестный инструмент: %s" % (name,))
+        return _error(msg_id, INVALID_PARAMS, "неизвестный инструмент: %s" % (name,))
     if name in _WRITE_TOOL_NAMES and not ALLOW_WRITE:
         return _error(
             msg_id,
-            -32602,
+            INVALID_PARAMS,
             "инструмент %s скрыт в этой установке (LQRAG_ALLOW_WRITE=0): "
             "управление индексацией из агента отключено" % name,
         )
@@ -2111,7 +2117,7 @@ def _handle_tools_call(msg_id, params):
     except InvalidParams as exc:
         # Ошибка вызова, а не ошибка выполнения: агент должен увидеть её как
         # неверные параметры и исправить вызов.
-        return _error(msg_id, -32602, str(exc))
+        return _error(msg_id, INVALID_PARAMS, str(exc))
     except ToolError as exc:
         _log("%s: %s" % (name, exc))
         return _tool_result(msg_id, "Ошибка %s: %s" % (name, exc), is_error=True)
@@ -2142,7 +2148,7 @@ def _handle(msg):
     # JSON-RPC допускает params-массив, а эти методы читают его через .get():
     # иначе AttributeError ронял бы мост.
     if method in ("initialize", "tools/call") and not isinstance(params, dict):
-        return _error(msg_id, -32602, "поле 'params' должно быть объектом")
+        return _error(msg_id, INVALID_PARAMS, "поле 'params' должно быть объектом")
 
     if method == "initialize":
         # Проба и автозапуск — в фоне: рукопожатие не ждёт ни сети, ни systemd.
@@ -2171,7 +2177,7 @@ def _handle(msg):
         return _handle_tools_call(msg_id, params)
 
     _log("метод не поддерживается:", method)
-    return _error(msg_id, -32601, "метод не найден: %s" % method)
+    return _error(msg_id, METHOD_NOT_FOUND, "метод не найден: %s" % method)
 
 
 def _safe_handle(msg):
@@ -2184,7 +2190,9 @@ def _safe_handle(msg):
     except Exception as exc:
         _log("сбой обработки сообщения: %r" % (exc,))
         if isinstance(msg, dict) and "id" in msg:
-            return _error(msg.get("id"), -32603, "внутренняя ошибка моста: %s" % exc)
+            return _error(
+                msg.get("id"), INTERNAL_ERROR, "внутренняя ошибка моста: %s" % exc
+            )
         return None
 
 

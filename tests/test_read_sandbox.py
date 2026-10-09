@@ -130,6 +130,35 @@ def test_symlink_to_fs_root_is_forbidden(tmp_path):
     assert _forbidden_folder(str(link))
 
 
+def test_symlink_to_system_dir_is_forbidden(tmp_path, monkeypatch):
+    system = tmp_path / "etc"
+    system.mkdir()
+    monkeypatch.setattr("src.server.router._SYSTEM_DIRS", (str(system),))
+    link = tmp_path / "конфиги"
+    link.symlink_to(system, target_is_directory=True)
+    assert _forbidden_folder(str(link))
+
+
+def test_symlink_to_hidden_home_dir_is_forbidden(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    link = home / "ключи"
+    link.symlink_to(home / ".ssh", target_is_directory=True)
+    assert _forbidden_folder(str(link))
+
+
+def test_home_under_system_dir_is_allowed(tmp_path, monkeypatch):
+    """Дом за ссылкой в системный каталог (/home -> /var/home на ostree) — штатный корень."""
+    real_home = tmp_path / "var" / "home" / "u"
+    (real_home / "Документы").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(real_home))
+    monkeypatch.setattr("src.server.router._SYSTEM_DIRS", (str(tmp_path / "var"),))
+    link = tmp_path / "Документы"
+    link.symlink_to(real_home / "Документы", target_is_directory=True)
+    assert not _forbidden_folder(str(link))
+
+
 @pytest.mark.parametrize("name", ["/", "/etc", ".ssh"])
 def test_validate_folders_refuses_dangerous_roots(tmp_path, name):
     """Список целиком отклоняется (400), конфиг не меняется — как у несуществующей папки."""

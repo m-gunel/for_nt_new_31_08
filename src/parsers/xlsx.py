@@ -157,8 +157,10 @@ def _read_rows(ws, limit: int) -> tuple[list[Row], bool]:
         if len(filled) == 1:  # жирная одиночная строка — подпись раздела
             try:
                 bold = bool(r[filled[0]].font.b)
-            except Exception:
-                bold = False
+            except Exception as exc:  # битый стиль ячейки — строка считается обычной
+                logger.debug(
+                    "xlsx: шрифт ячейки не прочитан (%s: %s)", type(exc).__name__, exc
+                )
         number = next((c.row for c in r if getattr(c, "row", None)), None)
         rows.append((vals, fmts, bold, number or (rows[-1][3] + 1 if rows else 1)))
         if len(rows) >= limit:

@@ -468,6 +468,51 @@ async def test_root_change_stops_email_stage_of_old_scanner(
     await asyncio.wait_for(email_index.task, 5)
 
 
+@pytest.mark.asyncio
+async def test_concurrent_root_change_creates_one_scanner(
+    email_index: Index, email_cfg: Config, tmp_path, monkeypatch
+):
+    """Роутер и поллинг, сменившие корень одновременно, получают один сканер."""
+    started = asyncio.Event()
+
+    async def nothing(*args, **kwargs):
+        return None
+
+    async def endless_email_pass(collect, scanner, store):
+        if store is email_index.email_store:
+            started.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(email_index, "reconcile_deleted", nothing)
+    monkeypatch.setattr(email_index, "_run_pass", endless_email_pass)
+    email_index.task = asyncio.create_task(email_index.scan_all())
+    await asyncio.wait_for(started.wait(), 5)
+    other_root = make_profile(tmp_path / "tb2", {"INBOX": default_inbox_messages()})
+    monkeypatch.setattr(
+        email_cfg,
+        "email",
+        EmailConfig(enabled=True, path_to_email_folder=str(other_root)),
+    )
+
+    created = []
+    create = email_index._create_emails_scanner
+
+    def counting_create():
+        created.append(create())
+        return created[-1]
+
+    monkeypatch.setattr(email_index, "_create_emails_scanner", counting_create)
+
+    first, second = await asyncio.gather(
+        email_index._ensure_emails_scanner(), email_index._ensure_emails_scanner()
+    )
+
+    assert len(created) == 1, "второй вызов создал лишний сканер"
+    assert first is second is email_index.emails_scanner
+    assert first.path == other_root
+    await asyncio.wait_for(email_index.task, 5)
+
+
 # --- T095: закрытие индекса гасит все фоновые задачи ------------------------
 
 

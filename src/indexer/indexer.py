@@ -42,7 +42,7 @@ from src.utils import (
     wrap_exception_logger,
     wrap_iter_to_async,
 )
-from src.utils.lance_wrapper import LanceWrapper, sql_quote
+from src.utils.lance_wrapper import DELETE_BATCH, LanceWrapper, sql_quote
 from src.utils.lsm_adapter import LSMCollection, check_meta_changed
 from src.utils.lsm_adapter import to_thread as lsm_to_thread
 from src.utils.lsm_adapter import wait_idle as lsm_wait_idle
@@ -61,9 +61,6 @@ lg = get_logger(__name__, slice=-1)
 
 
 GIB = 1024**3
-
-# Сколько путей класть в один фильтр удаления, чтобы не делать коммит на файл.
-_DELETE_BATCH = 100
 
 # Через сколько записанных батчей перепроверять свободное место во время
 # прохода. disk_usage — системный вызов, на каждый батч он лишний.
@@ -271,8 +268,12 @@ class Index(AbstractAsyncContextManager):
             # Почтовый этап идущего прохода читает очередь этого сканера —
             # обрываем его, пока она открыта.
             await self._stop_email_stage()
+            # Пока ждали, сканер мог пересоздать параллельный вызов.
+            if self.emails_scanner is not None and self.emails_scanner.path == root:
+                return self.emails_scanner
             # Новый сканер читает offsets.json в конструкторе.
-            self.emails_scanner._save_state()
+            if self.emails_scanner is not None:
+                self.emails_scanner._save_state()
         old, self.emails_scanner = self.emails_scanner, self._create_emails_scanner()
         if old is not None:
             # Очередь прежнего закрываем сразу, а не на остановке демона: новый
@@ -803,8 +804,8 @@ class Index(AbstractAsyncContextManager):
         """
         if any(map(is_email_path, paths)):
             raise ValueError("почта удаляется по префиксу, а не по точному пути")
-        for start in range(0, len(paths), _DELETE_BATCH):
-            batch = paths[start : start + _DELETE_BATCH]
+        for start in range(0, len(paths), DELETE_BATCH):
+            batch = paths[start : start + DELETE_BATCH]
             predicate = "path IN ({})".format(
                 ", ".join(f"'{sql_quote(p)}'" for p in batch)
             )

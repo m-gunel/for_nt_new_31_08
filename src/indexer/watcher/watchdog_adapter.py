@@ -19,6 +19,7 @@ from watchdog.events import (
     FileSystemEventHandler,
 )
 from watchdog.observers import Observer
+from watchdog.utils import UnsupportedLibcError
 from watchfiles import Change, DefaultFilter
 
 from src.utils import get_logger
@@ -29,7 +30,7 @@ try:
     # Только Linux: на других ОС модуль не импортируется (в libc нет inotify).
     from watchdog.observers.inotify import InotifyObserver as _InotifyObserver
     from watchdog.observers.inotify_c import Inotify as _Inotify
-except Exception:
+except (ImportError, OSError, UnsupportedLibcError):
     _InotifyObserver = None  # type: ignore[assignment,misc]
     _Inotify = None  # type: ignore[assignment,misc]
 

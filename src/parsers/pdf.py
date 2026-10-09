@@ -4,10 +4,14 @@ from typing import BinaryIO
 
 import pymupdf
 
+from src.utils import get_logger
+
 from .base import Parser, SkipFile, parser
 from .doc_model import Block, ParsedDoc
 from .metadata import pdf_properties
 from .ocr import needs_ocr, recognize
+
+logger = get_logger(__name__)
 
 # Частная область F0xx: Symbol кладёт туда буквы и знаки (их переводит
 # normalize.py), а шрифты-пиктограммы — маркеры списков и галочки.
@@ -28,7 +32,8 @@ def _dingbats_to_bullets(page: pymupdf.Page, text: str) -> str:
                     font = span["font"].lower()
                     dingbat = any(name in font for name in _DINGBAT_FONTS)
                     (marks if dingbat else other).update(_PUA.findall(span["text"]))
-    except Exception:  # шрифты страницы не прочитались — знаки по таблице Symbol
+    except Exception as exc:  # шрифты страницы не прочитались — знаки по таблице Symbol
+        logger.debug("pdf: шрифты страницы не прочитаны (%s: %s)", type(exc).__name__, exc)
         return text
     # Код, встреченный и в другом шрифте страницы, оставляем таблице Symbol.
     if not (marks := marks - other):

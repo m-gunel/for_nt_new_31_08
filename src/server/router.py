@@ -185,7 +185,21 @@ def _forbidden_folder(folder: str) -> bool:
     бы ему всю ФС или конфиги с токенами.
     """
     path = os.path.abspath(os.path.expanduser(folder))
-    if path == os.sep or os.path.realpath(path) == os.sep:
+    if _forbidden_path(path):
+        return True
+    # Цель ссылки тоже: папка ~/x -> /etc или ~/x -> ~/.ssh иначе прошла бы.
+    real = os.path.realpath(path)
+    home = os.path.realpath(os.path.expanduser("~"))
+    if real == home or real.startswith(home + os.sep):
+        # Дом бывает под системным каталогом (/var/home): внутри него — только скрытые.
+        return any(
+            part.startswith(".") for part in Path(os.path.relpath(real, home)).parts
+        )
+    return _forbidden_path(real)
+
+
+def _forbidden_path(path: str) -> bool:
+    if path == os.sep:
         return True
     if any(path == d or path.startswith(d + os.sep) for d in _SYSTEM_DIRS):
         return True

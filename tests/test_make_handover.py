@@ -20,10 +20,16 @@ SCRIPT = ROOT / "scripts" / "make_handover.sh"
 TOOLS = ("dirname", "rm", "mkdir", "grep", "sed", "tail", "rsync", "zip", "mv")
 TOOLS += ("cut", "sort", "cat")
 
-pytestmark = pytest.mark.skipif(
-    not all(shutil.which(tool) for tool in ("bash", *TOOLS)),
-    reason="нужны bash, rsync, zip и coreutils",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not all(shutil.which(tool) for tool in ("bash", *TOOLS)),
+        reason="нужны bash, rsync, zip и coreutils",
+    ),
+    pytest.mark.skipif(
+        not (ROOT / "Makefile").is_file(),
+        reason="Makefile в контекст docker-сборки CI не копируется",
+    ),
+]
 
 # Токен и URL собираются в рантайме: литерал в исходнике остановил бы сборку
 # архива из настоящего репозитория.

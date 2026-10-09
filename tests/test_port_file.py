@@ -1,8 +1,9 @@
-"""Публикация порта: сбой при динамическом порте — ошибка, а не предупреждение."""
+"""Публикация порта и pid: сбой, из-за которого мост не найдёт демон или не
+предъявит ему токен, — ошибка, а не предупреждение."""
 
 import logging
 
-from src.port_file import publish_port
+from src.port_file import publish_pid, publish_port
 
 
 def _broken_root(tmp_path):
@@ -30,3 +31,14 @@ def test_unpublished_fallback_port_is_warning(tmp_path, caplog):
     assert publish_port(_broken_root(tmp_path), 8000) is None
     assert not _errors(caplog)
     assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_unpublished_pid_is_error(tmp_path, caplog):
+    """Без pid мост не отдаст демону токен агента: агенту 401 на всё."""
+    caplog.set_level(logging.WARNING, logger="app")
+
+    published = publish_pid(_broken_root(tmp_path))
+
+    assert published is None
+    errors = _errors(caplog)
+    assert errors and "токен агента" in errors[0].getMessage()

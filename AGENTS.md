@@ -31,7 +31,9 @@ CONFIG_PATH=cfg/mcp.yml RAG_PORT=8000 .venv/bin/python main.py &
 # uvicorn уже забинденный сокет, и своё стартовое сообщение тот не печатает.
 ```
 Читается `CONFIG_PATH` из env (см. `src/config.py`, `set_config`). Дефолтный адрес — 127.0.0.1:8000
-(`RAG_HOST`, `RAG_PORT`); `RAG_HOST=0.0.0.0` открыл бы API без авторизации всей сети.
+(`RAG_HOST`, `RAG_PORT`; пустой `RAG_HOST` — тоже 127.0.0.1). Не-loopback адрес требует двух
+переключателей сразу — `RAG_HOST=<адрес>` И `LQRAG_EXPOSE=1`, иначе демон отказывается
+стартовать (`src/bind_host.py`); имя, по которому к нему обращаются, — ещё и в `RAG_ALLOWED_HOSTS`.
 **НЕ использовать `nice` на старте** (зависает OpenVINO); `renice` — только после готовности Uvicorn.
 
 ## Критические "грабли" (НЕ менять)
@@ -55,6 +57,19 @@ CONFIG_PATH=cfg/mcp.yml RAG_PORT=8000 .venv/bin/python main.py &
 - Юнит демона — `Type=notify` с `WatchdogSec`: `READY=1` шлёт `app_life` после прогрева
   (`src/server/app.py`), без него старт упадёт по таймауту; пинг `WATCHDOG=1` идёт из
   event loop раз в `WatchdogSec/2` — не блокировать loop дольше 60 c, долгую работу — в `to_thread`.
+- Аутентификация API (VAS-6850): все ручки под `/api/v1`, кроме `/health`, требуют
+  `Authorization: Bearer <токен>`; проверка идёт до чтения тела запроса
+  (`TokenFirstMiddleware`). `register_mcp.py` всегда пишет в `<дом>/.files-search`:
+  токен агента — в `tokens/<агент>.token` (0600), sha256 — в `auth.json`. Демон читает
+  `<lsm_root>/auth.json`; при `DEV=1` это `data/app` — скопируйте туда
+  `install -m 600 ~/.files-search/auth.json data/app/`, а мосту задайте `LQRAG_URL` и
+  `LQRAG_TOKEN_FILE`. В конфиге агента — только несекретный ярлык `LQRAG_AGENT`.
+  НЕ ослаблять fail-closed в `src/server/auth.py` (нет, пустой или битый auth.json — 401
+  всем) и НЕ вписывать сам токен в конфиг агента, argv, env или лог. Повторная
+  регистрация переиспользует действующий токен (`--rotate` — только явно), иначе
+  `.path`-юниты ломали бы все мосты. `--revoke <агент>` — смена секрета, а не запрет:
+  пока агент установлен, следующая регистрация выдаст новый токен; отозванные и
+  перевыпущенные токены регистратор помнит в `withdrawn_tokens` и не возвращает.
 
 ## Лечение известных проблем
 - **Индекс битый, старой схемы или другой модели** → демон при старте сам собирает
@@ -67,6 +82,13 @@ CONFIG_PATH=cfg/mcp.yml RAG_PORT=8000 .venv/bin/python main.py &
   свой `threading.local()` InferRequest на поток, а НЕ через общий на модель
   `self.ov_model.tokenizer([text])`. Не возвращать старый вызов: сплиттер зовут из потоков
   парсинга, и общий InferRequest их не выдерживает.
+- **`tests/test_mcp_autostart.py` валится с `[Errno 1] Operation not permitted: '.../systemctl'`**
+  (весь файл, тексты «не удалось вызвать …») → LSM машины запрещает исполнение
+  файлов из `/tmp`, где pytest держит `tmp_path`: заглушка systemctl не стартует,
+  хотя код в порядке. Обход — база tmp вне `/tmp` и вне репо, без точечных компонент
+  в пути (скрытые каталоги исключает `check_path` из `src/indexer/exclude.py`, и
+  watcher-тесты молча теряют события):
+  `uv run --frozen pytest -m "not integration" --basetemp=../pytest-tmp`.
 
 ## Ядро API (для справки)
 - HTTP sidecar (127.0.0.1:8000): `GET /api/v1/health`, `GET /api/v1/status`,
@@ -80,8 +102,10 @@ CONFIG_PATH=cfg/mcp.yml RAG_PORT=8000 .venv/bin/python main.py &
   существуют; смена списка папок идёт через `POST /api/v1/config`.
 - Запросы с не-loopback `Host` (400) или `Origin` (403) демон отклоняет — защита
   от DNS rebinding и CSRF из браузера; мост и curl `Origin` не шлют и проходят.
-  Другие имена хоста — `RAG_ALLOWED_HOSTS` (через запятую). Аутентификации нет:
-  процесс другой учётки на том же АРМ до API достучится.
+  Другие имена хоста — `RAG_ALLOWED_HOSTS` (через запятую). Сверх этого все ручки,
+  кроме `/health`, требуют токен агента (401 без него), curl — так, чтобы токен не попал
+  в argv: `curl -H @<(printf 'Authorization: Bearer %s' "$(cat ~/.files-search/tokens/<агент>.token)") …`.
+  Процессы того же UID схема не различает — это граница ОС.
 - MCP-мост: `mcp_server.py` (чистый stdlib) + `mcp_launcher.sh`. По умолчанию
   агенту видны все семь инструментов: `local_search`,
   `local_index_status`, `local_read_file` и четыре управления индексацией
@@ -90,8 +114,9 @@ CONFIG_PATH=cfg/mcp.yml RAG_PORT=8000 .venv/bin/python main.py &
 - Мост собирается в `dist/mcp/` целью `make dist_mcp` (её вызывает `make build`):
   PyInstaller пакует только `main.py`, и без этого мост не попадает в `distro.zip`.
 - Тесты моста: `tests/test_mcp_protocol.py` и `tests/test_mcp_tools_contract.py`
-  (заглушка сайдкара, без OpenVINO), `tests/test_mcp_integration.py` под маркером
-  `integration`.
+  (заглушка сайдкара, без OpenVINO), `tests/test_mcp_auth.py` (токен агента и 401),
+  `tests/test_auth_contract.py` (имена и пути токена у регистратора, моста и демона),
+  `tests/test_mcp_integration.py` под маркером `integration`.
 
 ---
 *This file was generated by APM CLI. Do not edit manually.*

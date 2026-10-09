@@ -38,7 +38,15 @@ class _StubHandler(BaseHTTPRequestHandler):
             body = json.loads(raw) if raw else None
         except ValueError:
             body = None
-        self.stub.requests.append({"method": method, "path": self.path, "body": body})
+        self.stub.requests.append(
+            {
+                "method": method,
+                "path": self.path,
+                "body": body,
+                # Заголовки — для тестов авторизации: что мост предъявил.
+                "headers": dict(self.headers),
+            }
+        )
 
         route = self.stub.routes.get((method, self.path))
         if route is None:
@@ -120,7 +128,9 @@ class StubSidecar:
         # Короткий poll: shutdown() ждёт следующего опроса, дефолтные 0,5 с
         # добавляли бы полсекунды к каждому teardown.
         self._thread = threading.Thread(
-            target=self._server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
+            target=self._server.serve_forever,
+            kwargs={"poll_interval": 0.02},
+            daemon=True,
         )
         self._thread.start()
 
@@ -136,7 +146,9 @@ class StubSidecar:
     def bodies(self, method, path):
         """Тела запросов, пришедших на этот маршрут — в порядке поступления."""
         return [
-            r["body"] for r in self.requests if r["method"] == method and r["path"] == path
+            r["body"]
+            for r in self.requests
+            if r["method"] == method and r["path"] == path
         ]
 
     def close(self):
@@ -149,6 +161,9 @@ class Bridge:
 
     def __init__(self, url, **env):
         environment = dict(os.environ)
+        # Ярлык и токен из окружения разработчика не должны попасть к заглушке.
+        for key in ("LQRAG_AGENT", "LQRAG_TOKEN_FILE"):
+            environment.pop(key, None)
         environment["LQRAG_URL"] = url
         environment.setdefault("LQRAG_TIMEOUT", "5")
         for key, value in env.items():

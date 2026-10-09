@@ -18,8 +18,14 @@
     "localrag": {
       "command": "/usr/lib/lib-local-rag/mcp/mcp_launcher.sh",
       "args": [],
+      // LQRAG_AGENT — несекретный ярлык: по нему мост находит свой токен в
+      // ~/.files-search/tokens/<агент>.token и предъявляет его демону (API
+      // требует Authorization: Bearer). Сам токен в конфиге не живёт: конфиги
+      // коммитят в репозитории. Значение кладёт register_mcp.py; здесь
+      // показано, как выглядит итоговая запись.
       "env": {
-        "LQRAG_TIMEOUT": "110"
+        "LQRAG_TIMEOUT": "110",
+        "LQRAG_AGENT": "gigacode"
       }
     }
   }

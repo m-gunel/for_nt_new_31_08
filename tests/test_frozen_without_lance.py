@@ -80,5 +80,8 @@ def test_spec_does_not_exclude_lance():
     excludes = re.search(r"excludes=\[(.*?)\]", spec, re.S)
     assert excludes is not None
     assert "'lance'" not in excludes.group(1) and '"lance"' not in excludes.group(1)
-    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
-    assert not re.search(r"--exclude-module[= ]lance\b", makefile)
+    # Без Makefile (контекст docker-сборки CI) проверяется только main.spec.
+    makefile = ROOT / "Makefile"
+    if makefile.is_file():
+        text = makefile.read_text(encoding="utf-8")
+        assert not re.search(r"--exclude-module[= ]lance\b", text)

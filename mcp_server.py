@@ -20,6 +20,12 @@
                        Не задан — $HOME/.files-search/port, затем тот же файл
                        в домашнем каталоге из passwd; файл, чей демон жив по
                        соседнему pid, берётся раньше устаревшего
+  LQRAG_AGENT        — несекретный ярлык агента (gigacode, wsc); по нему мост
+                       берёт токен из tokens/<агент>.token рядом с порт-файлом
+  LQRAG_TOKEN_FILE   — явный путь к файлу токена; задан — берём только его.
+                       Токен уходит лишь нашему демону: по порт-файлу с живым
+                       pid этой учётки или на loopback-адрес LQRAG_URL, а на
+                       Linux — если порт слушает процесс этой учётки
   LQRAG_TIMEOUT      — таймаут HTTP, сек (по умолчанию 30)
   LQRAG_AUTOSTART    — 0 запрещает мосту поднимать lib-local-rag.service, когда
                        демон недоступен (по умолчанию поднимает, не чаще раза
@@ -31,16 +37,19 @@
 """
 
 import datetime
+import ipaddress
 import json
 import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
@@ -57,11 +66,37 @@ PID_FILE_NAME = "pid"
 FALLBACK_URL = "http://127.0.0.1:8000"
 LQRAG_TIMEOUT = float(os.environ.get("LQRAG_TIMEOUT", "30"))
 
+# Токен агента (VAS-6850): в конфиге агента только несекретный ярлык
+# LQRAG_AGENT, секрет — в tokens/<агент>.token рядом с порт-файлом. Явный
+# LQRAG_TOKEN_FILE заменяет поиск, как LQRAG_PORT_FILE.
+_AGENT_ENV = os.environ.get("LQRAG_AGENT", "").strip()
+# Имя агента — часть пути к токену: «../x» увёл бы путь за пределы tokens/.
+_AGENT_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+AGENT_NAME = _AGENT_ENV if _AGENT_NAME_RE.fullmatch(_AGENT_ENV) else ""
+_TOKEN_FILE_ENV = os.environ.get("LQRAG_TOKEN_FILE")
+LQRAG_TOKEN_FILE = os.path.expanduser(_TOKEN_FILE_ENV) if _TOKEN_FILE_ENV else None
+TOKENS_DIR_NAME = "tokens"
+TOKEN_SUFFIX = ".token"
+# Алфавит secrets.token_urlsafe. Перевод строки внутри файла http.client
+# вернул бы в ValueError вместе с токеном, а текст ошибки уходит агенту.
+TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{20,}")
+# Владельца слушающего порта Linux показывает в этих таблицах без root.
+PROC_NET_TABLES = ("/proc/net/tcp", "/proc/net/tcp6")
+TCP_LISTEN_STATE = "0A"
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Редирект отдаётся как ответ: urllib перенёс бы Authorization на новый адрес."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 # Без прокси: штатный urlopen берёт http_proxy из окружения агента, а no_proxy
 # сравнивает строкой («localhost» не покрывает 127.0.0.1). 502 прокси выглядит
 # как ответ живого демона, и автозапуск не срабатывает. Все запросы к сайдкару —
 # только через этот opener.
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
 # Автозапуск: если служба не поднята (остановлена, сессия не перезапущена после
 # установки), мост сам зовёт systemctl — просить об этом пользователя нельзя.
@@ -83,6 +118,20 @@ MASKED_RETRY_S = 30.0
 WARMING_TEXT = (
     "Индексатор LocalRAG запускается или прогревается (обычно около 45 секунд). "
     "Повторите запрос через минуту."
+)
+UNAUTHORIZED_TEXT = (
+    "Индексатор LocalRAG отклонил запрос: нет действующего токена агента "
+    "(401). Токен выдаётся при регистрации моста; после установки или "
+    "обновления пакета перезапустите агент, а если не помогло — диагностика: "
+    "python3 /usr/lib/lib-local-rag/mcp/register_mcp.py --doctor"
+)
+BROKEN_TOKEN_TEXT = (
+    "Файл токена агента %s повреждён (%s), запрос не отправлен. Перевыпустите "
+    "токен: python3 /usr/lib/lib-local-rag/mcp/register_mcp.py --rotate"
+)
+FOREIGN_LISTENER_TEXT = (
+    "порт %d занят чужим процессом (не этого пользователя), запрос и токен "
+    "агента туда не отправлены"
 )
 STUCK_TEXT = "Индексатор LocalRAG не поднимается (%s)."
 SERVICE_MISSING_TEXT = (
@@ -182,6 +231,10 @@ class ReplyTimeout(TransportError):
     """Сайдкар принял запрос, но не ответил за LQRAG_TIMEOUT: жив, но занят."""
 
 
+class ForeignListener(Exception):
+    """Порт маршрута слушает процесс другого пользователя: туда не шлём ничего."""
+
+
 def _port_file_candidates():
     """Где искать порт-файл без LQRAG_PORT_FILE: в $HOME и в доме из passwd.
 
@@ -222,12 +275,8 @@ def _read_port(path):
     return port if 1 <= port <= 65535 else None
 
 
-def _pid_alive(port_file):
-    """Жив ли демон, опубликовавший порт: True, False или None (неизвестно).
-
-    pid лежит рядом с порт-файлом. После SIGKILL или выключения питания оба
-    файла остаются, и по одному порту живой демон от мёртвого не отличить.
-    """
+def _read_pid(port_file):
+    """pid демона из файла рядом с порт-файлом; None — нет, битый или не POSIX."""
     # os.kill(pid, 0) на Windows не проверка, а TerminateProcess.
     if not port_file or os.name != "posix":
         return None
@@ -238,7 +287,17 @@ def _pid_alive(port_file):
     except (OSError, ValueError):
         return None
     # 0 и отрицательные — группа процессов, а не процесс: такой ответ ни о чём.
-    if pid <= 0:
+    return pid if pid > 0 else None
+
+
+def _pid_alive(port_file):
+    """Жив ли демон, опубликовавший порт: True, False или None (неизвестно).
+
+    После SIGKILL или выключения питания порт-файл и pid остаются, и по одному
+    порту живой демон от мёртвого не отличить.
+    """
+    pid = _read_pid(port_file)
+    if pid is None:
         return None
     try:
         os.kill(pid, 0)
@@ -249,6 +308,22 @@ def _pid_alive(port_file):
         return True
     except OSError:
         return None
+    return True
+
+
+def pid_is_ours(port_file):
+    """Порт опубликовал живой процесс этого пользователя.
+
+    PermissionError здесь — «чужой»: pid из устаревшего файла мог достаться
+    процессу другой учётки, а ей токен не положен.
+    """
+    pid = _read_pid(port_file)
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
     return True
 
 
@@ -280,6 +355,175 @@ def _port_file_routes():
     return routes, checked
 
 
+def _token_path(source, port_file):
+    """Файл токена для маршрута или None, если токен по нему не положен.
+
+    Токен — из того же корня, что и порт: при разошедшихся домах иначе ушёл бы
+    токен одного дома демону другого. Запасному адресу токен не положен: на
+    8000 может слушать кто угодно.
+    """
+    if source == "fallback":
+        return None
+    if LQRAG_TOKEN_FILE:
+        return LQRAG_TOKEN_FILE
+    if not AGENT_NAME or not port_file:
+        return None
+    return os.path.join(
+        os.path.dirname(port_file), TOKENS_DIR_NAME, AGENT_NAME + TOKEN_SUFFIX
+    )
+
+
+def _read_token(path):
+    """Токен из файла; None — файла нет. Битый файл — ToolError без содержимого.
+
+    Читается на каждом запросе: ротация и отзыв подменяют файл, и перезапуск
+    агента для них не нужен.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            token = handle.read().strip()
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError:
+        raise ToolError(BROKEN_TOKEN_TEXT % (path, "не текст UTF-8")) from None
+    except OSError as exc:
+        raise ToolError(BROKEN_TOKEN_TEXT % (path, exc.strerror or exc)) from None
+    if not TOKEN_RE.fullmatch(token):
+        raise ToolError(BROKEN_TOKEN_TEXT % (path, "содержимое не похоже на токен"))
+    return token
+
+
+def _loopback_targets(base):
+    """(адреса, порт) маршрута на эту машину; None — адрес не loopback."""
+    parts = urllib.parse.urlsplit(base)
+    try:
+        port = parts.port
+        target = ipaddress.ip_address(parts.hostname or "")
+    except ValueError:
+        return None
+    if port is None or not target.is_loopback:
+        return None
+    return [target], port
+
+
+def _pin_localhost(url):
+    """localhost в URL — 127.0.0.1, где и слушает демон (сокет AF_INET).
+
+    Иначе urllib разрешил бы имя и в ::1, а владельца там мост не проверял.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if (parts.hostname or "").lower() != "localhost":
+        return url
+    try:
+        port = parts.port
+    except ValueError:
+        return url
+    netloc = "127.0.0.1" if port is None else "127.0.0.1:%d" % port
+    return urllib.parse.urlunsplit(parts._replace(netloc=netloc))
+
+
+def _proc_address(hex_address):
+    """Адрес из /proc/net/tcp*: ядро печатает его 32-битными словами хоста."""
+    words = [hex_address[i : i + 8] for i in range(0, len(hex_address), 8)]
+    packed = b"".join(struct.pack("=I", int(word, 16)) for word in words)
+    return ipaddress.ip_address(packed)
+
+
+def _table_listeners(table, port):
+    """[(адрес, uid)] сокетов в LISTEN на port из одной таблицы /proc/net."""
+    with open(table, "r", encoding="ascii") as handle:
+        rows = handle.read().splitlines()[1:]
+    found = []
+    for row in rows:
+        # sl local_address rem_address st tx:rx tr:when retrnsmt uid ...
+        fields = row.split()
+        if len(fields) < 8 or fields[3] != TCP_LISTEN_STATE:
+            continue
+        address, _, hex_port = fields[1].partition(":")
+        if int(hex_port, 16) == port:
+            found.append((_proc_address(address), int(fields[7])))
+    return found
+
+
+def _proc_listeners(port):
+    """[(адрес, uid)] сокетов в LISTEN на port; None — /proc нет (не Linux)."""
+    if not os.path.exists(PROC_NET_TABLES[0]):
+        return None
+    listeners = []
+    for table in PROC_NET_TABLES:
+        # tcp6 нет, если IPv6 выключен в ядре.
+        if os.path.exists(table):
+            listeners.extend(_table_listeners(table, port))
+    return listeners
+
+
+def _accepting_uids(listeners, target):
+    """uid сокетов, которые примут соединение на target.
+
+    Точный адрес ядро предпочитает подстановочному: иначе чужой [::]:порт с
+    IPV6_V6ONLY отрезал бы мост от нашего демона на 127.0.0.1.
+    """
+    exact = [
+        uid
+        for address, uid in listeners
+        if address == target or getattr(address, "ipv4_mapped", None) == target
+    ]
+    # IPv6-подстановочный сокет (dual-stack) принимает и IPv4.
+    wildcard = [
+        uid
+        for address, uid in listeners
+        if address.is_unspecified and address.version >= target.version
+    ]
+    return exact or wildcard
+
+
+def _listener_owner(targets, port):
+    """Кто примет соединение: "ours", "foreign", "absent"; None — нечем проверить."""
+    listeners = _proc_listeners(port)
+    if listeners is None:
+        return None
+    uids = set()
+    for target in targets:
+        uids.update(_accepting_uids(listeners, target))
+    if not uids:
+        return "absent"
+    return "ours" if uids == {os.getuid()} else "foreign"
+
+
+def check_listener(base):
+    """Кто слушает порт маршрута: "ours", "absent", "remote" (не loopback), None.
+
+    None — проверить нечем (нет /proc). ForeignListener — порт слушает процесс
+    другой учётки. Туда не шлём ничего, даже без токена: её ответы — это выдача
+    поиска и папки, которыми мост ограничивает local_read_file.
+    """
+    route = _loopback_targets(base)
+    if route is None:
+        return "remote"
+    owner = _listener_owner(*route)
+    if owner == "foreign":
+        raise ForeignListener(FOREIGN_LISTENER_TEXT % route[1])
+    return owner
+
+
+def _route_auth(source, base, port_file):
+    """Заголовок Authorization для маршрута; {} — токен по нему не положен.
+
+    Токен уходит только нашему демону: на loopback, по порт-файлу — с живым pid
+    этой учётки, а на Linux порт должен слушать процесс нашего uid. Иначе
+    перехватчик порта из устаревшего порт-файла получил бы токен, а с ним и
+    чтение файлов. ForeignListener — порт слушает чужой процесс.
+    """
+    owner = check_listener(base)
+    path = _token_path(source, port_file)
+    if not path or owner in ("absent", "remote"):
+        return {}
+    if source == "port-file" and not pid_is_ours(port_file):
+        return {}
+    token = _read_token(path)
+    return {"Authorization": "Bearer " + token} if token else {}
+
+
 def _resolve_routes():
     """(routes, source, checked): куда стучаться, по порядку предпочтения.
 
@@ -288,7 +532,7 @@ def _resolve_routes():
     """
     explicit = os.environ.get("LQRAG_URL")
     if explicit:
-        return [(explicit.rstrip("/"), None, None)], "env", []
+        return [(_pin_localhost(explicit.rstrip("/")), None, None)], "env", []
     routes, checked = _port_file_routes()
     if routes:
         return routes, "port-file", checked
@@ -562,6 +806,13 @@ def _probe_and_autostart():
         return
     failure = None
     for url, _, _ in _attempt_order(routes):
+        try:
+            check_listener(url)
+        except ForeignListener as exc:
+            # Чужой ответ не значит, что наш демон жив: идём дальше к автозапуску.
+            if failure is None:
+                failure = (url, str(exc))
+            continue
         req = urllib.request.Request(
             url + "/api/v1/health", headers={"Accept": "application/json"}
         )
@@ -667,6 +918,9 @@ def _api_error(exc):
         detail = json.loads(raw).get("detail", raw)
     except Exception:
         pass
+    # Серверный detail называет состояние, а агенту нужен рецепт починки.
+    if exc.code == 401:
+        return ApiError(401, UNAUTHORIZED_TEXT)
     return ApiError(exc.code, detail)
 
 
@@ -680,8 +934,15 @@ def _http_json(method, path, payload=None):
     refused = None
     body = None
     for base, port_file, _ in _attempt_order(routes):
+        try:
+            auth = _route_auth(source, base, port_file)
+        except ForeignListener as exc:
+            # Запрос не ушёл, как и при отказе соединения: пробуем другой адрес.
+            if refused is None:
+                refused = (base, port_file, str(exc))
+            continue
         req = urllib.request.Request(
-            base + path, data=data, headers=headers, method=method
+            base + path, data=data, headers=dict(headers, **auth), method=method
         )
         try:
             with _OPENER.open(req, timeout=LQRAG_TIMEOUT) as resp:
@@ -703,9 +964,7 @@ def _http_json(method, path, payload=None):
             # Соединение было, ответа нет — демон жив, но не уложился.
             _note_reachable()
             error = ReplyTimeout if isinstance(exc, socket.timeout) else TransportError
-            raise error(
-                "сбой связи с сайдкаром %s: %s" % (base, exc)
-            ) from None
+            raise error("сбой связи с сайдкаром %s: %s" % (base, exc)) from None
         break
     else:
         base, port_file, reason = refused
@@ -734,7 +993,9 @@ def _reject_unknown(args, allowed):
 def _require_str(args, name):
     value = args.get(name)
     if not isinstance(value, str) or not value.strip():
-        raise InvalidParams("параметр '%s' обязателен и должен быть непустой строкой" % name)
+        raise InvalidParams(
+            "параметр '%s' обязателен и должен быть непустой строкой" % name
+        )
     return value.strip()
 
 
@@ -921,8 +1182,17 @@ def _format_score(value):
 # Единица «страницы» фрагмента по формату: у pptx это слайд, у таблиц — лист.
 _PAGE_UNIT = {".pptx": "слайд", ".xlsx": "лист", ".xls": "лист"}
 # Поля места фрагмента, которые демон отдаёт в /search (src/server/model.py).
-_CHUNK_PLACE = ("kind", "page_start", "page_end", "line_start", "line_end", "section",
-                "table_id", "row_start", "row_end")
+_CHUNK_PLACE = (
+    "kind",
+    "page_start",
+    "page_end",
+    "line_start",
+    "line_end",
+    "section",
+    "table_id",
+    "row_start",
+    "row_end",
+)
 
 
 def _span(start, end):
@@ -934,7 +1204,9 @@ def _chunk_place(chunk, ext):
     parts = []
     if isinstance(chunk.get("page_start"), int):
         unit = _PAGE_UNIT.get(ext, "стр.")
-        parts.append("%s %s" % (unit, _span(chunk["page_start"], chunk.get("page_end"))))
+        parts.append(
+            "%s %s" % (unit, _span(chunk["page_start"], chunk.get("page_end")))
+        )
     if isinstance(chunk.get("line_start"), int):
         parts.append("строки %s" % _span(chunk["line_start"], chunk.get("line_end")))
     if chunk.get("section"):
@@ -1124,7 +1396,9 @@ def _tool_search(args):
     _reject_unknown(args, ("query", "limit", "query_type") + _SEARCH_FILTER_ARGS)
     query = _require_str(args, "query")
     limit = _optional_int(args, "limit", 10, 1, 50)
-    query_type = _optional_enum(args, "query_type", "hybrid", ("hybrid", "vector", "text"))
+    query_type = _optional_enum(
+        args, "query_type", "hybrid", ("hybrid", "vector", "text")
+    )
     filters = _search_filters(args)
 
     payload = {
@@ -1237,9 +1511,25 @@ def _tool_index_status(args):
 # .env, .ini, .conf, .properties, .toml исключены намеренно: в таких файлах
 # лежат токены, а индекс может покрывать весь домашний каталог.
 TEXT_EXTENSIONS = {
-    ".txt", ".md", ".markdown", ".rst", ".csv", ".tsv", ".log",
-    ".json", ".yml", ".yaml", ".xml", ".html", ".htm",
-    ".py", ".sh", ".sql", ".java", ".kt", ".ipynb",
+    ".txt",
+    ".md",
+    ".markdown",
+    ".rst",
+    ".csv",
+    ".tsv",
+    ".log",
+    ".json",
+    ".yml",
+    ".yaml",
+    ".xml",
+    ".html",
+    ".htm",
+    ".py",
+    ".sh",
+    ".sql",
+    ".java",
+    ".kt",
+    ".ipynb",
 }
 # Легаси .doc/.xls читает только демон (конвертер Р7); без него — отказ с
 # подсказкой.
@@ -1256,7 +1546,10 @@ def _indexed_roots():
     HTTP-запрос каждый раз, но и залипать на устаревшем списке не должны.
     """
     now = time.monotonic()
-    if _folders_cache["roots"] is not None and now - _folders_cache["ts"] < _FOLDERS_TTL:
+    if (
+        _folders_cache["roots"] is not None
+        and now - _folders_cache["ts"] < _FOLDERS_TTL
+    ):
         return _folders_cache["roots"]
     data = _http_json("GET", "/api/v1/config")
     roots = []
@@ -1465,8 +1758,7 @@ def _read_text(path, ext):
             raise ToolError(
                 "формат %s требует библиотеки %s, которой нет в окружении моста. "
                 "Текстовые форматы читаются без дополнительных библиотек; "
-                "фрагменты этого документа доступны через local_search"
-                % (ext, package)
+                "фрагменты этого документа доступны через local_search" % (ext, package)
             ) from None
         except Exception as exc:
             raise ToolError("не удалось разобрать %s: %s" % (ext, exc)) from None
@@ -1531,7 +1823,10 @@ def _tool_read_file(args):
             if isinstance(remote, str):
                 truncated = len(remote) > MAX_FILE_CHARS or bool(data.get("truncated"))
                 content = remote[:MAX_FILE_CHARS]
-                header = "Путь: %s\nРазмер файла: %s байт\n" % (path, os.path.getsize(path))
+                header = "Путь: %s\nРазмер файла: %s байт\n" % (
+                    path,
+                    os.path.getsize(path),
+                )
                 if truncated:
                     header += "(текст обрезан до %d символов)\n" % MAX_FILE_CHARS
                 text = (
@@ -1935,7 +2230,11 @@ WRITE_TOOLS = [
     {
         "name": "local_list_paths",
         "description": "Список папок, по которым LocalRAG строит индекс, с отметкой доступности.",
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
     {
@@ -1964,7 +2263,11 @@ WRITE_TOOLS = [
             "required": ["path"],
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True,
+        },
     },
     {
         "name": "local_trigger_rescan",
@@ -1972,7 +2275,11 @@ WRITE_TOOLS = [
             "Форсирует переобход всех индексируемых папок без потери индекса. "
             "Отказывает, если индексация уже идёт."
         ),
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
         "annotations": {"readOnlyHint": False, "idempotentHint": True},
     },
 ]
@@ -2134,15 +2441,23 @@ def main():
         "fallback": "запасной адрес",
     }[source]
     _log(
-        "старт: LocalRAG=%s (%s), инструментов=%d, запись=%s, автозапуск=%s"
+        "старт: LocalRAG=%s (%s), инструментов=%d, запись=%s, автозапуск=%s, "
+        "агент=%s"
         % (
             url,
             origin,
             len(visible_tools()),
             "разрешена" if ALLOW_WRITE else "запрещена",
             "да" if _autostart_enabled() and source != "env" else "нет",
+            AGENT_NAME or "-",
         )
     )
+    if _AGENT_ENV and not AGENT_NAME:
+        # Значение не печатаем: по ошибке туда могли вставить сам токен.
+        _log(
+            "ПРЕДУПРЕЖДЕНИЕ: LQRAG_AGENT не имя агента ([a-z0-9][a-z0-9_-], до "
+            "32 символов) — токен по нему не ищется"
+        )
     if source == "fallback":
         # Без порт-файла демон, скорее всего, не поднят, а запасной адрес это
         # маскирует — предупреждаем сразу.

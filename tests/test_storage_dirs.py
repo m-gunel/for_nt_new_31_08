@@ -61,6 +61,37 @@ def test_reset_storage_removes_configured_paths(tmp_path, caplog):
     assert str(lsm_root) in caplog.text
 
 
+def test_reset_storage_keeps_agent_tokens(tmp_path: Path) -> None:
+    """auth.json, tokens/ и надгробия — доступ мостов к API, а не индекс."""
+    lsm_root = tmp_path / "files-search"
+    tokens = lsm_root / config_module.TOKENS_DIR_NAME
+    tokens.mkdir(parents=True)
+    (tokens / "gigacode.token").write_text("секрет", encoding="utf-8")
+    auth_file = lsm_root / config_module.AUTH_FILE_NAME
+    auth_file.write_text('{"gigacode": "хэш"}', encoding="utf-8")
+    (lsm_root / config_module.WITHDRAWN_FILE_NAME).write_text("хэш\n", encoding="utf-8")
+    (lsm_root / "ocr").mkdir()
+    (lsm_root / "ocr" / "page.json").write_text("{}", encoding="utf-8")
+    (lsm_root / "port").write_text("8000", encoding="utf-8")
+    cfg = _cfg(
+        lsm_root=lsm_root,
+        ld_db_path=tmp_path / "lance",
+        data_directory=tmp_path / "ragsearch",
+    )
+
+    config_module.reset_storage(cfg)
+
+    assert sorted(p.name for p in lsm_root.iterdir()) == sorted(
+        [
+            config_module.AUTH_FILE_NAME,
+            config_module.TOKENS_DIR_NAME,
+            config_module.WITHDRAWN_FILE_NAME,
+        ]
+    )
+    assert auth_file.read_text(encoding="utf-8") == '{"gigacode": "хэш"}'
+    assert (tokens / "gigacode.token").read_text(encoding="utf-8") == "секрет"
+
+
 def test_reset_storage_never_removes_home(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()

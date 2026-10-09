@@ -93,6 +93,13 @@ def test_package_install_stops_units_before_removing_registration(base):
     assert not (base / "home" / ".ragsearch").exists()
 
 
+@pytest.mark.parametrize("load_state", ["loaded", "not-found"])
+def test_registrar_forgets_tokens_after_unregistering(base, load_state):
+    # Регистратор раскладывает токены и в pw_dir, а $STATE — один каталог.
+    _, calls = _run(base, load_state)
+    assert _first(calls, "--remove") < _first(calls, "--forget")
+
+
 def test_archive_install_leaves_systemd_alone(base):
     out, calls = _run(base, "not-found")
     assert not [c for c in calls if {"stop", "mask"} & set(c.split())]

@@ -7,14 +7,17 @@ OpenVINO (десятки секунд), поэтому в `make tests` не вх
     uv run pytest tests/test_mcp_integration.py -m integration -v
 """
 
+import hashlib
 import json
 import os
+import secrets
 import socket
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+from collections import namedtuple
 from pathlib import Path
 
 import pytest
@@ -26,8 +29,12 @@ ROOT = Path(__file__).resolve().parent.parent
 STARTUP_TIMEOUT = 180.0
 INDEXING_TIMEOUT = 180.0
 MARKER = "ОРАНЖЕВЫЙ-КАШАЛОТ-482"
+AGENT = "gigacode"
 
 pytestmark = pytest.mark.integration
+
+# Живой демон: адрес, токен агента и порт-файл, по которому его найдёт мост.
+LiveSidecar = namedtuple("LiveSidecar", "url token port_file")
 
 
 def _free_port():
@@ -36,25 +43,46 @@ def _free_port():
         return sock.getsockname()[1]
 
 
-def _get(url, timeout=2.0):
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
+def _get(url, timeout=2.0, token=None):
+    headers = {"Authorization": "Bearer " + token} if token else {}
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def _write_private(path, text):
+    """Файл 0600, как его пишет регистратор."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def _register_agent(lsm_root, agent):
+    """Токен агента и его sha256 в auth.json — как их раскладывает register_mcp.py."""
+    tokens = lsm_root / "tokens"
+    tokens.mkdir(mode=0o700, parents=True)
+    token = secrets.token_urlsafe(32)
+    _write_private(tokens / (agent + ".token"), token)
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    _write_private(lsm_root / "auth.json", json.dumps({agent: digest}))
+    return token
 
 
 @pytest.fixture
 def sidecar(tmp_path):
-    """Настоящий демон на эфемерном порту, со своим HOME.
+    """Настоящий демон на эфемерном порту, со своим HOME и токеном агента.
 
     HOME подменён: индексы и пользовательский конфиг демона живут в
     ~/.files-search и ~/.ragsearch, и без подмены прогон писал бы в каталоги
-    разработчика.
+    разработчика. При DEV=0 ~/.files-search — lsm_root демона: там регистратор
+    держит токены и auth.json, там же демон публикует порт и pid.
     """
     port = _free_port()
-    home = tmp_path / "home"
-    home.mkdir()
+    lsm_root = tmp_path / "home" / ".files-search"
+    token = _register_agent(lsm_root, AGENT)
     env = dict(os.environ)
     env.update(
-        HOME=str(home),
+        HOME=str(tmp_path / "home"),
         CONFIG_PATH="cfg/dev.yml",
         RAG_HOST="127.0.0.1",
         RAG_PORT=str(port),
@@ -75,6 +103,7 @@ def sidecar(tmp_path):
                     % (tmp_path / "sidecar.log").read_text(encoding="utf-8")[-3000:]
                 )
             try:
+                # /health открыт без токена — им и ждём старта.
                 if _get(url + "/api/v1/health").get("status") == "OK":
                     break
             except (urllib.error.URLError, OSError):
@@ -82,7 +111,7 @@ def sidecar(tmp_path):
             if time.monotonic() > deadline:
                 pytest.fail("сайдкар не поднялся за %s с" % STARTUP_TIMEOUT)
             time.sleep(1.0)
-        yield url
+        yield LiveSidecar(url, token, lsm_root / "port")
     finally:
         proc.terminate()
         try:
@@ -92,10 +121,10 @@ def sidecar(tmp_path):
         log.close()
 
 
-def _wait_idle(url, timeout=INDEXING_TIMEOUT):
+def _wait_idle(live, timeout=INDEXING_TIMEOUT):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        status = _get(url + "/api/v1/status")
+        status = _get(live.url + "/api/v1/status", token=live.token)
         if not status.get("is_indexing") and status.get("files_to_index", 0) == 0:
             return status
         time.sleep(1.0)
@@ -112,7 +141,20 @@ def test_full_cycle_through_mcp(sidecar, tmp_path):
         encoding="utf-8",
     )
 
-    bridge = Bridge(sidecar, LQRAG_ALLOW_WRITE="1", LQRAG_TIMEOUT="60")
+    # Без токена демон закрыт: иначе тест не проверял бы путь с токеном.
+    with pytest.raises(urllib.error.HTTPError) as rejected:
+        _get(sidecar.url + "/api/v1/status")
+    assert rejected.value.code == 401
+
+    # Мост — как его запускает агент: адрес из порт-файла, токен по ярлыку.
+    bridge = Bridge(
+        "",
+        LQRAG_PORT_FILE=str(sidecar.port_file),
+        LQRAG_AGENT=AGENT,
+        LQRAG_AUTOSTART="0",
+        LQRAG_ALLOW_WRITE="1",
+        LQRAG_TIMEOUT="60",
+    )
     try:
         assert bridge.request("initialize", {"protocolVersion": "2025-06-18"})["result"]
         names = [tool["name"] for tool in bridge.tools()]
@@ -127,9 +169,13 @@ def test_full_cycle_through_mcp(sidecar, tmp_path):
         assert status["result"]["isError"] is False
         assert "не идёт" in call_text(status)
 
-        found = bridge.call("local_search", {"query": "кодовое слово договора"}, timeout=60)
+        found = bridge.call(
+            "local_search", {"query": "кодовое слово договора"}, timeout=60
+        )
         assert found["result"]["isError"] is False, call_text(found)
-        paths = [item["path"] for item in found["result"]["structuredContent"]["results"]]
+        paths = [
+            item["path"] for item in found["result"]["structuredContent"]["results"]
+        ]
         assert str(document) in paths, call_text(found)
 
         read = bridge.call("local_read_file", {"absolute_path": str(document)})

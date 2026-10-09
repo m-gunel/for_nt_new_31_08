@@ -16,11 +16,11 @@
 unzip lib-local-rag-mcp-*.zip
 cd lib-local-rag
 
-# ОБЯЗАТЕЛЬНО перед установкой: в pyproject.toml индекс пакетов прописан с
-# плейсхолдером OSC_TOKEN. Подстановку делает только Dockerfile при сборке
-# образа, поэтому на обычной машине её нужно выполнить руками — иначе uv
-# пойдёт в зеркало с логином "OSC_TOKEN" и получит 401.
-sed -i "s/OSC_TOKEN/<ваш токен sberosc>/" pyproject.toml
+# ОБЯЗАТЕЛЬНО: uv не читает pip.conf и без индекса идёт на pypi.org, недоступный
+# из корпоративной сети. Индекс — зеркало SberOSC с токеном. Make берёт токен из
+# файла .secret (строка OSC_TOKEN=<токен>, файл в .gitignore) и сам выставляет
+# UV_INDEX_URL; без make — задайте переменную руками:
+export UV_INDEX_URL="https://token:<ваш токен sberosc>@sberosc.sigma.sbrf.ru/repo/pypi/simple"
 
 uv sync --frozen        # ставит РОВНО те версии, что зафиксированы в uv.lock
 ```
@@ -61,17 +61,27 @@ curl -s http://127.0.0.1:8000/api/v1/health     # {"status":"OK"}
 N.N c` в логе сервис не отвечает. Строки `Uvicorn running` в логе **нет**:
 `main.py` передаёт uvicorn уже забинденный сокет, и своё стартовое сообщение
 тот в таком режиме не печатает. Ориентир — собственная строка демона
-`слушаю http://...`. Демон по умолчанию слушает `127.0.0.1`; `RAG_HOST=0.0.0.0`
-не задавайте — авторизации у API нет, и поиск по файлам пользователя ушёл бы
-в сеть.
+`слушаю http://...`. Демон по умолчанию слушает `127.0.0.1`: внешний
+интерфейс он откроет только при `RAG_HOST=<адрес>` и `LQRAG_EXPOSE=1` вместе.
+
+Все ручки, кроме `/health`, требуют токен агента (см. `docs/mcp/README.md`,
+раздел «Аутентификация на демоне»). Токены выдаёт регистрация моста (§6) —
+агентам, у которых найден конфиг; какие выданы, покажет
+`python3 scripts/register_mcp.py --doctor`. Ниже — токен агента `wsc`.
+Заголовок передаётся через подстановку процесса, токен не попадает в argv:
+
+```bash
+python3 scripts/register_mcp.py      # прописать мост агентам и выдать им токены
+auth() { printf 'Authorization: Bearer %s' "$(cat ~/.files-search/tokens/wsc.token)"; }
+```
 
 Папки для индексации задаются через API, а не правкой YAML:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8000/api/v1/config \
+curl -s -H @<(auth) -X POST http://127.0.0.1:8000/api/v1/config \
   -H 'Content-Type: application/json' -d "{\"folders\":[\"$HOME/Документы\"]}"
 
-curl -s http://127.0.0.1:8000/api/v1/status     # ждём is_indexing: false
+curl -s -H @<(auth) http://127.0.0.1:8000/api/v1/status     # ждём is_indexing: false
 ```
 
 При правке YAML в обход API состояние LSM считает файлы уже обработанными, и
@@ -98,6 +108,18 @@ python3 scripts/nt/mcp_overhead.py --url http://127.0.0.1:8000        # цена
 
 Полный протокол НТ — `scripts/nt/README.md`.
 
+API демона требует токен агента, а скрипты НТ ходят в него без заголовка
+`Authorization` и получат 401. Им нужен заголовок с токеном зарегистрированного
+агента (`~/.files-search/tokens/<агент>.token`, см. §3); доработка скриптов —
+за тестировщиком. Сброс в `smoke_user_path.sh`, `test_sber_indexer.sh` и
+`hunt_crash.py` удаляет `~/.files-search` целиком — вместе с `auth.json` и
+`tokens/`, и до новой регистрации (`register_mcp.py --all`) демон закрыт для всех;
+`RESET=1` при старте демона индекс сбрасывает, а токены сохраняет.
+
+Мост в фазах `mcp_overhead.py` получает адрес через `LQRAG_URL`, а с явным URL токен
+по ярлыку не ищется: перед запуском `export LQRAG_TOKEN_FILE=~/.files-search/tokens/<агент>.token`.
+Прямые HTTP-запросы скрипта всё равно без заголовка — см. абзац выше.
+
 Критерии для `mcp_overhead.py`: накладные расходы моста по p50 — единицы
 миллисекунд, `errors = 0`. Фаза `mcp_burst` показывает, что мост обрабатывает
 запросы последовательно: это его свойство, а не поломка.
@@ -115,8 +137,9 @@ python3 mcp/register_mcp.py                # из распакованного d
 
 Скрипт дописывает запись в конфиги агентов — Workspace Computer
 (`~/.wsc/config/wsc.json`) и GigaCode (`~/.gigacode/settings.json`), — не затирая
-остальное их содержимое. Повторный запуск ничего не меняет. Посмотреть
-состояние — `--doctor`, снять регистрацию — `--remove`.
+остальное их содержимое, и выдаёт этим агентам токены демона
+(`~/.files-search/tokens/<агент>.token`). Повторный запуск ничего не меняет.
+Посмотреть состояние — `--doctor`, снять регистрацию — `--remove`.
 
 Вручную для Workspace Computer это выглядит так:
 
@@ -126,9 +149,12 @@ python3 mcp/register_mcp.py                # из распакованного d
   "command": ["/абсолютный/путь/lib-local-rag/mcp_launcher.sh"],
   "enabled": true,
   "timeout": 120000,
-  "environment": {"LQRAG_TIMEOUT": "110"}
+  "environment": {"LQRAG_TIMEOUT": "110", "LQRAG_AGENT": "wsc"}
 }}}
 ```
+
+`LQRAG_AGENT` — несекретный ярлык: по нему мост находит свой токен. Сам токен
+в конфиг не пишется, его выдаёт только `register_mcp.py`.
 
 Ключ внутри `mcp` — имя сервера. Вложенности `mcp.servers.<имя>` не существует:
 агент прочитает её как сервер с именем `servers`, провалит валидацию и отбросит
@@ -158,8 +184,10 @@ python3 mcp/register_mcp.py                # из распакованного d
 | `lancedb ... doesn't have a wheel for the current platform` | Потерялся `required-environments` в `pyproject.toml` | Вернуть `["sys_platform == 'linux' and platform_machine == 'x86_64'"]` |
 | `ModuleNotFoundError: pytest_asyncio` | Ставили без группы `test` | `uv sync --frozen` (группа `dev` включает `test`) |
 | Демон не поднимается | Нет модели или зависимостей | `/tmp/rag.log`; модель — в `models/rubert-tiny2_002` |
-| Поиск пуст, файлы на месте | Индексация ещё идёт | `curl /api/v1/status`, либо инструмент `local_index_status` |
-| В логе `nothing new`, `total=0` | Папки меняли правкой YAML мимо API | Задать через `POST /config`, либо сбросить `~/.files-search` |
-| Мост: «сайдкар недоступен» | Демон не поднят, либо порт не опубликован | `curl /health`; проверить `~/.files-search/port`; при нестандартной установке задать `LQRAG_URL` |
+| Поиск пуст, файлы на месте | Индексация ещё идёт | `curl -H @<(auth) …/api/v1/status` (§3), либо инструмент `local_index_status` |
+| В логе `nothing new`, `total=0` | Папки меняли правкой YAML мимо API | Задать через `POST /config`, либо сбросить `~/.files-search` и заново выдать токены: `python3 scripts/register_mcp.py` |
+| Мост: «сайдкар недоступен» | Демон не поднят, либо порт не опубликован | `curl /health`; проверить `~/.files-search/port`; при нестандартной установке задать `LQRAG_PORT_FILE=<дом демона>/.files-search/port` (токен найдётся рядом по `LQRAG_AGENT`) либо `LQRAG_URL` вместе с `LQRAG_TOKEN_FILE=~/.files-search/tokens/<агент>.token` — с явным URL токен сам не ищется, без него 401 |
 | Мост: «индексатор запускается или прогревается» | Демон греет модель (40–45 с). В установке из `.deb` мост ещё и сам попросил systemd поднять службу | Повторить через минуту |
 | У агента нет инструментов | Относительный путь или нет прав | `python3 scripts/register_mcp.py` — подставит абсолютный путь и вернёт `+x`; затем перезапуск агента |
+| Мост: «нет действующего токена агента (401)» | Агент не перезапущен после регистрации, токен не выдан или отозван | Перезапустить агента; не помогло — `python3 scripts/register_mcp.py --doctor` (строки `токен:` и `авторизация:`) |
+| `curl` к API отвечает 401 | Нет заголовка с токеном агента | См. §3: `-H @<(auth)` |

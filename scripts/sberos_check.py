@@ -10,6 +10,12 @@ search), CPU и память его процесса, наличие модул�
     python3 scripts/sberos_check.py                 # все проверки
     python3 scripts/sberos_check.py --port 8000     # порт, если демон его не опубликовал
     python3 scripts/sberos_check.py --pid 1234      # процесс для замера ресурсов
+    python3 scripts/sberos_check.py --token-file ~/.files-search/tokens/wsc.token
+
+API демона, кроме health, требует токен агента: без --token-file ответы
+status, config и search — 401, и секция runtime помечается WARN. Токен уходит
+только демону этой учётки — по тем же правилам, что у MCP-моста (рядом
+mcp_server.py): на порт по умолчанию 8000 и чужому процессу на порту — нет.
 
 Порт и pid берутся из дома демона, как у MCP-моста: $HOME или дом из passwd
 (на SberOS это разные каталоги, служба systemd --user живёт во втором).
@@ -30,6 +36,13 @@ import sys
 import time
 import urllib.request
 
+# Кому можно отдать токен и как он выглядит, решает мост: правило одно на оба
+# скрипта.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+import mcp_server  # noqa: E402
+
 REPORT_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "sberos_report.json"
 )
@@ -39,10 +52,12 @@ PACKAGE_DIR = "/opt/lib-local-rag"
 # Порт, если демон его не опубликовал, — как FALLBACK_URL моста.
 DEFAULT_PORT = 8000
 
-# Без прокси: штатный urlopen берёт http_proxy из окружения, а no_proxy
-# сравнивает строкой («localhost» не покрывает 127.0.0.1): 502 прокси выглядел
-# бы как «демон не отвечает». Как _OPENER в mcp_server.py.
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# Без прокси (502 прокси выглядел бы как «демон не отвечает») и без
+# редиректов (urllib перенёс бы Authorization на адрес из Location).
+_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), mcp_server.NoRedirect()
+)
+UNAUTHORIZED = 401
 
 
 def section(report, name, verdict, details):
@@ -236,10 +251,48 @@ def check_resources(report, pid, seconds):
         )
 
 
-def http_json(method, url, body=None, timeout=10):
+def read_token(path):
+    """Токен агента из файла; нечитаемый или битый файл — выход с ошибкой.
+
+    Содержимое файла в текст ошибки не попадает.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            token = f.read().strip()
+    except (OSError, UnicodeDecodeError) as e:
+        sys.exit("файл токена {0} не читается: {1}".format(path, type(e).__name__))
+    if not mcp_server.TOKEN_RE.fullmatch(token):
+        sys.exit("файл токена {0} не похож на токен агента".format(path))
+    return token
+
+
+def token_refusal(port, files_root, port_is_explicit):
+    """Почему токен на этот порт не слать; None — можно.
+
+    Как у моста (mcp_server._route_auth): процесс на порту получил бы с
+    токеном и чтение файлов. Порт по умолчанию — догадка, на нём может
+    слушать кто угодно; порт из файла — только при живом pid этой учётки.
+    """
+    if port is None:
+        return "порт демона не опубликован (~/.files-search/port), а 8000 — догадка"
+    try:
+        owner = mcp_server.check_listener("http://127.0.0.1:{0}".format(port))
+    except mcp_server.ForeignListener:
+        return "порт {0} слушает процесс другой учётки".format(port)
+    if owner == "absent":
+        return "порт {0} никто не слушает".format(port)
+    port_file = os.path.join(files_root, "port")
+    if not port_is_explicit and not mcp_server.pid_is_ours(port_file):
+        return "pid из ~/.files-search/pid — не живой процесс этой учётки"
+    return None
+
+
+def http_json(method, url, body=None, timeout=10, token=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
     try:
         with _OPENER.open(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode())
@@ -248,7 +301,32 @@ def http_json(method, url, body=None, timeout=10):
         return code if code else type(e).__name__, None
 
 
-def check_runtime(report, port):
+def runtime_verdict(details, token, refusal=None):
+    """(вердикт, пояснение) по ответам API; 401 — не PASS: данные не проверены.
+
+    refusal — почему токен из --token-file не отправлен.
+    """
+    denied = sorted(
+        name for name, result in details.items() if result["status"] == UNAUTHORIZED
+    )
+    if not denied:
+        return "PASS", None
+    if refusal:
+        return "WARN", "токен не отправлен (401: {0}): {1}".format(
+            ", ".join(denied), refusal
+        )
+    if token is None:
+        return "WARN", (
+            "API требует токен агента (401: {0}) — запустите с --token-file "
+            "~/.files-search/tokens/<агент>.token".format(", ".join(denied))
+        )
+    return "FAIL", (
+        "демон не принял токен из --token-file (401: {0}) — проверьте "
+        "register_mcp.py --doctor".format(", ".join(denied))
+    )
+
+
+def check_runtime(report, port, token=None, refusal=None):
     base = "http://127.0.0.1:{0}/api/v1".format(port)
     details = {}
     st, body = http_json("GET", base + "/health")
@@ -261,9 +339,9 @@ def check_runtime(report, port):
             dict(details, note="демон не отвечает на порту {0}".format(port)),
         )
         return
-    st, body = http_json("GET", base + "/status")
+    st, body = http_json("GET", base + "/status", token=token)
     details["status"] = {"status": st, "body": body}
-    st, body = http_json("GET", base + "/config")
+    st, body = http_json("GET", base + "/config", token=token)
     details["config"] = {"status": st}
     if st == 200 and isinstance(body, dict):
         # Число папок, не сами пути: в путях логин и имена личных каталогов.
@@ -272,6 +350,7 @@ def check_runtime(report, port):
         "POST",
         base + "/search",
         {"query": "тест", "limit": 5, "query_type": "hybrid"},
+        token=token,
     )
     details["search"] = {"status": st}
     if st == 200 and isinstance(body, dict):
@@ -279,7 +358,10 @@ def check_runtime(report, port):
         for r in body.get("results") or []:
             types[r.get("type")] = types.get(r.get("type"), 0) + 1
         details["search"].update(total=body.get("total"), result_types=types)
-    section(report, "runtime", "PASS", details)
+    verdict, note = runtime_verdict(details, token, refusal)
+    if note:
+        details["note"] = note
+    section(report, "runtime", verdict, details)
 
 
 def check_frozen_lance(report, dist_dir):
@@ -330,7 +412,14 @@ def main():
         "иначе dist/main)".format(PACKAGE_DIR),
     )
     ap.add_argument("--resource-seconds", type=int, default=15)
+    ap.add_argument(
+        "--token-file",
+        default=None,
+        help="файл токена агента (~/.files-search/tokens/<агент>.token): без него "
+        "status, config и search отвечают 401",
+    )
     args = ap.parse_args()
+    token = read_token(os.path.expanduser(args.token_file)) if args.token_file else None
 
     home = find_daemon_home()
     files_root = os.path.join(home, ".files-search")
@@ -345,7 +434,12 @@ def main():
     }
 
     check_inotify(report)
-    check_runtime(report, args.port or read_port(files_root) or DEFAULT_PORT)
+    port = args.port or read_port(files_root)
+    explicit = args.port is not None
+    refusal = token_refusal(port, files_root, explicit) if token else None
+    if refusal:
+        token = None
+    check_runtime(report, port or DEFAULT_PORT, token, refusal)
     pid = args.pid if args.pid else find_daemon_pid(files_root)
     check_resources(report, pid, args.resource_seconds)
     dist = args.dist or (PACKAGE_DIR if os.path.isdir(PACKAGE_DIR) else "dist/main")

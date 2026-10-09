@@ -5,15 +5,17 @@
 невалидным и отбросил бы весь конфиг.
 
 На SberOS pw_dir и $HOME терминала — разные каталоги, писать надо в оба.
-Проверяются обход домов, отказ от записи под root и --doctor.
+Проверяются обход домов, отказ от записи под root, --doctor и токены агентов.
 
 Скрипт лежит в scripts/ и пакетом не является, поэтому грузится по пути.
 """
 
+import fcntl
 import importlib.util
 import json
 import os
 import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -41,6 +43,9 @@ class _Args:
         self.targets = None
         self.config = None
         self.schema = "opencode"
+        self.agent = None
+        self.rotate = False
+        self.revoke = None
         self.__dict__.update(kw)
 
 
@@ -116,6 +121,8 @@ def _run(target_key, home, launcher, **kw):
         _Args(**kw),
         cleanup_only=cleanup,
         home=None if cleanup else str(home),
+        # Как main(): имя штатной цели — это и имя агента в ярлыке LQRAG_AGENT.
+        agent=None if cleanup else target_key,
     )
 
 
@@ -296,7 +303,9 @@ def test_restores_entry_after_agent_overwrote_config(home, launcher):
 def test_remove_drops_entry_but_keeps_the_rest(home, launcher):
     cfg_dir = home / ".wsc" / "config"
     cfg_dir.mkdir(parents=True)
-    (cfg_dir / "wsc.json").write_text(json.dumps({"permission": {"bash": "ask"}}), encoding="utf-8")
+    (cfg_dir / "wsc.json").write_text(
+        json.dumps({"permission": {"bash": "ask"}}), encoding="utf-8"
+    )
     _run("wsc", home, launcher)
 
     _run("wsc", home, launcher, remove=True)
@@ -311,7 +320,13 @@ def test_migration_removes_broken_servers_key(home, launcher):
     cfg_dir = home / ".wsc" / "config"
     cfg_dir.mkdir(parents=True)
     (cfg_dir / "wsc.json").write_text(
-        json.dumps({"mcp": {"servers": {"localrag": {"type": "local", "command": ["/old.sh"]}}}}),
+        json.dumps(
+            {
+                "mcp": {
+                    "servers": {"localrag": {"type": "local", "command": ["/old.sh"]}}
+                }
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -327,7 +342,9 @@ def test_migration_spares_a_real_server_named_servers(home, launcher):
     cfg_dir = home / ".wsc" / "config"
     cfg_dir.mkdir(parents=True)
     real = {"type": "local", "command": ["/chuzhoy.sh"], "enabled": True}
-    (cfg_dir / "wsc.json").write_text(json.dumps({"mcp": {"servers": real}}), encoding="utf-8")
+    (cfg_dir / "wsc.json").write_text(
+        json.dumps({"mcp": {"servers": real}}), encoding="utf-8"
+    )
 
     _run("wsc", home, launcher)
 
@@ -339,7 +356,12 @@ def test_legacy_target_is_cleaned_but_not_written_to(home, launcher):
     legacy = home / ".config" / "gigatool"
     legacy.mkdir(parents=True)
     (legacy / "opencode.json").write_text(
-        json.dumps({"model": "giga/x", "mcp": {"servers": {"localrag": {"command": ["/old.sh"]}}}}),
+        json.dumps(
+            {
+                "model": "giga/x",
+                "mcp": {"servers": {"localrag": {"command": ["/old.sh"]}}},
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -376,7 +398,12 @@ def test_gigacode_uses_flat_mcp_servers_with_string_command(home, launcher):
 def test_gigacode_rewrites_old_entry_with_type_stdio(home, launcher):
     """Запись прежней версии с type: "stdio" перезаписывается без поля type."""
     (home / ".gigacode").mkdir()
-    old = {"type": "stdio", "command": launcher, "args": [], "env": {"LQRAG_TIMEOUT": reg.BRIDGE_TIMEOUT_S}}
+    old = {
+        "type": "stdio",
+        "command": launcher,
+        "args": [],
+        "env": {"LQRAG_TIMEOUT": reg.BRIDGE_TIMEOUT_S},
+    }
     settings = home / ".gigacode" / "settings.json"
     settings.write_text(json.dumps({"mcpServers": {"localrag": old}}), encoding="utf-8")
 
@@ -394,7 +421,11 @@ def _opt_out_wsc_entry(launcher, **override):
         "command": [launcher],
         "enabled": False,
         "timeout": reg.MCP_TIMEOUT_MS,
-        "environment": {"LQRAG_TIMEOUT": reg.BRIDGE_TIMEOUT_S, "LQRAG_ALLOW_WRITE": "0"},
+        "environment": {
+            "LQRAG_TIMEOUT": reg.BRIDGE_TIMEOUT_S,
+            "LQRAG_ALLOW_WRITE": "0",
+            reg.AGENT_ENV: "wsc",
+        },
     }
     entry.update(override)
     return entry
@@ -404,7 +435,10 @@ def test_wsc_opt_out_is_not_rewritten(home, launcher):
     """enabled: false и LQRAG_ALLOW_WRITE=0 — выбор пользователя: файл не трогаем."""
     cfg = home / ".wsc" / "config" / "wsc.json"
     cfg.parent.mkdir(parents=True)
-    cfg.write_text(json.dumps({"mcp": {"localrag": _opt_out_wsc_entry(launcher)}}), encoding="utf-8")
+    cfg.write_text(
+        json.dumps({"mcp": {"localrag": _opt_out_wsc_entry(launcher)}}),
+        encoding="utf-8",
+    )
     before = cfg.read_bytes()
 
     assert _run("wsc", home, launcher) == reg.UNCHANGED
@@ -419,7 +453,11 @@ def test_stale_wsc_entry_is_updated_but_keeps_opt_out(home, launcher):
     old = _opt_out_wsc_entry(
         "/old/mcp_launcher.sh",
         timeout=5000,
-        environment={"LQRAG_TIMEOUT": "30", "LQRAG_ALLOW_WRITE": "0", "LQRAG_AUTOSTART": "0"},
+        environment={
+            "LQRAG_TIMEOUT": "30",
+            "LQRAG_ALLOW_WRITE": "0",
+            "LQRAG_AUTOSTART": "0",
+        },
     )
     cfg.write_text(json.dumps({"mcp": {"localrag": old}}), encoding="utf-8")
 
@@ -433,6 +471,7 @@ def test_stale_wsc_entry_is_updated_but_keeps_opt_out(home, launcher):
         "LQRAG_TIMEOUT": reg.BRIDGE_TIMEOUT_S,
         "LQRAG_ALLOW_WRITE": "0",
         "LQRAG_AUTOSTART": "0",
+        reg.AGENT_ENV: "wsc",
     }
 
 
@@ -455,13 +494,26 @@ def test_gigacode_entry_keeps_opt_out_in_env(home, launcher):
     """У GigaCode opt-out — в env: command и type прежней версии чинятся, env пользователя остаётся."""
     settings = home / ".gigacode" / "settings.json"
     settings.parent.mkdir()
-    env = {"LQRAG_TIMEOUT": reg.BRIDGE_TIMEOUT_S, "LQRAG_ALLOW_WRITE": "0"}
-    old = {"type": "stdio", "command": "/old/mcp_launcher.sh", "args": [], "env": dict(env)}
+    env = {
+        "LQRAG_TIMEOUT": reg.BRIDGE_TIMEOUT_S,
+        "LQRAG_ALLOW_WRITE": "0",
+        reg.AGENT_ENV: "gigacode",
+    }
+    old = {
+        "type": "stdio",
+        "command": "/old/mcp_launcher.sh",
+        "args": [],
+        "env": dict(env),
+    }
     settings.write_text(json.dumps({"mcpServers": {"localrag": old}}), encoding="utf-8")
 
     assert _run("gigacode", home, launcher) == reg.WRITTEN
 
-    assert _read(settings)["mcpServers"]["localrag"] == {"command": launcher, "args": [], "env": env}
+    assert _read(settings)["mcpServers"]["localrag"] == {
+        "command": launcher,
+        "args": [],
+        "env": env,
+    }
     assert _run("gigacode", home, launcher) == reg.UNCHANGED
 
 
@@ -469,12 +521,21 @@ def test_unit_run_keeps_opt_out_in_both_agents(home, launcher, capsys):
     """Ровно запуск юнита (--all): opt-out в обоих агентах переживает прогон."""
     wsc = home / ".wsc" / "config" / "wsc.json"
     wsc.parent.mkdir(parents=True)
-    wsc.write_text(json.dumps({"mcp": {"localrag": _opt_out_wsc_entry(launcher)}}), encoding="utf-8")
+    wsc.write_text(
+        json.dumps({"mcp": {"localrag": _opt_out_wsc_entry(launcher)}}),
+        encoding="utf-8",
+    )
     giga = home / ".gigacode" / "settings.json"
     giga.parent.mkdir()
-    env = {"LQRAG_TIMEOUT": reg.BRIDGE_TIMEOUT_S, "LQRAG_ALLOW_WRITE": "0"}
+    env = {
+        "LQRAG_TIMEOUT": reg.BRIDGE_TIMEOUT_S,
+        "LQRAG_ALLOW_WRITE": "0",
+        reg.AGENT_ENV: "gigacode",
+    }
     giga.write_text(
-        json.dumps({"mcpServers": {"localrag": {"command": launcher, "args": [], "env": env}}}),
+        json.dumps(
+            {"mcpServers": {"localrag": {"command": launcher, "args": [], "env": env}}}
+        ),
         encoding="utf-8",
     )
     before = [wsc.read_bytes(), giga.read_bytes()]
@@ -489,7 +550,10 @@ def test_allow_write_flag_overrides_opt_out(home, launcher):
     """Явный --allow-write сильнее записанного LQRAG_ALLOW_WRITE=0; enabled не трогает."""
     cfg = home / ".wsc" / "config" / "wsc.json"
     cfg.parent.mkdir(parents=True)
-    cfg.write_text(json.dumps({"mcp": {"localrag": _opt_out_wsc_entry(launcher)}}), encoding="utf-8")
+    cfg.write_text(
+        json.dumps({"mcp": {"localrag": _opt_out_wsc_entry(launcher)}}),
+        encoding="utf-8",
+    )
 
     assert _run("wsc", home, launcher, allow_write=True) == reg.WRITTEN
 
@@ -556,7 +620,10 @@ def test_rewrite_without_comments_adds_no_copies(home, launcher):
 
     assert _run("wsc", home, launcher) == reg.WRITTEN
 
-    assert sorted(p.name for p in cfg_dir.iterdir()) == ["wsc.json", "wsc.json.localrag-backup"]
+    assert sorted(p.name for p in cfg_dir.iterdir()) == [
+        "wsc.json",
+        "wsc.json.localrag-backup",
+    ]
 
 
 def test_dry_run_changes_nothing(home, launcher):
@@ -655,7 +722,9 @@ def test_explicit_homes_replace_discovery(sberos, monkeypatch, tmp_path):
     assert reg.discover_homes([str(b)]) == [str(b)]
 
 
-def test_main_writes_to_every_home_where_agent_is_installed(tmp_path, launcher, monkeypatch, capsys):
+def test_main_writes_to_every_home_where_agent_is_installed(
+    tmp_path, launcher, monkeypatch, capsys
+):
     h1, h2 = tmp_path / "h1", tmp_path / "h2"
     (h1 / ".wsc").mkdir(parents=True)
     (h1 / ".gigacode").mkdir()
@@ -686,7 +755,9 @@ def test_home_option_replaces_env_homes(tmp_path, launcher, monkeypatch):
     assert not (h1 / ".wsc" / "config").exists()
 
 
-def test_same_file_seen_from_two_homes_is_processed_once(tmp_path, launcher, monkeypatch, capsys):
+def test_same_file_seen_from_two_homes_is_processed_once(
+    tmp_path, launcher, monkeypatch, capsys
+):
     """.wsc в /home/work — симлинк в pw_dir: один файл, одна строка вывода."""
     h1, h2 = tmp_path / "h1", tmp_path / "h2"
     (h1 / ".wsc").mkdir(parents=True)
@@ -718,7 +789,10 @@ def test_main_second_run_changes_nothing(home, launcher, capsys):
     (home / ".wsc").mkdir()
     (home / ".gigacode").mkdir()
     _main(launcher)
-    files = [home / ".wsc" / "config" / "wsc.json", home / ".gigacode" / "settings.json"]
+    files = [
+        home / ".wsc" / "config" / "wsc.json",
+        home / ".gigacode" / "settings.json",
+    ]
     before = [(f.stat().st_mtime_ns, f.read_bytes()) for f in files]
     capsys.readouterr()
 
@@ -730,7 +804,9 @@ def test_main_second_run_changes_nothing(home, launcher, capsys):
     assert [(f.stat().st_mtime_ns, f.read_bytes()) for f in files] == before
 
 
-def test_no_homes_found_is_reported_but_not_a_failure(tmp_path, launcher, monkeypatch, capsys):
+def test_no_homes_found_is_reported_but_not_a_failure(
+    tmp_path, launcher, monkeypatch, capsys
+):
     """Юнит дёргается .path-срабатываниями: failed заглушил бы следующие."""
     monkeypatch.delenv(reg.HOMES_ENV)
     monkeypatch.setattr(reg, "_passwd_entry", lambda: (None, None))
@@ -775,7 +851,9 @@ def test_strict_three_when_no_agent_anywhere(home, launcher):
 def test_strict_one_when_a_target_fails(home, launcher, capsys):
     """Одна ОШИБКА — 1, даже если другая цель записана."""
     (home / ".wsc" / "config").mkdir(parents=True)
-    (home / ".wsc" / "config" / "wsc.json").write_text('{ "mcp": { broken', encoding="utf-8")
+    (home / ".wsc" / "config" / "wsc.json").write_text(
+        '{ "mcp": { broken', encoding="utf-8"
+    )
     (home / ".gigacode").mkdir()
 
     assert _main(launcher, "--strict") == 1
@@ -838,15 +916,31 @@ def test_strict_one_when_no_homes_found(tmp_path, launcher, monkeypatch):
     assert _main(launcher, "--strict") == 1
 
 
-def test_strict_with_config(tmp_path, launcher):
+def test_strict_with_config(tmp_path, home, launcher):
+    cfg = tmp_path / "agent" / "cfg.json"
+    cfg.parent.mkdir()
+    agent = ("--agent", "custom")
+
+    assert _main(launcher, "--strict", "--config", str(cfg), *agent) == 0
+    cfg.write_text("[1, 2", encoding="utf-8")
+    assert _main(launcher, "--strict", "--config", str(cfg), *agent) == 1
+    nope = str(tmp_path / "nope" / "cfg.json")
+    assert _main(launcher, "--strict", "--config", nope, *agent) == 3
+    assert not (tmp_path / "nope").exists()
+
+
+def test_config_without_agent_is_refused_before_writing(tmp_path, home, launcher):
+    """Запись без ярлыка LQRAG_AGENT мосту бесполезна: токена нет — 401 всегда."""
     cfg = tmp_path / "agent" / "cfg.json"
     cfg.parent.mkdir()
 
-    assert _main(launcher, "--strict", "--config", str(cfg)) == 0
-    cfg.write_text("[1, 2", encoding="utf-8")
-    assert _main(launcher, "--strict", "--config", str(cfg)) == 1
-    assert _main(launcher, "--strict", "--config", str(tmp_path / "nope" / "cfg.json")) == 3
-    assert not (tmp_path / "nope").exists()
+    with pytest.raises(SystemExit) as exc:
+        _main(launcher, "--config", str(cfg))
+
+    assert exc.value.code == 2
+    assert not cfg.exists()
+    # --remove ярлык не нужен: файла нет — «агент не найден», а не отказ.
+    assert _main(launcher, "--strict", "--config", str(cfg), "--remove") == 3
 
 
 def test_restart_hint_only_when_something_written(home, launcher, capsys):
@@ -876,7 +970,8 @@ def test_restart_hint_not_for_legacy_cleanup_only(home, launcher, capsys):
     legacy = home / ".config" / "gigatool"
     legacy.mkdir(parents=True)
     (legacy / "opencode.json").write_text(
-        json.dumps({"mcp": {"servers": {"localrag": {"command": ["/old.sh"]}}}}), encoding="utf-8"
+        json.dumps({"mcp": {"servers": {"localrag": {"command": ["/old.sh"]}}}}),
+        encoding="utf-8",
     )
 
     _main(launcher)
@@ -897,7 +992,7 @@ def _victim(tmp_path, name="victim.txt", mode=0o600):
 
 
 def test_symlink_in_place_of_tmp_is_not_followed(home, launcher, tmp_path):
-    """Симлинк на месте .localrag.tmp: цель ссылки не переписана и права не сменены."""
+    """Симлинк на месте временного файла прежних версий: цель ссылки не тронута."""
     cfg_dir = home / ".wsc" / "config"
     cfg_dir.mkdir(parents=True)
     cfg = cfg_dir / "wsc.json"
@@ -913,7 +1008,6 @@ def test_symlink_in_place_of_tmp_is_not_followed(home, launcher, tmp_path):
     assert not cfg.is_symlink()
     assert "localrag" in _read(cfg)["mcp"]
     assert stat.S_IMODE(cfg.stat().st_mode) == 0o644
-    assert not os.path.lexists(str(cfg_dir / "wsc.json.localrag.tmp"))
 
 
 def test_symlink_in_place_of_backup_is_not_followed(home, launcher, tmp_path):
@@ -944,8 +1038,8 @@ def test_symlink_in_place_of_backup_is_not_followed(home, launcher, tmp_path):
     assert backup.is_symlink()
 
 
-def test_stale_tmp_from_interrupted_run_is_replaced(home, launcher):
-    """Обычный файл-остаток прошлого прогона не мешает записи (O_EXCL без unlink упал бы)."""
+def test_stale_tmp_from_interrupted_run_does_not_block(home, launcher):
+    """Остаток прерванного прогона не мешает записи, а новых временных файлов нет."""
     cfg_dir = home / ".wsc" / "config"
     cfg_dir.mkdir(parents=True)
     (cfg_dir / "wsc.json.localrag.tmp").write_text("{ half", encoding="utf-8")
@@ -953,7 +1047,32 @@ def test_stale_tmp_from_interrupted_run_is_replaced(home, launcher):
     assert _run("wsc", home, launcher) == reg.WRITTEN
 
     assert "localrag" in _read(cfg_dir / "wsc.json")["mcp"]
-    assert not (cfg_dir / "wsc.json.localrag.tmp").exists()
+    assert sorted(p.name for p in cfg_dir.iterdir()) == [
+        "wsc.json",
+        "wsc.json.localrag.tmp",
+    ]
+
+
+def test_parallel_runs_do_not_share_temp_file(home, launcher, monkeypatch):
+    """Второй прогон между созданием временного файла и replace первого не ломает его."""
+    cfg_dir = home / ".wsc" / "config"
+    cfg_dir.mkdir(parents=True)
+    cfg = str(cfg_dir / "wsc.json")
+    real_replace = os.replace
+    inner = []
+
+    def replace_after_second_run(src, dst):
+        if dst == cfg and not inner:
+            inner.append(True)
+            reg.save_config(cfg, {"by": "B"})
+        real_replace(src, dst)
+
+    monkeypatch.setattr(reg.os, "replace", replace_after_second_run)
+
+    reg.save_config(cfg, {"by": "A"})
+
+    assert _read(cfg) == {"by": "A"}
+    assert os.listdir(str(cfg_dir)) == ["wsc.json"]
 
 
 def test_mode_is_set_by_descriptor_despite_umask(home, launcher):
@@ -986,7 +1105,9 @@ def test_new_config_is_created_0600(home, launcher):
     assert stat.S_IMODE((cfg_dir / "wsc.json").stat().st_mode) == 0o600
 
 
-def test_root_refuses_to_write_without_explicit_homes(sberos, launcher, monkeypatch, capsys):
+def test_root_refuses_to_write_without_explicit_homes(
+    sberos, launcher, monkeypatch, capsys
+):
     """sudo python3 register_mcp.py не должен оставить конфиги с владельцем root."""
     (sberos.pw_dir / ".wsc").mkdir()
     _as_root(monkeypatch)
@@ -1031,7 +1152,18 @@ def test_real_root_may_dry_run_explicit_home(sberos, launcher, monkeypatch, caps
 
 @pytest.mark.parametrize(
     "mode",
-    ["auto", "home", "env-homes", "config", "remove", "target", "strict", "allow-write"],
+    [
+        "auto",
+        "home",
+        "env-homes",
+        "config",
+        "remove",
+        "target",
+        "strict",
+        "allow-write",
+        "rotate",
+        "revoke",
+    ],
 )
 def test_root_refuses_every_writing_mode(sberos, launcher, monkeypatch, capsys, mode):
     """От root не пишем НИЧЕГО — ни по найденным домам, ни по явным, ни в --config.
@@ -1041,7 +1173,9 @@ def test_root_refuses_every_writing_mode(sberos, launcher, monkeypatch, capsys, 
     for home in (sberos.pw_dir, sberos.work):
         (home / ".wsc" / "config").mkdir(parents=True)
         (home / ".wsc" / "config" / "wsc.json").write_text(
-            json.dumps({"mcp": {"localrag": {"type": "local", "command": ["/old.sh"]}}}),
+            json.dumps(
+                {"mcp": {"localrag": {"type": "local", "command": ["/old.sh"]}}}
+            ),
             encoding="utf-8",
         )
         (home / ".gigacode").mkdir()
@@ -1052,14 +1186,24 @@ def test_root_refuses_every_writing_mode(sberos, launcher, monkeypatch, capsys, 
         "auto": [],
         "home": ["--home", str(sberos.pw_dir)],
         "env-homes": [],
-        "config": ["--config", str(sberos.pw_dir / ".wsc" / "config" / "wsc.json")],
+        "config": [
+            "--config",
+            str(sberos.pw_dir / ".wsc" / "config" / "wsc.json"),
+            "--agent",
+            "custom",
+        ],
         "remove": ["--remove", "--home", str(sberos.pw_dir)],
         "target": ["--target", "wsc", "--home", str(sberos.work)],
         "strict": ["--strict", "--home", str(sberos.pw_dir)],
         "allow-write": ["--allow-write", "--home", str(sberos.pw_dir)],
+        # Перевыпуск и отзыв токенов тоже пишут на диск.
+        "rotate": ["--rotate", "--home", str(sberos.pw_dir)],
+        "revoke": ["--revoke", "wsc", "--home", str(sberos.pw_dir)],
     }[mode]
     if mode == "env-homes":
-        monkeypatch.setenv(reg.HOMES_ENV, os.pathsep.join([str(sberos.pw_dir), str(sberos.work)]))
+        monkeypatch.setenv(
+            reg.HOMES_ENV, os.pathsep.join([str(sberos.pw_dir), str(sberos.work)])
+        )
 
     assert _main(launcher, *argv) == 2
 
@@ -1082,7 +1226,9 @@ def test_allow_root_flag_is_gone(launcher, monkeypatch):
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="временный каталог принадлежит root")
-def test_root_refusal_names_owner_of_explicit_home(tmp_path, launcher, monkeypatch, capsys):
+def test_root_refusal_names_owner_of_explicit_home(
+    tmp_path, launcher, monkeypatch, capsys
+):
     """Без sudo (su -, runuser) подсказка называет владельца явно заданного дома."""
     import pwd
 
@@ -1123,7 +1269,9 @@ def test_doctor_reports_unreadable_unit(tmp_path, launcher, monkeypatch, capsys)
     broken = units / "lib-local-rag.service"
     broken.write_text("[Unit]\n", encoding="utf-8")
     broken.chmod(0)
-    (units / "lib-local-rag-mcp-register.service").write_text("[Unit]\n", encoding="utf-8")
+    (units / "lib-local-rag-mcp-register.service").write_text(
+        "[Unit]\n", encoding="utf-8"
+    )
     monkeypatch.setenv(reg.UNIT_DIR_ENV, str(units))
     try:
         out = _doctor(launcher, capsys)
@@ -1194,12 +1342,19 @@ def test_doctor_accepts_opt_out(home, launcher, capsys):
     cfg_dir = home / ".wsc" / "config"
     cfg_dir.mkdir(parents=True)
     (cfg_dir / "wsc.json").write_text(
-        json.dumps({"mcp": {"localrag": _opt_out_wsc_entry(launcher)}}), encoding="utf-8"
+        json.dumps({"mcp": {"localrag": _opt_out_wsc_entry(launcher)}}),
+        encoding="utf-8",
     )
     (home / ".gigacode").mkdir()
-    env = {"LQRAG_TIMEOUT": reg.BRIDGE_TIMEOUT_S, "LQRAG_ALLOW_WRITE": "0"}
+    env = {
+        "LQRAG_TIMEOUT": reg.BRIDGE_TIMEOUT_S,
+        "LQRAG_ALLOW_WRITE": "0",
+        reg.AGENT_ENV: "gigacode",
+    }
     (home / ".gigacode" / "settings.json").write_text(
-        json.dumps({"mcpServers": {"localrag": {"command": launcher, "args": [], "env": env}}}),
+        json.dumps(
+            {"mcpServers": {"localrag": {"command": launcher, "args": [], "env": env}}}
+        ),
         encoding="utf-8",
     )
 
@@ -1214,7 +1369,13 @@ def test_doctor_accepts_opt_out(home, launcher, capsys):
 def test_doctor_finds_duplicate_in_gigacode_args(home, launcher, capsys):
     (home / ".gigacode").mkdir()
     (home / ".gigacode" / "settings.json").write_text(
-        json.dumps({"mcpServers": {"rag-sh": {"command": "sh", "args": ["/x/mcp_launcher.sh"]}}}),
+        json.dumps(
+            {
+                "mcpServers": {
+                    "rag-sh": {"command": "sh", "args": ["/x/mcp_launcher.sh"]}
+                }
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -1226,8 +1387,663 @@ def test_doctor_finds_duplicate_in_gigacode_args(home, launcher, capsys):
 def test_doctor_reports_non_utf8_config(home, launcher, capsys):
     """--doctor не падает на конфиге не в UTF-8, а называет причину."""
     (home / ".gigacode").mkdir()
-    (home / ".gigacode" / "settings.json").write_bytes('{"note": "привет"}'.encode("cp1251"))
+    (home / ".gigacode" / "settings.json").write_bytes(
+        '{"note": "привет"}'.encode("cp1251")
+    )
 
     line = _line(_doctor(launcher, capsys), "НЕ ЧИТАЕТСЯ")
 
     assert "UTF-8" in line
+
+
+# Токены агентов: секрет — ~/.files-search/tokens/<агент>.token для моста,
+# {агент: sha256} — ~/.files-search/auth.json для демона. В конфиг агента идёт
+# только ярлык LQRAG_AGENT: конфиг можно показать в тикете, файлы токенов — нет.
+
+
+def _tokens(home):
+    """{агент: содержимое файла токена} в этом доме."""
+    tokens = home / reg.FILES_SEARCH_DIR / reg.TOKENS_DIR_NAME
+    if not tokens.is_dir():
+        return {}
+    return {
+        path.name[: -len(reg.TOKEN_SUFFIX)]: path.read_text(encoding="utf-8").strip()
+        for path in tokens.iterdir()
+        if path.name.endswith(reg.TOKEN_SUFFIX)
+    }
+
+
+def _auth(home):
+    return _read(home / reg.FILES_SEARCH_DIR / reg.AUTH_FILE_NAME)
+
+
+def _token_file(home, agent="wsc"):
+    return (
+        home / reg.FILES_SEARCH_DIR / reg.TOKENS_DIR_NAME / (agent + reg.TOKEN_SUFFIX)
+    )
+
+
+def _mode(path):
+    return stat.S_IMODE(os.lstat(str(path)).st_mode)
+
+
+def _plant_token(home, content, mode=0o600, agent="wsc"):
+    """Файл токена, оставленный до регистрации."""
+    path = _token_file(home, agent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    path.chmod(mode)
+    return path
+
+
+# Валидный по виду токен, который регистрация не должна взять себе.
+_PLANTED = "planted-token-known-to-attacker-0123456789"
+
+
+def test_registration_mints_per_agent_tokens(home, launcher, capsys):
+    """Файл токена 0600 + хэш в auth.json + несекретный ярлык в конфиге."""
+    (home / ".wsc").mkdir()
+    (home / ".gigacode").mkdir()
+
+    _main(launcher)
+
+    tokens = _tokens(home)
+    assert set(tokens) == {"wsc", "gigacode"}
+    assert tokens["wsc"] != tokens["gigacode"]
+    auth = _auth(home)
+    assert auth == {name: reg.sha256_hex(token) for name, token in tokens.items()}
+    assert _mode(_token_file(home)) == 0o600
+    entry = _read(home / ".wsc" / "config" / "wsc.json")["mcp"]["localrag"]
+    assert entry["environment"][reg.AGENT_ENV] == "wsc"
+    assert tokens["wsc"] not in json.dumps(entry)
+    out = capsys.readouterr()
+    assert tokens["wsc"] not in out.out and tokens["wsc"] not in out.err
+
+
+def test_second_registration_reuses_existing_tokens(home, launcher):
+    """Перевыпуск на каждом срабатывании .path ломал бы все мосты."""
+    (home / ".wsc").mkdir()
+    (home / ".gigacode").mkdir()
+    _main(launcher)
+    auth_file = home / reg.FILES_SEARCH_DIR / reg.AUTH_FILE_NAME
+    before = (_tokens(home), _auth(home), auth_file.stat().st_mtime_ns)
+
+    _main(launcher)
+
+    assert (_tokens(home), _auth(home), auth_file.stat().st_mtime_ns) == before
+
+
+def test_tokens_are_shared_across_homes(tmp_path, launcher, monkeypatch):
+    """Разные токены по домам — мост предъявил бы демону неизвестный ему токен."""
+    h1, h2 = tmp_path / "h1", tmp_path / "h2"
+    (h1 / ".wsc").mkdir(parents=True)
+    (h2 / ".wsc").mkdir(parents=True)
+    monkeypatch.setenv(reg.HOMES_ENV, os.pathsep.join([str(h1), str(h2)]))
+
+    _main(launcher)
+
+    assert _tokens(h1)["wsc"] == _tokens(h2)["wsc"]
+    assert _auth(h1)["wsc"] == _auth(h2)["wsc"]
+
+
+def test_rotate_keeps_one_token_across_homes(tmp_path, launcher, monkeypatch):
+    """--rotate на SberOS (два дома): один новый токен на агента в обоих домах."""
+    h1, h2 = tmp_path / "h1", tmp_path / "h2"
+    (h1 / ".wsc").mkdir(parents=True)
+    h2.mkdir()
+    monkeypatch.setenv(reg.HOMES_ENV, os.pathsep.join([str(h1), str(h2)]))
+    _main(launcher)
+    old = _tokens(h1)["wsc"]
+
+    assert _main(launcher, "--rotate") == 0
+
+    new = _tokens(h1)["wsc"]
+    assert new != old
+    assert _tokens(h2)["wsc"] == new
+    assert _auth(h1)["wsc"] == _auth(h2)["wsc"] == reg.sha256_hex(new)
+
+
+def test_token_from_second_home_is_reused(tmp_path, launcher, monkeypatch):
+    """Пропал токен в pw_dir (RESET=1) — берётся годный из второго дома, а не новый."""
+    h1, h2 = tmp_path / "h1", tmp_path / "h2"
+    (h1 / ".wsc").mkdir(parents=True)
+    h2.mkdir()
+    monkeypatch.setenv(reg.HOMES_ENV, os.pathsep.join([str(h1), str(h2)]))
+    _main(launcher)
+    token = _tokens(h2)["wsc"]
+    _token_file(h1).unlink()
+
+    _main(launcher)
+
+    assert _tokens(h1)["wsc"] == token
+    assert _auth(h1)["wsc"] == reg.sha256_hex(token)
+
+
+def _two_homes(tmp_path, monkeypatch):
+    """Два дома, как на SberOS; WSC установлен в первом."""
+    h1, h2 = tmp_path / "h1", tmp_path / "h2"
+    (h1 / ".wsc").mkdir(parents=True)
+    h2.mkdir()
+    monkeypatch.setenv(reg.HOMES_ENV, os.pathsep.join([str(h1), str(h2)]))
+    return h1, h2
+
+
+def test_revoke_in_one_home_is_not_undone_by_copy_in_other(
+    tmp_path, launcher, monkeypatch
+):
+    """Отзыв дошёл не во все дома (--home, сбой) — регистрация не вернёт старый токен."""
+    h1, h2 = _two_homes(tmp_path, monkeypatch)
+    _main(launcher)
+    old = _tokens(h1)["wsc"]
+
+    assert _main(launcher, "--revoke", "wsc", "--home", str(h1)) == 0
+    _main(launcher)
+
+    new = _tokens(h1)["wsc"]
+    assert new != old
+    assert _tokens(h2)["wsc"] == new
+    assert _auth(h1)["wsc"] == _auth(h2)["wsc"] == reg.sha256_hex(new)
+
+
+def test_partial_rotate_is_not_rolled_back(tmp_path, launcher, monkeypatch, capsys):
+    """--rotate не дописал один дом — следующая регистрация не возвращает старый токен."""
+    h1, h2 = _two_homes(tmp_path, monkeypatch)
+    _main(launcher)
+    old = _tokens(h1)["wsc"]
+    real_write = reg._write_private
+    # Сбой в первом доме (pw_dir): прежде регистрация брала токен оттуда.
+    h1_token = str(_token_file(h1))
+
+    def fail_in_h1(path, payload):
+        if path == h1_token:
+            raise OSError(5, "Input/output error")
+        real_write(path, payload)
+
+    monkeypatch.setattr(reg, "_write_private", fail_in_h1)
+    assert _main(launcher, "--rotate") == 1  # и без --strict: ручной режим
+    assert "ОШИБКА" in capsys.readouterr().err
+    assert _tokens(h1)["wsc"] == old
+    monkeypatch.setattr(reg, "_write_private", real_write)
+
+    _main(launcher)
+
+    assert old not in (_tokens(h1)["wsc"], _tokens(h2)["wsc"])
+    assert _tokens(h1)["wsc"] == _tokens(h2)["wsc"]
+    assert reg.sha256_hex(old) not in (_auth(h1)["wsc"], _auth(h2)["wsc"])
+
+
+def test_token_readable_by_others_in_one_home_is_reissued_everywhere(
+    tmp_path, launcher, monkeypatch
+):
+    """Копия 0644 в одном доме — секрет мог утечь: новый токен во все дома."""
+    h1, h2 = _two_homes(tmp_path, monkeypatch)
+    _main(launcher)
+    old = _tokens(h1)["wsc"]
+    _token_file(h2).chmod(0o644)
+
+    _main(launcher)
+
+    assert _tokens(h1)["wsc"] != old
+    assert _tokens(h1)["wsc"] == _tokens(h2)["wsc"]
+    assert _mode(_token_file(h2)) == 0o600
+
+
+def test_auth_json_writable_by_others_is_not_carried_over(home, launcher, capsys):
+    """Демон такой файл отвергает: подложенный в него хэш в новый файл не попадает."""
+    (home / ".wsc").mkdir()
+    _main(launcher)
+    auth_file = home / reg.FILES_SEARCH_DIR / reg.AUTH_FILE_NAME
+    planted = dict(_auth(home), intruder=reg.sha256_hex(_PLANTED))
+    auth_file.write_text(json.dumps(planted), encoding="utf-8")
+    auth_file.chmod(0o666)
+    capsys.readouterr()
+
+    _main(launcher)
+
+    assert set(_auth(home)) == {"wsc"}
+    assert _mode(auth_file) == 0o600
+    assert "отвергнут демоном" in capsys.readouterr().err
+
+
+def test_auth_entries_daemon_would_skip_are_dropped(home, launcher):
+    (home / ".wsc").mkdir()
+    root = home / reg.FILES_SEARCH_DIR
+    root.mkdir()
+    entries = {
+        "good": reg.sha256_hex("x"),
+        "Bad Name": reg.sha256_hex("y"),
+        "short": "abc",
+    }
+    (root / reg.AUTH_FILE_NAME).write_text(json.dumps(entries), encoding="utf-8")
+
+    _main(launcher)
+
+    assert set(_auth(home)) == {"good", "wsc"}
+
+
+def test_forget_removes_token_traces_in_every_home(tmp_path, launcher, monkeypatch):
+    """uninstall.sh удаляет один ~/.files-search, а токены лежат в каждом доме."""
+    h1, h2 = _two_homes(tmp_path, monkeypatch)
+    _main(launcher)
+    _main(launcher, "--rotate")
+    (h1 / reg.FILES_SEARCH_DIR / "lance").mkdir()  # данные демона — не наше дело
+
+    assert _main(launcher, "--forget") == 0
+
+    assert sorted(os.listdir(str(h1 / reg.FILES_SEARCH_DIR))) == ["lance"]
+    assert not (h2 / reg.FILES_SEARCH_DIR).exists()
+    assert _read(h1 / ".wsc" / "config" / "wsc.json")["mcp"]["localrag"]
+
+
+def test_forget_dry_run_changes_nothing(tmp_path, launcher, monkeypatch, capsys):
+    h1, h2 = _two_homes(tmp_path, monkeypatch)
+    _main(launcher)
+    before = (_tokens(h1), _tokens(h2))
+
+    assert _main(launcher, "--forget", "--dry-run") == 0
+
+    assert (_tokens(h1), _tokens(h2)) == before
+    assert "(план)" in capsys.readouterr().out
+
+
+def test_registration_preserves_foreign_auth_entries(home, launcher):
+    """auth.json — общее хранилище: чужого агента никто не отзывал."""
+    (home / ".wsc").mkdir()
+    root = home / reg.FILES_SEARCH_DIR
+    root.mkdir()
+    foreign = {"megacode": reg.sha256_hex("чужой")}
+    (root / reg.AUTH_FILE_NAME).write_text(json.dumps(foreign), encoding="utf-8")
+
+    _main(launcher)
+
+    assert _auth(home)["megacode"] == reg.sha256_hex("чужой")
+    assert "megacode" not in _tokens(home)
+
+
+def test_tokens_only_for_agents_with_config(home, launcher):
+    """Неустановленному агенту токен не выдаётся."""
+    (home / ".wsc").mkdir()
+
+    _main(launcher)
+
+    assert set(_tokens(home)) == {"wsc"}
+    assert set(_auth(home)) == {"wsc"}
+
+
+def test_revoked_agent_without_config_stays_revoked(home, launcher):
+    """Агента удалили и отозвали — следующая регистрация токен ему не вернёт."""
+    (home / ".wsc").mkdir()
+    (home / ".gigacode").mkdir()
+    _main(launcher)
+    (home / ".gigacode" / "settings.json").unlink()
+    (home / ".gigacode").rmdir()
+    _main(launcher, "--revoke", "gigacode")
+
+    _main(launcher)
+
+    assert set(_tokens(home)) == {"wsc"}
+    assert set(_auth(home)) == {"wsc"}
+
+
+def test_rotate_replaces_every_token_and_digest(home, launcher, capsys):
+    (home / ".wsc").mkdir()
+    (home / ".gigacode").mkdir()
+    _main(launcher)
+    old = _tokens(home)
+
+    assert _main(launcher, "--rotate") == 0
+
+    new = _tokens(home)
+    assert all(new[name] != old[name] for name in old)
+    assert _auth(home) == {name: reg.sha256_hex(token) for name, token in new.items()}
+    out = capsys.readouterr()
+    assert new["wsc"] not in out.out and new["wsc"] not in out.err
+
+
+def test_rotate_names_tokens_it_did_not_rotate(home, launcher, capsys):
+    """Токен агента без конфига --rotate не трогает, но называет: он ещё действует."""
+    (home / ".wsc").mkdir()
+    (home / ".gigacode").mkdir()
+    _main(launcher)
+    (home / ".gigacode" / "settings.json").unlink()
+    (home / ".gigacode").rmdir()
+    old = _tokens(home)["gigacode"]
+    capsys.readouterr()
+
+    _main(launcher, "--rotate")
+
+    assert _tokens(home)["gigacode"] == old
+    assert "не разобран): gigacode —" in _line(
+        capsys.readouterr().err, "не перевыпущены"
+    )
+
+
+def test_revoke_removes_token_and_digest_only_for_one_agent(home, launcher):
+    (home / ".wsc").mkdir()
+    (home / ".gigacode").mkdir()
+    _main(launcher)
+
+    assert _main(launcher, "--revoke", "wsc") == 0
+
+    assert set(_tokens(home)) == {"gigacode"}
+    assert set(_auth(home)) == {"gigacode"}
+    # Регистрация не снимается: отзыв — смена секрета, а не удаление агента.
+    assert _read(home / ".wsc" / "config" / "wsc.json")["mcp"]["localrag"]
+
+
+def test_revoke_is_idempotent(home, launcher, capsys):
+    (home / ".wsc").mkdir()
+    _main(launcher)
+    _main(launcher, "--revoke", "wsc")
+
+    assert _main(launcher, "--revoke", "wsc") == 0
+
+    assert "нет следов" in capsys.readouterr().out
+
+
+def test_revoke_walks_all_homes(tmp_path, launcher, monkeypatch):
+    h1, h2 = tmp_path / "h1", tmp_path / "h2"
+    (h1 / ".wsc").mkdir(parents=True)
+    h2.mkdir()
+    monkeypatch.setenv(reg.HOMES_ENV, os.pathsep.join([str(h1), str(h2)]))
+    _main(launcher)
+
+    assert _main(launcher, "--revoke", "wsc") == 0
+
+    assert _tokens(h1) == _tokens(h2) == {}
+    assert _auth(h1) == _auth(h2) == {}
+
+
+def test_revoke_failure_returns_one(home, launcher, capsys):
+    """Отзыв не удался — код 1 и строка ОШИБКА, а не молчаливый успех."""
+    (home / ".wsc").mkdir()
+    _main(launcher)
+    secret = _token_file(home)
+    secret.unlink()
+    secret.mkdir()
+    (secret / "keep").write_text("", encoding="utf-8")
+
+    assert _main(launcher, "--revoke", "wsc") == 1
+
+    assert "ОШИБКА" in capsys.readouterr().err
+
+
+def test_remove_leaves_tokens_alone(home, launcher):
+    """Снятие регистрации — не отзыв: для этого --revoke, а purge сносит всё."""
+    (home / ".wsc").mkdir()
+    _main(launcher)
+    before = (_tokens(home), _auth(home))
+
+    _main(launcher, "--remove")
+
+    assert (_tokens(home), _auth(home)) == before
+
+
+def test_dry_run_mints_nothing(home, launcher, capsys):
+    (home / ".wsc").mkdir()
+
+    _main(launcher, "--dry-run")
+
+    assert not (home / reg.FILES_SEARCH_DIR).exists()
+    assert "(план) авторизация %s: wsc (выдан)" % home in capsys.readouterr().out
+
+
+def test_dry_run_revoke_and_rotate_change_nothing(home, launcher):
+    (home / ".wsc").mkdir()
+    _main(launcher)
+    before = _tree(home / reg.FILES_SEARCH_DIR)
+
+    _main(launcher, "--rotate", "--dry-run")
+    _main(launcher, "--revoke", "wsc", "--dry-run")
+
+    assert _tree(home / reg.FILES_SEARCH_DIR) == before
+
+
+def test_token_storage_is_private_and_leaves_no_temp_files(home, launcher):
+    """Каталоги 0700, файлы 0600 при любом umask; после записи — ни одного временного файла."""
+    (home / ".wsc").mkdir()
+    old = os.umask(0)
+    try:
+        _main(launcher)
+        _main(launcher, "--rotate")
+    finally:
+        os.umask(old)
+
+    root = home / reg.FILES_SEARCH_DIR
+    expected = [
+        reg.AUTH_FILE_NAME,
+        reg.LOCK_FILE_NAME,
+        reg.TOKENS_DIR_NAME,
+        reg.WITHDRAWN_FILE_NAME,  # от --rotate
+    ]
+    assert sorted(os.listdir(str(root))) == sorted(expected)
+    assert os.listdir(str(root / reg.TOKENS_DIR_NAME)) == ["wsc" + reg.TOKEN_SUFFIX]
+    assert _mode(root) == _mode(root / reg.TOKENS_DIR_NAME) == 0o700
+    assert _mode(root / reg.AUTH_FILE_NAME) == _mode(_token_file(home)) == 0o600
+    assert _mode(root / reg.WITHDRAWN_FILE_NAME) == 0o600
+
+
+def test_shared_auth_json_is_rewritten_0600(home, launcher):
+    (home / ".wsc").mkdir()
+    _main(launcher)
+    auth_file = home / reg.FILES_SEARCH_DIR / reg.AUTH_FILE_NAME
+    auth_file.chmod(0o644)
+    before = _auth(home)
+
+    _main(launcher)
+
+    assert _mode(auth_file) == 0o600
+    assert _auth(home) == before
+
+
+def test_registration_waits_for_lock_of_another_run(home, launcher):
+    """Пока другой прогон держит .register.lock, токены не пишутся; после — пишутся."""
+    (home / ".wsc").mkdir()
+    root = home / reg.FILES_SEARCH_DIR
+    root.mkdir(mode=0o700)
+    worker = threading.Thread(target=_main, args=(launcher,))
+    with open(str(root / reg.LOCK_FILE_NAME), "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        worker.start()
+        worker.join(timeout=0.5)
+        waited = worker.is_alive() and not _tokens(home)
+
+    worker.join(timeout=30)
+
+    assert waited
+    assert not worker.is_alive()
+    assert set(_tokens(home)) == {"wsc"}
+
+
+def test_token_symlink_is_not_reused_or_followed(home, launcher, tmp_path):
+    """Симлинк на месте файла токена: его содержимое не берётся, цель не переписывается."""
+    (home / ".wsc").mkdir()
+    victim = _victim(tmp_path, name="token-victim.txt")
+    victim.write_text(_PLANTED, encoding="utf-8")
+    secret = _token_file(home)
+    secret.parent.mkdir(parents=True)
+    secret.symlink_to(victim)
+
+    _main(launcher)
+
+    assert victim.read_text(encoding="utf-8") == _PLANTED
+    assert not secret.is_symlink()
+    token = _tokens(home)["wsc"]
+    assert token != _PLANTED
+    assert _auth(home)["wsc"] == reg.sha256_hex(token)
+
+
+@pytest.mark.parametrize(
+    "content, mode",
+    [
+        (_PLANTED.encode("ascii"), 0o644),  # доступен группе и всем
+        (b"\xff\xfe not utf-8 \x00", 0o600),  # битый файл не роняет регистрацию
+        (b"short", 0o600),  # не похоже на токен
+    ],
+)
+def test_unfit_token_file_is_replaced(home, launcher, content, mode):
+    (home / ".wsc").mkdir()
+    secret = _plant_token(home, content, mode)
+
+    assert _main(launcher, "--strict") == 0
+
+    token = _tokens(home)["wsc"]
+    assert token.encode("ascii") != content.strip()
+    assert _mode(secret) == 0o600
+    assert _auth(home)["wsc"] == reg.sha256_hex(token)
+
+
+def test_foreign_token_file_is_not_reused(home, launcher, monkeypatch):
+    """Файл токена чужого владельца (явный --home в чужом каталоге) не переиспользуется."""
+    (home / ".wsc").mkdir()
+    _plant_token(home, _PLANTED.encode("ascii"))
+    real_uid = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: real_uid + 1)
+
+    _main(launcher)
+
+    assert _tokens(home)["wsc"] != _PLANTED
+
+
+def test_failed_token_write_is_error_in_strict(home, launcher, capsys):
+    """Токен не записан — мосту будет 401, и postinst не должен писать «выполнено»."""
+    (home / ".wsc").mkdir()
+    root = home / reg.FILES_SEARCH_DIR
+    root.mkdir()
+    (root / reg.TOKENS_DIR_NAME).write_text("не каталог", encoding="utf-8")
+
+    assert _main(launcher, "--strict") == 1
+
+    assert "ОШИБКА" in capsys.readouterr().err
+    assert "localrag" in _read(home / ".wsc" / "config" / "wsc.json")["mcp"]
+    assert _auth(home) == {}  # хэша без файла токена не бывает
+    assert _main(launcher) == 0  # без --strict — 0, юнит не упирается в StartLimit
+
+
+def test_failed_auth_write_is_error_in_strict(home, launcher, capsys):
+    (home / ".wsc").mkdir()
+    root = home / reg.FILES_SEARCH_DIR
+    root.mkdir()
+    (root / reg.AUTH_FILE_NAME).mkdir()
+
+    assert _main(launcher, "--strict") == 1
+
+    assert "ОШИБКА" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--revoke", "../x"],
+        ["--revoke", "WSC"],
+        ["--revoke", "wsc\n"],
+        ["--revoke", "a" * 33],
+        ["--config", "cfg.json", "--agent", "../../x"],
+        ["--agent", "custom"],  # --agent без --config
+        ["--rotate", "--remove"],
+        ["--revoke", "wsc", "--rotate"],
+    ],
+)
+def test_bad_agent_names_and_mode_mixes_are_refused(launcher, capsys, argv):
+    with pytest.raises(SystemExit) as exc:
+        _main(launcher, *argv)
+
+    assert exc.value.code == 2
+
+
+def test_config_with_agent_gets_label_and_token(tmp_path, home, launcher):
+    cfg = tmp_path / "agent" / "cfg.json"
+    cfg.parent.mkdir()
+
+    assert _main(launcher, "--strict", "--config", str(cfg), "--agent", "custom") == 0
+
+    assert _read(cfg)["mcp"]["localrag"]["environment"][reg.AGENT_ENV] == "custom"
+    assert _auth(home)["custom"] == reg.sha256_hex(_tokens(home)["custom"])
+
+
+def test_config_without_agent_dir_gets_no_token(tmp_path, home, launcher):
+    cfg = tmp_path / "nope" / "cfg.json"
+
+    assert _main(launcher, "--strict", "--config", str(cfg), "--agent", "custom") == 3
+
+    assert not (home / reg.FILES_SEARCH_DIR).exists()
+
+
+def test_doctor_reports_auth_and_tokens_without_secret(home, launcher, capsys):
+    (home / ".wsc").mkdir()
+    (home / ".gigacode").mkdir()
+    (home / ".gigacode" / "settings.json").write_text("{}", encoding="utf-8")
+
+    before = _doctor(launcher, capsys)
+    _main(launcher)
+    after = _doctor(launcher, capsys)
+
+    assert "нет файла — демон отвечает 401" in _line(before, "авторизация:")
+    assert "НЕТ — будет выдан" in _line(before, "токен:")
+    assert _line(after, "авторизация:").endswith(": gigacode, wsc")
+    tokens = _tokens(home)
+    assert [line for line in after.splitlines() if "токен:" in line] == [
+        "  токен:     есть, хэш в auth.json совпадает"
+    ] * 2
+    assert all(token not in after for token in tokens.values())
+
+
+def test_doctor_reports_digest_mismatch(home, launcher, capsys):
+    (home / ".wsc").mkdir()
+    _main(launcher)
+    auth_file = home / reg.FILES_SEARCH_DIR / reg.AUTH_FILE_NAME
+    auth_file.write_text(
+        json.dumps({"wsc": reg.sha256_hex("другой")}), encoding="utf-8"
+    )
+
+    out = _doctor(launcher, capsys)
+
+    assert "НЕ СОВПАДАЕТ" in _line(out, "токен:")
+
+
+@pytest.mark.parametrize("mode", [0o620, 0o602], ids=["g+w", "o+w"])
+def test_doctor_reports_auth_json_the_daemon_rejects(home, launcher, capsys, mode):
+    """Права, при которых демон закрыт для всех, --doctor называет прямо."""
+    (home / ".wsc").mkdir()
+    _main(launcher)
+    (home / reg.FILES_SEARCH_DIR / reg.AUTH_FILE_NAME).chmod(mode)
+
+    line = _line(_doctor(launcher, capsys), reg.AUTH_FILE_NAME + ":")
+
+    assert "ОТВЕРГНУТ" in line and "%04o" % mode in line
+
+
+def test_doctor_marks_entry_without_agent_label_stale(home, launcher, capsys):
+    """Запись без LQRAG_AGENT мост не свяжет с токеном — это УСТАРЕЛА."""
+    cfg = home / ".wsc" / "config" / "wsc.json"
+    cfg.parent.mkdir(parents=True)
+    entry = _opt_out_wsc_entry(launcher, enabled=True)
+    del entry["environment"][reg.AGENT_ENV]
+    cfg.write_text(json.dumps({"mcp": {"localrag": entry}}), encoding="utf-8")
+
+    state = _line(_doctor(launcher, capsys), "запись:")
+
+    assert "УСТАРЕЛА" in state and "environment" in state
+
+
+def test_token_names_match_bridge_and_daemon():
+    """Имена и хэш повторены в мосте и демоне: stdlib-скрипт их не импортирует."""
+    import mcp_server
+    from src import config
+    from src.server import auth
+
+    assert (mcp_server.TOKENS_DIR_NAME, mcp_server.TOKEN_SUFFIX) == (
+        reg.TOKENS_DIR_NAME,
+        reg.TOKEN_SUFFIX,
+    )
+    assert mcp_server.PORT_FILE_RELATIVE.split(os.sep)[0] == reg.FILES_SEARCH_DIR
+    assert (config.AUTH_FILE_NAME, config.TOKENS_DIR_NAME) == (
+        reg.AUTH_FILE_NAME,
+        reg.TOKENS_DIR_NAME,
+    )
+    assert config.WITHDRAWN_FILE_NAME == reg.WITHDRAWN_FILE_NAME
+    assert auth.sha256_hex("токен") == reg.sha256_hex("токен")
+    assert (auth.AGENT_NAME_PATTERN.pattern, auth.DIGEST_PATTERN.pattern) == (
+        reg.AGENT_NAME_PATTERN,
+        reg.DIGEST_PATTERN,
+    )

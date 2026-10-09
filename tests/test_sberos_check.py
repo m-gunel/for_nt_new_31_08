@@ -139,6 +139,131 @@ def test_runtime_uses_current_api_contract(sidecar):
     assert details["search"] == {"status": 200, "total": 1, "result_types": {"file": 1}}
 
 
+# Токен агента: без него API, кроме health, отвечает 401, и это не PASS.
+
+GUARDED = (
+    ("GET", "/api/v1/status"),
+    ("GET", "/api/v1/config"),
+    ("POST", "/api/v1/search"),
+)
+TOKEN = "T-secret-token-0000000001"
+
+
+def _deny_without_token(sidecar):
+    for method, path in GUARDED:
+        sidecar.set(method, path, {"detail": "требуется токен агента"}, status=401)
+
+
+def test_runtime_without_token_is_warn_not_pass(sidecar):
+    _deny_without_token(sidecar)
+    report = {"sections": {}}
+
+    chk.check_runtime(report, int(sidecar.url.rsplit(":", 1)[1]))
+
+    runtime = report["sections"]["runtime"]
+    assert runtime["verdict"] == "WARN"
+    assert "--token-file" in runtime["details"]["note"]
+
+
+def _token_file(tmp_path):
+    token_file = tmp_path / "wsc.token"
+    token_file.write_text(TOKEN + "\n", encoding="utf-8")
+    return str(token_file)
+
+
+def _sent_token(monkeypatch, tmp_path, *argv, owner="ours"):
+    """(токен, причина отказа), с которыми main() зовёт check_runtime.
+
+    owner — кого «видно» в /proc/net на порту: на Linux таблицы настоящие.
+    """
+    monkeypatch.setattr(chk.mcp_server, "_listener_owner", lambda targets, port: owner)
+    seen = []
+    monkeypatch.setattr(
+        chk,
+        "check_runtime",
+        lambda report, port, token, refusal: seen.append((token, refusal)),
+    )
+    _run_main(monkeypatch, tmp_path, "--token-file", _token_file(tmp_path), *argv)
+    return seen[0]
+
+
+def test_token_file_option_reaches_runtime_check(homes, monkeypatch, tmp_path):
+    term, _ = homes
+    _publish(term, 43123, os.getpid())
+
+    assert _sent_token(monkeypatch, tmp_path) == (TOKEN, None)
+
+
+@pytest.mark.parametrize(
+    "port, pid",
+    [
+        pytest.param(None, os.getpid(), id="порт-8000-по-умолчанию"),
+        pytest.param(43123, None, id="нет-pid"),
+        pytest.param(43123, "dead", id="мёртвый-pid"),
+    ],
+)
+def test_token_not_sent_to_unverified_port(homes, monkeypatch, tmp_path, port, pid):
+    # На 8000 или на порту устаревшего файла может слушать кто угодно.
+    term, _ = homes
+    _publish(term, port, _dead_pid() if pid == "dead" else pid)
+
+    token, refusal = _sent_token(monkeypatch, tmp_path)
+
+    assert token is None
+    assert refusal
+
+
+def test_token_not_sent_to_foreign_listener(homes, monkeypatch, tmp_path):
+    term, _ = homes
+    _publish(term, 43123, os.getpid())
+
+    token, refusal = _sent_token(monkeypatch, tmp_path, owner="foreign")
+
+    assert token is None
+    assert "другой учётки" in refusal
+
+
+def test_refused_token_is_explained_in_report(sidecar):
+    _deny_without_token(sidecar)
+    report = {"sections": {}}
+
+    chk.check_runtime(report, int(sidecar.url.rsplit(":", 1)[1]), None, "причина")
+
+    runtime = report["sections"]["runtime"]
+    assert runtime["verdict"] == "WARN"
+    assert "причина" in runtime["details"]["note"]
+
+
+def test_runtime_puts_token_into_guarded_requests_only(sidecar):
+    report = {"sections": {}}
+
+    chk.check_runtime(report, int(sidecar.url.rsplit(":", 1)[1]), TOKEN)
+
+    sent = {(r["method"], r["path"]): r["headers"] for r in sidecar.requests}
+    assert "Authorization" not in sent[("GET", "/api/v1/health")]
+    assert {sent[op].get("Authorization") for op in GUARDED} == {"Bearer " + TOKEN}
+
+
+def test_rejected_token_is_fail(sidecar):
+    _deny_without_token(sidecar)
+    report = {"sections": {}}
+
+    chk.check_runtime(report, int(sidecar.url.rsplit(":", 1)[1]), TOKEN)
+
+    assert report["sections"]["runtime"]["verdict"] == "FAIL"
+
+
+@pytest.mark.parametrize("content", ["", "короткий", TOKEN + "\nвторая строка"])
+def test_broken_token_file_stops_without_echoing_it(tmp_path, content):
+    token_file = tmp_path / "broken.token"
+    token_file.write_text(content, encoding="utf-8")
+
+    with pytest.raises(SystemExit) as stop:
+        chk.read_token(str(token_file))
+
+    assert TOKEN not in str(stop.value) and "строка" not in str(stop.value)
+
+
 @pytest.mark.parametrize(
     "argv, published, expected",
     [
@@ -153,7 +278,9 @@ def test_port_option_then_port_file_then_8000(
     term, _ = homes
     _publish(term, published, os.getpid())
     ports = []
-    monkeypatch.setattr(chk, "check_runtime", lambda report, port: ports.append(port))
+    monkeypatch.setattr(
+        chk, "check_runtime", lambda report, port, token, refusal: ports.append(port)
+    )
     _run_main(monkeypatch, tmp_path, *argv)
     assert ports == [expected]
 
@@ -168,7 +295,7 @@ def test_dist_defaults_to_package_dir_when_installed(
     if installed:
         package.mkdir()
     dists = []
-    monkeypatch.setattr(chk, "check_runtime", lambda report, port: None)
+    monkeypatch.setattr(chk, "check_runtime", lambda report, port, token, refusal: None)
     monkeypatch.setattr(chk, "check_frozen_lance", lambda report, d: dists.append(d))
     _run_main(monkeypatch, tmp_path, package_dir=package)
     assert dists == [str(package) if installed else "dist/main"]
@@ -215,7 +342,7 @@ def test_dist_path_in_report_hides_login(homes, monkeypatch, tmp_path, exists):
     dist = pwdir / "lib-local-rag" / "main"
     if exists:
         dist.mkdir(parents=True)
-    monkeypatch.setattr(chk, "check_runtime", lambda report, port: None)
+    monkeypatch.setattr(chk, "check_runtime", lambda report, port, token, refusal: None)
 
     report = _run_main(monkeypatch, tmp_path, "--dist", str(dist))
 

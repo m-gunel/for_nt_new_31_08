@@ -152,6 +152,23 @@ def test_daemon_unit_waits_for_ready_and_has_watchdog():
     not (ROOT / "debian").is_dir(),
     reason="debian/ в контекст docker-сборки не копируется",
 )
+def test_daemon_unit_starts_after_registration_without_depending_on_it():
+    """Токены раскладывает регистрация, но её сбой не должен держать демон."""
+    unit = _unit_sections(ROOT / "debian" / "lib-local-rag.user.service")["Unit"]
+
+    assert unit["After"] == "lib-local-rag-mcp-register.service"
+    assert not {"Requires", "Requisite", "BindsTo"} & unit.keys()
+    # Зависшая регистрация держала бы старт демона: у oneshot таймаута нет.
+    register = _unit_sections(
+        ROOT / "debian" / "units" / "lib-local-rag-mcp-register.service"
+    )["Service"]
+    assert 0 < int(register["TimeoutStartSec"]) < 300
+
+
+@pytest.mark.skipif(
+    not (ROOT / "debian").is_dir(),
+    reason="debian/ в контекст docker-сборки не копируется",
+)
 def test_watchdog_restart_loop_reaches_start_limit():
     """При устойчивом зависании юнит должен уйти в failed, а не крутиться вечно."""
     unit = _unit_sections(ROOT / "debian" / "lib-local-rag.user.service")

@@ -10,10 +10,17 @@
 #
 # Переменные:
 #   MCP_CONFIG=<путь>       один конкретный конфиг агента вместо всех известных
-#   SKIP_MCP_REGISTER=1     не трогать конфиг агента
+#   MCP_AGENT=<имя>         имя агента для MCP_CONFIG (умолчание custom): по нему
+#                           мост находит свой токен, без него демон ответит 401
+#   SKIP_MCP_REGISTER=1     не трогать конфиг агента (и токенов не будет)
 set -eu
 
 DIR=$(cd "$(dirname "$0")" && pwd)
+# Чей токен показать в подсказке curl ниже; при штатной регистрации — wsc.
+AGENT=wsc
+if [ -n "${MCP_CONFIG:-}" ]; then
+    AGENT=${MCP_AGENT:-custom}
+fi
 
 restore() {
     if [ ! -f "$1" ]; then
@@ -41,7 +48,7 @@ elif ! command -v python3 >/dev/null 2>&1; then
 else
     echo "Регистрация MCP-моста в конфигах агентов:"
     if [ -n "${MCP_CONFIG:-}" ]; then
-        python3 "$DIR/mcp/register_mcp.py" --config "$MCP_CONFIG" \
+        python3 "$DIR/mcp/register_mcp.py" --config "$MCP_CONFIG" --agent "$AGENT" \
             || echo "  не удалось — пропишите вручную, см. mcp/README.md" >&2
     else
         python3 "$DIR/mcp/register_mcp.py" \
@@ -67,9 +74,15 @@ cat <<EOF
   3. По умолчанию индексируется весь /home (cfg/distro.yml). Сузить набор
      папок — через API. Правкой YAML не выйдет: сохранённый
      ~/.ragsearch/user_conf.yml (если он есть) главнее списка из YAML, а
-     снятые папки удаляет из индекса только POST /api/v1/config:
+     снятые папки удаляет из индекса только POST /api/v1/config.
+     Все ручки, кроме /health, требуют токен агента: регистрация выше кладёт
+     его каждому агенту с найденным конфигом в ~/.files-search/tokens/
+     (ниже — $AGENT; нет такого файла — возьмите токен другого агента).
+     Заголовок — из файла, а не в командной строке: так токен не виден в
+     списке процессов (нужен bash или zsh):
 
        curl -X POST http://127.0.0.1:\$(cat ~/.files-search/port)/api/v1/config \\
+         -H @<(printf 'Authorization: Bearer %s' "\$(cat ~/.files-search/tokens/$AGENT.token)") \\
          -H 'Content-Type: application/json' \\
          -d "{\\"folders\\":[\\"\$HOME/Документы\\"]}"
 

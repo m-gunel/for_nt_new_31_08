@@ -1,9 +1,10 @@
 """HTTP API отвечает только запросам с loopback-Host и без чужого Origin.
 
 Проверяется настоящее приложение src.server.app без lifespan: модель не
-грузится, а запросы идут в ручки без зависимостей от индекса (/health) или
-отбиваются валидацией тела до вызова ручки (/read_file с пустым телом), так
-что ни одна ручка не меняет состояние даже без проверки.
+грузится, а запросы идут в ручки без зависимостей от индекса (/health) или, с
+токеном тестового агента, отбиваются валидацией тела до вызова ручки
+(/read_file с пустым телом), так что ни одна ручка не меняет состояние даже
+без проверки.
 """
 
 import pytest
@@ -53,13 +54,15 @@ def test_foreign_origin_rejected_before_handler(client):
     assert resp.status_code == 403
 
 
-def test_swagger_same_origin_still_works(client):
-    """Swagger UI с того же адреса: страница, схема и «Try it out»."""
+def test_swagger_same_origin_still_works(client, agent_auth):
+    """Swagger UI с того же адреса: страница, схема и «Try it out» с токеном."""
     origin = "http://127.0.0.1:%d" % PORT
     assert client.get("/docs").status_code == 200
     assert client.get("/openapi.json").status_code == 200
-    # До ручки доходит: 422 — это уже валидация тела, а не отказ проверки.
-    resp = client.post("/api/v1/read_file", json={}, headers={"origin": origin})
+    # Origin пропущен и токен принят: 422 — это уже валидация тела.
+    resp = client.post(
+        "/api/v1/read_file", json={}, headers={"origin": origin, **agent_auth}
+    )
     assert resp.status_code == 422
     resp = client.get(
         "/api/v1/health", headers={"origin": "http://localhost:%d" % PORT}

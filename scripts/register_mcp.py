@@ -21,10 +21,15 @@
 доме (discover_homes), пишем только туда, где агент установлен. От root скрипт
 не пишет ничего (root_refusal).
 
+Токены. Агенту с найденным конфигом скрипт выдаёт bearer-токен к демону, один
+на все дома: секрет — в ~/.files-search/tokens/<агент>.token (0600, читает
+мост), sha256 — в ~/.files-search/auth.json (читает демон). В конфиг агента
+идёт только несекретный ярлык LQRAG_AGENT: конфиги показывают в тикетах.
+
 Код возврата без --strict — 0: юнит дёргается .path-срабатываниями, и
 failed-состояние упёрлось бы в StartLimit. С --strict (так зовёт postinst):
 0 — ошибок нет и агент найден, 3 — агентов нет ни в одном доме, 1 — ошибка по
-цели или не найден ни один дом. Отказ под root — 2 в любом режиме.
+цели, по токенам или не найден ни один дом. Отказ под root — 2 в любом режиме.
 
 Только stdlib и конструкции python3.6: скрипт работает на системном
 интерпретаторе, а нижняя граница python3 в debian/control снята сознательно.
@@ -36,16 +41,26 @@ failed-состояние упёрлось бы в StartLimit. С --strict (та
     python3 register_mcp.py --home DIR       # только этот дом (можно повторять)
     python3 register_mcp.py --strict         # код возврата по итогу (postinst)
     python3 register_mcp.py --remove         # снять при удалении ПО
+    python3 register_mcp.py --rotate         # перевыпустить токены агентов
+    python3 register_mcp.py --revoke NAME    # отозвать текущий токен агента
+    python3 register_mcp.py --forget         # удалить токены во всех домах (uninstall.sh)
 """
 
 import argparse
+import contextlib
 import errno
+import fcntl
+import hashlib
 import json
 import os
 import pwd
+import re
+import secrets
 import shlex
+import shutil
 import stat
 import sys
+import tempfile
 import time
 
 DEFAULT_NAME = "localrag"
@@ -100,6 +115,33 @@ WORK_HOME_ROOT = "/home/work"
 # тестам нельзя трогать настоящие ~/.wsc и ~/.gigacode разработчика, а
 # нестандартной установке — гадать по passwd.
 HOMES_ENV = "LQRAG_REGISTER_HOMES"
+
+# Носители токенов агентов в каждом доме. Имена и шаблоны повторены в
+# mcp_server.py, src/config.py и src/server/auth.py: stdlib-скрипт их не
+# импортирует, расхождение ловит test_token_names_match_bridge_and_daemon.
+FILES_SEARCH_DIR = ".files-search"
+TOKENS_DIR_NAME = "tokens"
+TOKEN_SUFFIX = ".token"
+AUTH_FILE_NAME = "auth.json"
+# sha256 токенов, выведенных --revoke и --rotate: регистрация их не вернёт,
+# даже если копия осталась в доме, куда отзыв не дошёл.
+WITHDRAWN_FILE_NAME = "withdrawn_tokens"
+LOCK_FILE_NAME = ".register.lock"
+AGENT_ENV = "LQRAG_AGENT"
+# Имя агента входит в путь файла токена: «../x» вывело бы его из tokens/.
+AGENT_NAME_PATTERN = r"[a-z0-9][a-z0-9_-]{0,31}"
+TOKEN_PATTERN = r"[A-Za-z0-9_-]{20,}"
+DIGEST_PATTERN = r"[0-9a-f]{64}"
+TOKEN_BYTES = 32
+# Наши токены — 43 символа; больше не читаем, чтобы подложенный огромный файл
+# не съел память.
+TOKEN_READ_LIMIT = 4096
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+# Биты группы и остальных: файл с любым из них не приватный.
+SHARED_ACCESS_BITS = 0o077
+# auth.json с такими битами демон отвергает: в него мог вписать хэш не владелец.
+FOREIGN_WRITE_BITS = stat.S_IWGRP | stat.S_IWOTH
 
 # Пользовательские юниты пакета. --doctor проверяет, что пользователь может их
 # прочитать: при правах 0600 root systemd --user отвечает «could not be found»,
@@ -302,7 +344,8 @@ def check_launcher_origin(launcher):
     return [
         "ВНИМАНИЕ: в конфиг пойдёт %s, хотя пакет поставил %s. "
         "Путь из рабочей копии не переживёт её удаление — если это не отладка, "
-        "перезапустите с --launcher %s" % (launcher, PACKAGED_LAUNCHER, PACKAGED_LAUNCHER)
+        "перезапустите с --launcher %s"
+        % (launcher, PACKAGED_LAUNCHER, PACKAGED_LAUNCHER)
     ]
 
 
@@ -414,7 +457,9 @@ def load_config(path):
             "перезаписывать его я не буду, там могут быть ваши настройки." % (path, exc)
         )
     if not isinstance(data, dict):
-        raise SystemExit("%s: ожидался объект JSON, получено %s" % (path, type(data).__name__))
+        raise SystemExit(
+            "%s: ожидался объект JSON, получено %s" % (path, type(data).__name__)
+        )
     return data, raw
 
 
@@ -479,11 +524,15 @@ def make_backup(path, raw):
         mode = stat.S_IMODE(os.stat(path).st_mode)
         _create_file(backup, raw.encode("utf-8"), mode)
     except OSError as exc:
-        print("не удалось сохранить резервную копию %s: %s" % (backup, exc), file=sys.stderr)
+        print(
+            "не удалось сохранить резервную копию %s: %s" % (backup, exc),
+            file=sys.stderr,
+        )
         return None
     if has_comments:
         print(
-            "%s: комментарии при записи не сохраняются, прежний текст — в %s" % (path, backup),
+            "%s: комментарии при записи не сохраняются, прежний текст — в %s"
+            % (path, backup),
             file=sys.stderr,
         )
     return backup
@@ -494,33 +543,571 @@ def save_config(path, config):
 
     Режим существующего файла сохраняется; новый — 0600: в конфиге агента
     бывают токены соседних MCP-серверов.
-
-    Временный файл — .localrag.tmp, а не <имя>.tmp: за <имя> следит
-    .path-юнит. Остаток прерванного прогона или подложенный симлинк удаляем
-    (unlink и os.replace по ссылкам не ходят) и создаём заново.
     """
     directory = os.path.dirname(path)
     if directory:
-        os.makedirs(directory, 0o700, exist_ok=True)
-    mode = 0o600
+        os.makedirs(directory, PRIVATE_DIR_MODE, exist_ok=True)
+    mode = PRIVATE_FILE_MODE
     if os.path.exists(path):
         try:
             mode = stat.S_IMODE(os.stat(path).st_mode)
         except OSError:
             pass
-    tmp = path + ".localrag.tmp"
     payload = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
-    _unlink_missing_ok(tmp)
-    _create_file(tmp, payload.encode("utf-8"), mode)
-    os.replace(tmp, path)
+    _write_atomic(path, payload.encode("utf-8"), mode)
 
 
-def _opencode_entry(launcher, allow_write):
+def agent_name(value):
+    """Тип argparse для --agent и --revoke: имя агента по AGENT_NAME_PATTERN."""
+    if re.fullmatch(AGENT_NAME_PATTERN, value) is None:
+        raise argparse.ArgumentTypeError(
+            "%r — не имя агента: строчные латинские буквы, цифры, «_» и «-», "
+            "до 32 символов, первый — буква или цифра" % value
+        )
+    return value
+
+
+def sha256_hex(text):
+    """Хэш токена для auth.json — тот же, что считает демон (src/server/auth.py)."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def data_dir(home):
+    return os.path.join(home, FILES_SEARCH_DIR)
+
+
+def tokens_dir(home):
+    return os.path.join(data_dir(home), TOKENS_DIR_NAME)
+
+
+def token_path(home, agent):
+    return os.path.join(tokens_dir(home), agent + TOKEN_SUFFIX)
+
+
+def auth_path(home):
+    return os.path.join(data_dir(home), AUTH_FILE_NAME)
+
+
+# Без O_NONBLOCK чтение FIFO на месте файла токена повисло бы до писателя.
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+
+
+def _private_file_problem(st):
+    """None, если это свой обычный файл, закрытый от группы и остальных, иначе причина."""
+    if not stat.S_ISREG(st.st_mode):
+        return "не обычный файл"
+    if st.st_uid != os.getuid():
+        return "владелец uid %d, а не вы" % st.st_uid
+    if st.st_mode & SHARED_ACCESS_BITS:
+        return "права %04o, нужны 0600" % stat.S_IMODE(st.st_mode)
+    return None
+
+
+def _parse_token(raw):
+    if len(raw) > TOKEN_READ_LIMIT:
+        return None, "файл слишком большой"
+    token = raw.decode("ascii", "replace").strip()
+    if re.fullmatch(TOKEN_PATTERN, token) is None:
+        return None, "содержимое не похоже на токен"
+    return token, None
+
+
+NO_FILE = "нет файла"
+
+
+def _read_checked(path, problem_of, limit=-1):
+    """(байты, None) или (None, причина): файл не по ссылке и прошёл problem_of(stat).
+
+    O_NOFOLLOW — симлинк не годится даже на свой файл; проверка — по
+    дескриптору, так что подмена между проверкой и чтением не пройдёт.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return None, NO_FILE
+        if exc.errno == errno.ELOOP:
+            return None, "симлинк"
+        return None, "не читается (%s)" % (exc.strerror or exc)
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            problem = problem_of(os.fstat(handle.fileno()))
+            raw = None if problem else handle.read(limit)
+    except OSError as exc:
+        return None, "не читается (%s)" % (exc.strerror or exc)
+    return raw, problem
+
+
+def inspect_token(path):
+    """(токен, None), если файл годится для переиспользования, иначе (None, причина).
+
+    Явный --home владельцем не фильтруется, и токен, подложенный в чужой
+    tokens/, был бы известен подложившему. Поэтому берём только свой
+    приватный файл.
+    """
+    raw, problem = _read_checked(path, _private_file_problem, TOKEN_READ_LIMIT + 1)
+    if problem:
+        return None, problem
+    return _parse_token(raw)
+
+
+def _read_token(path):
+    return inspect_token(path)[0]
+
+
+def _make_private_dir(path):
+    """Создать каталог 0700, если его нет; существующий не трогаем.
+
+    Права — явным chmod: mkdir урезает mode umask'ом, а makedirs
+    промежуточным каталогам mode не задаёт вовсе.
+    """
+    try:
+        os.mkdir(path, PRIVATE_DIR_MODE)
+    except FileExistsError:
+        return
+    os.chmod(path, PRIVATE_DIR_MODE)
+
+
+def _write_atomic(path, payload, mode):
+    """Атомарно записать файл с правами mode.
+
+    mkstemp — уникальное имя с O_EXCL|O_NOFOLLOW в том же каталоге:
+    параллельный прогон и подложенный симлинк запись не перехватят, а
+    .path-юнит, который следит за самим файлом, временный не заметит.
+    Права — fchmod по дескриптору, umask на них не влияет.
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(
+        prefix="." + os.path.basename(path) + ".", suffix=".tmp", dir=directory
+    )
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as handle:
+            fd = None  # дальше дескриптор закрывает handle
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        _unlink_missing_ok(tmp)
+        raise
+
+
+def _write_private(path, payload):
+    """Атомарно записать файл 0600 рядом с секретами."""
+    _write_atomic(path, payload, PRIVATE_FILE_MODE)
+
+
+def _auth_file_problem(st):
+    """None, если auth.json примет демон (src/server/auth.py), иначе причина."""
+    if not stat.S_ISREG(st.st_mode):
+        return "не обычный файл"
+    if st.st_uid != os.getuid():
+        return "владелец uid %d, а не вы" % st.st_uid
+    if st.st_mode & FOREIGN_WRITE_BITS:
+        return "права %04o — писать в него могут другие" % stat.S_IMODE(st.st_mode)
+    return None
+
+
+def _is_auth_entry(name, digest):
+    # Как _is_valid_entry демона: запись, которую он пропустит, не переносим.
+    return (
+        isinstance(name, str)
+        and isinstance(digest, str)
+        and re.fullmatch(AGENT_NAME_PATTERN, name) is not None
+        and re.fullmatch(DIGEST_PATTERN, digest) is not None
+    )
+
+
+def inspect_auth(path):
+    """({агент: sha256}, None) или ({}, причина, по которой демон файл отвергнет).
+
+    Нет файла — ({}, None). Чужие агенты сохраняются: auth.json — общее
+    хранилище демона. Но файл, в который мог писать не владелец, не
+    переносится: иначе подложенный хэш переехал бы в наш новый файл 0600.
+    """
+    raw, problem = _read_checked(path, _auth_file_problem)
+    if problem:
+        return {}, None if problem == NO_FILE else problem
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return {}, "не JSON"
+    if not isinstance(data, dict):
+        return {}, "не объект JSON"
+    return {
+        name: digest for name, digest in data.items() if _is_auth_entry(name, digest)
+    }, None
+
+
+def _load_auth(path):
+    return inspect_auth(path)[0]
+
+
+def _load_auth_noting(home):
+    """{агент: sha256} дома; про отвергнутый файл — строка в stderr."""
+    path = auth_path(home)
+    digests, problem = inspect_auth(path)
+    if problem:
+        print(
+            "авторизация %s: %s отвергнут демоном (%s) — прежние записи не переносятся"
+            % (home, AUTH_FILE_NAME, problem),
+            file=sys.stderr,
+        )
+    return digests
+
+
+def withdrawn_path(home):
+    return os.path.join(data_dir(home), WITHDRAWN_FILE_NAME)
+
+
+def _load_withdrawn(home):
+    """sha256 выведенных из обращения токенов дома."""
+    try:
+        with open(withdrawn_path(home), "r", encoding="ascii") as handle:
+            lines = [line.strip() for line in handle]
+    except (OSError, ValueError):
+        return set()
+    return {line for line in lines if re.fullmatch(DIGEST_PATTERN, line)}
+
+
+def _withdraw(home, digests):
+    """Внести хэши в withdrawn_tokens дома: регистрация эти токены не вернёт."""
+    known = _load_withdrawn(home)
+    if set(digests) <= known:
+        return
+    lines = "".join(digest + "\n" for digest in sorted(known | set(digests)))
+    _write_private(withdrawn_path(home), lines.encode("ascii"))
+
+
+def _save_auth(path, digests):
+    _write_private(
+        path, (json.dumps(digests, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    )
+
+
+def _is_private_file(path):
+    try:
+        return _private_file_problem(os.lstat(path)) is None
+    except OSError:
+        return False
+
+
+def _report_auth_error(home, what, exc):
+    # Слово ОШИБКА — как у сбоев целей: на эти строки ссылается postinst.
+    # Сам токен в текст не попадает.
+    print("авторизация %s: ОШИБКА %s: %s" % (home, what, exc), file=sys.stderr)
+
+
+def _lock_homes(stack, homes):
+    """Взять блокировку выдачи токенов во всех домах; вернуть дома, где не вышло.
+
+    Регистрацию одновременно зовут postinst, юнит входа, .path-юниты и
+    пользователь: без блокировки файл токена остался бы от одного прогона, а
+    хэш — от другого. Порядок захвата — по реальному пути, чтобы два прогона
+    не ждали друг друга по кругу. Каталог, видимый из двух домов, блокируем
+    один раз: второй flock того же файла в этом процессе ждал бы вечно.
+    """
+    failed = []
+    locked = set()
+    for home in sorted(homes, key=os.path.realpath):
+        try:
+            _make_private_dir(data_dir(home))
+            real = os.path.realpath(data_dir(home))
+            if real in locked:
+                continue
+            fd = os.open(
+                os.path.join(real, LOCK_FILE_NAME),
+                os.O_RDWR | os.O_CREAT | _O_NOFOLLOW,
+                PRIVATE_FILE_MODE,
+            )
+            stack.callback(os.close, fd)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            locked.add(real)
+        except OSError as exc:
+            _report_auth_error(home, "блокировка", exc)
+            failed.append(home)
+    return failed
+
+
+def _existing_token(homes, agent):
+    """Токен агента, который можно оставить, или None — тогда выпускается новый.
+
+    Оставляем, только если все копии по домам одинаковы и годны, а токен не
+    выведен из обращения ни в одном доме. Иначе следующая регистрация вернула
+    бы токен, отозванный или перевыпущенный там, куда отзыв дошёл, или копию,
+    открытую на чтение другим (секрет мог утечь).
+    """
+    found = set()
+    for home in homes:
+        token, problem = inspect_token(token_path(home, agent))
+        if token is None and problem != NO_FILE:
+            return None
+        if token is not None:
+            found.add(token)
+    if len(found) != 1:
+        return None
+    token = found.pop()
+    if any(sha256_hex(token) in _load_withdrawn(home) for home in homes):
+        return None
+    return token
+
+
+def _choose_tokens(homes, agents, rotate):
+    """{агент: токен} — один на все дома: существующий годный или новый."""
+    tokens = {}
+    for agent in agents:
+        token = None if rotate else _existing_token(homes, agent)
+        tokens[agent] = token or secrets.token_urlsafe(TOKEN_BYTES)
+    return tokens
+
+
+ISSUED = "выдан"
+REISSUED = "перевыпущен"
+REHASHED = "обновлён хэш"
+
+
+def _token_change(home, agent, token, digests):
+    """(что изменится у агента в доме, хэши заменяемых токенов).
+
+    Изменение — ISSUED, REISSUED, REHASHED или None.
+    """
+    existing = _read_token(token_path(home, agent))
+    replaced = {digests.get(agent), sha256_hex(existing) if existing else None}
+    replaced -= {None, sha256_hex(token)}
+    if existing is None:
+        return ISSUED, replaced
+    if existing != token:
+        return REISSUED, replaced
+    if digests.get(agent) != sha256_hex(token):
+        return REHASHED, replaced
+    return None, replaced
+
+
+def _store_tokens(home, tokens):
+    """Записать токены и auth.json одного дома; False — был сбой (он уже в stderr).
+
+    Порядок: надгробия заменяемых токенов, файлы токенов, хэши. Хэш агента,
+    чей файл не записался, не меняется, и прежняя пара остаётся согласованной.
+    """
+    auth = auth_path(home)
+    current = _load_auth_noting(home)
+    digests = dict(current)
+    notes = []
+    is_complete = True
+    for agent in sorted(tokens):
+        change, replaced = _token_change(home, agent, tokens[agent], current)
+        if change is None:
+            continue
+        try:
+            # До записи: сорвись она — прежний токен уже не вернётся.
+            _withdraw(home, replaced)
+            if change != REHASHED:
+                _make_private_dir(tokens_dir(home))
+                _write_private(
+                    token_path(home, agent), (tokens[agent] + "\n").encode("ascii")
+                )
+        except OSError as exc:
+            _report_auth_error(home, "токен %s" % agent, exc)
+            is_complete = False
+            continue
+        digests[agent] = sha256_hex(tokens[agent])
+        notes.append("%s (%s)" % (agent, change))
+    if digests != current or not _is_private_file(auth):
+        try:
+            _save_auth(auth, digests)
+        except OSError as exc:
+            _report_auth_error(home, AUTH_FILE_NAME, exc)
+            return False
+    if notes:
+        print("авторизация %s: %s" % (home, ", ".join(notes)))
+    return is_complete
+
+
+def _print_token_plan(home, tokens):
+    digests = _load_auth(auth_path(home))
+    notes = []
+    for agent in sorted(tokens):
+        change, _ = _token_change(home, agent, tokens[agent], digests)
+        if change is not None:
+            notes.append("%s (%s)" % (agent, change))
+    if notes:
+        print("(план) авторизация %s: %s" % (home, ", ".join(notes)))
+
+
+def ensure_agent_tokens(homes, agents, rotate=False, dry_run=False):
+    """Выдать агентам токены во всех домах и вписать хэши в auth.json; вернуть дома со сбоем.
+
+    Один агент — один токен во ВСЕХ домах: мост на SberOS берёт токен рядом
+    с найденным порт-файлом (в любом из домов), а демон сверяет хэш по
+    auth.json своего дома. Годный токен переиспользуется: перевыпуск на
+    каждом срабатывании .path ломал бы мосты. Несуществующий дом
+    пропускается: мосту там жить негде.
+    """
+    homes = [home for home in homes if os.path.isdir(home)]
+    if not homes or not agents:
+        return []
+    if dry_run:
+        tokens = _choose_tokens(homes, agents, rotate)
+        for home in homes:
+            _print_token_plan(home, tokens)
+        return []
+    with contextlib.ExitStack() as stack:
+        failed = _lock_homes(stack, homes)
+        ready = [home for home in homes if home not in failed]
+        tokens = _choose_tokens(ready, agents, rotate)
+        failed.extend(home for home in ready if not _store_tokens(home, tokens))
+    return failed
+
+
+def warn_unrotated(homes, rotated):
+    """Назвать агентов из auth.json, чьи токены --rotate не перевыпустил.
+
+    Перевыпуск идёт только агентам с найденным конфигом, а токен агента без
+    регистрации продолжает действовать.
+    """
+    for home in homes:
+        rest = sorted(set(_load_auth(auth_path(home))) - set(rotated))
+        if rest:
+            print(
+                "ВНИМАНИЕ: в %s токены не перевыпущены (конфиг агента не найден или не "
+                "разобран): %s — "
+                "если доступ им не нужен, отзовите: --revoke <агент>"
+                % (auth_path(home), ", ".join(rest)),
+                file=sys.stderr,
+            )
+
+
+def register_tokens(homes, agents, args):
+    """Токены агентам с найденным конфигом; вернуть дома со сбоем.
+
+    Зовётся после записи конфигов: только так известно, у кого конфиг найден.
+    Окна 401 это не открывает — мост читает токен на каждом запросе, а не при
+    старте. Снятие регистрации токены не трогает: отзыв — отдельный --revoke,
+    а purge удаляет ~/.files-search целиком.
+    """
+    if args.remove:
+        return []
+    failed = ensure_agent_tokens(
+        homes, agents, rotate=args.rotate, dry_run=args.dry_run
+    )
+    if args.rotate:
+        warn_unrotated(homes, agents)
+    return failed
+
+
+def _revoke_in_home(home, agent):
+    """Удалить файл токена и хэш агента в доме; вернуть, что удалено.
+
+    Сначала надгробие, потом файл, потом хэш: при сбое посередине отозванный
+    токен не вернётся из уцелевшей копии.
+    """
+    removed = []
+    auth = auth_path(home)
+    digests = _load_auth_noting(home)
+    secret = token_path(home, agent)
+    token = _read_token(secret)
+    _withdraw(home, {digests.get(agent), sha256_hex(token) if token else None} - {None})
+    # lexists: висячий симлинк — тоже след, а unlink уносит ссылку, не цель.
+    if os.path.lexists(secret):
+        os.unlink(secret)
+        removed.append("файл токена")
+    if agent in digests:
+        del digests[agent]
+        _save_auth(auth, digests)
+        removed.append("хэш из auth.json")
+    return removed
+
+
+def _print_revoke_plan(home, agent):
+    traces = []
+    if agent in _load_auth(auth_path(home)):
+        traces.append("хэш из auth.json")
+    if os.path.lexists(token_path(home, agent)):
+        traces.append("файл токена")
+    print(
+        "(план) %s: %s"
+        % (home, ("удалить " + ", ".join(traces)) if traces else "нет следов")
+    )
+
+
+def revoke_agent(homes, agent, dry_run=False):
+    """Отозвать текущий токен агента во всех домах; вернуть дома со сбоем.
+
+    Регистрация не снимается, и следующий прогон регистрации выдаст агенту с
+    найденным конфигом новый токен: это смена секрета, а не запрет агента.
+    """
+    if dry_run:
+        for home in homes:
+            _print_revoke_plan(home, agent)
+        return []
+    with contextlib.ExitStack() as stack:
+        present = [home for home in homes if os.path.isdir(data_dir(home))]
+        failed = _lock_homes(stack, present)
+        for home in homes:
+            if home in failed:
+                continue
+            try:
+                removed = _revoke_in_home(home, agent) if home in present else []
+            except OSError as exc:
+                _report_auth_error(home, "отзыв %s" % agent, exc)
+                failed.append(home)
+                continue
+            print(
+                "%s: %s"
+                % (home, ("удалены " + ", ".join(removed)) if removed else "нет следов")
+            )
+    return failed
+
+
+def forget_tokens(homes, dry_run=False):
+    """Удалить токены, auth.json и служебные файлы регистратора во всех домах.
+
+    Для uninstall.sh: он удаляет один ~/.files-search, а регистратор
+    раскладывает токены в каждый найденный дом (на SberOS их два). Пустой
+    после этого .files-search удаляется. Вернуть дома со сбоем.
+    """
+    failed = []
+    for home in homes:
+        root = data_dir(home)
+        names = (TOKENS_DIR_NAME, AUTH_FILE_NAME, WITHDRAWN_FILE_NAME, LOCK_FILE_NAME)
+        traces = [os.path.join(root, name) for name in names]
+        traces = [path for path in traces if os.path.lexists(path)]
+        if dry_run:
+            print(
+                "(план) %s: %s"
+                % (home, ("удалить " + ", ".join(traces)) if traces else "нет следов")
+            )
+            continue
+        try:
+            for path in traces:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.unlink(path)
+            if traces and not os.listdir(root):
+                os.rmdir(root)
+        except OSError as exc:
+            _report_auth_error(home, "удаление токенов", exc)
+            failed.append(home)
+            continue
+        print(
+            "%s: %s" % (home, "удалены токены и auth.json" if traces else "нет следов")
+        )
+    return failed
+
+
+def _opencode_entry(launcher, allow_write, agent=None):
     environment = {"LQRAG_TIMEOUT": BRIDGE_TIMEOUT_S}
     if allow_write:
         # У моста это и так умолчание; явное значение показывает, что
         # управление индексацией разрешено сознательно.
         environment["LQRAG_ALLOW_WRITE"] = "1"
+    if agent:
+        # По ярлыку мост находит свой файл токена; сам токен в конфиг не пишем.
+        environment[AGENT_ENV] = agent
     # LQRAG_URL не задаём: без него мост берёт фактический порт из
     # ~/.files-search/port, а зашитый адрес сильнее порт-файла и сломался бы
     # при перезапуске демона на другом порту.
@@ -547,18 +1134,20 @@ def _merge_env(current, ours):
     return merged
 
 
-def _opencode_desired(current, launcher, allow_write):
+def _opencode_desired(current, launcher, allow_write, agent=None):
     """Какой должна стать запись: наши поля — по эталону, поля пользователя — как были.
 
     Пользователю принадлежат enabled (выключатель сервера в агенте) и чужие
     переменные environment. Остальное — по эталону: схема строгая, и лишний
     ключ отверг бы весь конфиг.
     """
-    entry = _opencode_entry(launcher, allow_write)
+    entry = _opencode_entry(launcher, allow_write, agent)
     if isinstance(current, dict):
         if isinstance(current.get("enabled"), bool):
             entry["enabled"] = current["enabled"]
-        entry["environment"] = _merge_env(current.get("environment"), entry["environment"])
+        entry["environment"] = _merge_env(
+            current.get("environment"), entry["environment"]
+        )
     return entry
 
 
@@ -580,12 +1169,12 @@ def _opencode_cleanup(config):
     return True
 
 
-def _opencode_place(config, name, launcher, allow_write):
+def _opencode_place(config, name, launcher, allow_write, agent=None):
     changed = _opencode_cleanup(config)
     mcp = config.setdefault("mcp", {})
     if not isinstance(mcp, dict):
         raise SystemExit("в конфиге ключ 'mcp' не объект — не берусь его чинить")
-    entry = _opencode_desired(mcp.get(name), launcher, allow_write)
+    entry = _opencode_desired(mcp.get(name), launcher, allow_write, agent)
     if mcp.get(name) != entry:
         mcp[name] = entry
         changed = True
@@ -608,7 +1197,7 @@ def _opencode_has(config, name):
     return isinstance(mcp, dict) and name in mcp
 
 
-def _mcp_servers_entry(launcher, allow_write):
+def _mcp_servers_entry(launcher, allow_write, agent=None):
     # В отличие от opencode: command — строка, аргументы — в args (пустой
     # пишем явно), окружение — env.
     # Поля транспорта нет. Прежняя версия писала type: "stdio" по образцу
@@ -616,6 +1205,8 @@ def _mcp_servers_entry(launcher, allow_write):
     env = {"LQRAG_TIMEOUT": BRIDGE_TIMEOUT_S}
     if allow_write:
         env["LQRAG_ALLOW_WRITE"] = "1"
+    if agent:
+        env[AGENT_ENV] = agent
     return {
         "command": launcher,
         "args": [],
@@ -623,19 +1214,19 @@ def _mcp_servers_entry(launcher, allow_write):
     }
 
 
-def _mcp_servers_desired(current, launcher, allow_write):
+def _mcp_servers_desired(current, launcher, allow_write, agent=None):
     """Какой должна стать запись GigaCode: из текущей сохраняются чужие переменные env."""
-    entry = _mcp_servers_entry(launcher, allow_write)
+    entry = _mcp_servers_entry(launcher, allow_write, agent)
     if isinstance(current, dict):
         entry["env"] = _merge_env(current.get("env"), entry["env"])
     return entry
 
 
-def _mcp_servers_place(config, name, launcher, allow_write):
+def _mcp_servers_place(config, name, launcher, allow_write, agent=None):
     servers = config.setdefault("mcpServers", {})
     if not isinstance(servers, dict):
         raise SystemExit("в конфиге ключ 'mcpServers' не объект — не берусь его чинить")
-    entry = _mcp_servers_desired(servers.get(name), launcher, allow_write)
+    entry = _mcp_servers_desired(servers.get(name), launcher, allow_write, agent)
     if servers.get(name) == entry:
         return False
     servers[name] = entry
@@ -721,17 +1312,18 @@ FAILED = "ошибка"
 AGENT_FOUND = (WRITTEN, UNCHANGED, PLANNED)
 
 
-def process_target(key, target, launcher, args, cleanup_only, home=None):
+def process_target(key, target, launcher, args, cleanup_only, home=None, agent=None):
     """Обработать одну цель и вернуть её статус. Отказ по цели НЕ прерывает остальные.
 
     Битый конфиг одной цели не должен мешать регистрации в других. Ошибка
     уходит в stderr (журнал юнита) и возвращается как FAILED для --strict.
 
     home — дом, относительно которого разворачивается «~» цели; None — $HOME
-    (легаси-цель и явный --config).
+    (легаси-цель и явный --config). agent — ярлык LQRAG_AGENT; None — запись
+    без ярлыка (легаси-цель, --config без --agent).
     """
     try:
-        return _process_target(key, target, launcher, args, cleanup_only, home)
+        return _process_target(key, target, launcher, args, cleanup_only, home, agent)
     except SystemExit as exc:
         print("%-9s ОШИБКА: %s" % (key, exc), file=sys.stderr)
     except OSError as exc:
@@ -742,7 +1334,7 @@ def process_target(key, target, launcher, args, cleanup_only, home=None):
     return FAILED
 
 
-def _process_target(key, target, launcher, args, cleanup_only, home):
+def _process_target(key, target, launcher, args, cleanup_only, home, agent):
     path = resolve_path(target["path"], home)
     marker = resolve_path(target["marker"], home)
     schema = SCHEMAS[target["schema"]]
@@ -773,7 +1365,7 @@ def _process_target(key, target, launcher, args, cleanup_only, home):
     elif cleanup_only:
         changed = schema["cleanup"](config)
     else:
-        changed = schema["place"](config, args.name, launcher, args.allow_write)
+        changed = schema["place"](config, args.name, launcher, args.allow_write, agent)
 
     if not changed:
         print("%-9s без изменений: %s" % (key, path))
@@ -814,12 +1406,12 @@ def _access_problem(path, mode):
     return "нет прав"
 
 
-def _entry_state(config, schema, launcher, args):
+def _entry_state(config, schema, launcher, args, agent):
     section = config.get(schema["section"])
     if not isinstance(section, dict) or args.name not in section:
         return "нет — запустите без --doctor"
     current = section[args.name]
-    desired = schema["entry"](current, launcher, args.allow_write)
+    desired = schema["entry"](current, launcher, args.allow_write, agent)
     if current == desired:
         if current.get("enabled") is False:
             # Выбор пользователя, а не дефект: регистрация его не откатывает.
@@ -828,11 +1420,49 @@ def _entry_state(config, schema, launcher, args):
     # Называем только поля, без значений: в environment/env рядом могут
     # оказаться чужие переменные, а вывод --doctor пересылают в чаты.
     if isinstance(current, dict):
-        fields = sorted(k for k in set(current) | set(desired) if current.get(k) != desired.get(k))
+        fields = sorted(
+            k for k in set(current) | set(desired) if current.get(k) != desired.get(k)
+        )
         detail = "отличаются поля: %s" % ", ".join(fields)
     else:
         detail = "запись не объект"
     return "УСТАРЕЛА (%s) — запустите без --doctor" % detail
+
+
+def _token_state(home, agent):
+    """Состояние токена агента в доме для --doctor; сам токен не печатается."""
+    path = token_path(home, agent)
+    token, problem = inspect_token(path)
+    if problem == NO_FILE:
+        return "НЕТ — будет выдан при регистрации (%s)" % path
+    if token is None:
+        return "НЕПРИГОДЕН: %s — будет заменён при регистрации (%s)" % (problem, path)
+    if _load_auth(auth_path(home)).get(agent) != sha256_hex(token):
+        return (
+            "НЕ СОВПАДАЕТ с хэшем в auth.json — мосту будет 401, запустите без --doctor"
+        )
+    return "есть, хэш в auth.json совпадает"
+
+
+def _auth_state(home):
+    """Состояние auth.json дома для --doctor: без него демон закрыт для всех."""
+    path = auth_path(home)
+    closed = "демон отвечает 401 на всё, кроме /health"
+    if not os.path.lexists(path):
+        return "%s: нет файла — %s" % (path, closed)
+    digests, problem = inspect_auth(path)
+    if problem:
+        return (
+            "%s: ОТВЕРГНУТ демоном (%s) — %s; запустите без --doctor, файл будет перезаписан 0600"
+            % (
+                path,
+                problem,
+                closed,
+            )
+        )
+    if not digests:
+        return "%s: нет действующих агентов — %s" % (path, closed)
+    return "%s: %s" % (path, ", ".join(sorted(digests)))
 
 
 def _doctor_target(key, target, home, launcher, args, is_legacy):
@@ -843,7 +1473,9 @@ def _doctor_target(key, target, home, launcher, args, is_legacy):
     if is_legacy:
         print("  режим:     только очистка, новых записей не делаем")
     else:
-        print("  агент:     %s" % ("установлен" if os.path.isdir(marker) else "не найден"))
+        print(
+            "  агент:     %s" % ("установлен" if os.path.isdir(marker) else "не найден")
+        )
     if not os.path.exists(path):
         print("  состояние: файла нет")
         print("")
@@ -856,7 +1488,11 @@ def _doctor_target(key, target, home, launcher, args, is_legacy):
         return
     schema = SCHEMAS[target["schema"]]
     if not is_legacy:
-        print("  запись:    %s" % _entry_state(config, schema, launcher, args))
+        # Имя агента штатной цели — её ключ: так его пишет регистрация.
+        print(
+            "  запись:    %s" % _entry_state(config, schema, launcher, args, agent=key)
+        )
+        print("  токен:     %s" % _token_state(home, key))
         for other in launcher_duplicates(config, schema, args.name):
             print(
                 "  ВНИМАНИЕ:  дубль — запись «%s» тоже запускает %s: агент поднимет "
@@ -917,7 +1553,10 @@ def run_doctor(launcher, args):
     script = _script_path()
     problem = _access_problem(script, os.R_OK)
     print("  скрипт:    %s" % script)
-    print("             чтение — %s" % ("есть" if problem is None else "НЕТ: %s" % problem))
+    print(
+        "             чтение — %s"
+        % ("есть" if problem is None else "НЕТ: %s" % problem)
+    )
     print("")
 
     unit_dir = os.environ.get(UNIT_DIR_ENV) or UNIT_DIR
@@ -930,7 +1569,7 @@ def run_doctor(launcher, args):
             state = "нет файла (пакет не установлен?)"
         else:
             state = (
-                'НЕ ЧИТАЕТСЯ пользователем: пакет собран с неверными правами, systemd '
+                "НЕ ЧИТАЕТСЯ пользователем: пакет собран с неверными правами, systemd "
                 'ответит "could not be found" (%s)' % problem
             )
         print("  %-42s %s" % (unit, state))
@@ -938,6 +1577,8 @@ def run_doctor(launcher, args):
 
     for home in homes:
         print("== дом %s" % home)
+        print("авторизация: %s" % _auth_state(home))
+        print("")
         for key, target in sorted(TARGETS.items()):
             _doctor_target(key, target, home, launcher, args, is_legacy=False)
     for key, target in sorted(CLEANUP_TARGETS.items()):
@@ -1001,11 +1642,16 @@ def main(argv=None):
         action="append",
         dest="targets",
         metavar="NAME",
-        help="обработать только эту цель (можно повторять): %s" % ", ".join(sorted(TARGETS)),
+        help="обработать только эту цель (можно повторять): %s"
+        % ", ".join(sorted(TARGETS)),
     )
-    parser.add_argument("--all", action="store_true", help="все цели (поведение по умолчанию)")
+    parser.add_argument(
+        "--all", action="store_true", help="все цели (поведение по умолчанию)"
+    )
     parser.add_argument("--list", action="store_true", help="перечислить цели и выйти")
-    parser.add_argument("--doctor", action="store_true", help="диагностика, ничего не менять")
+    parser.add_argument(
+        "--doctor", action="store_true", help="диагностика, ничего не менять"
+    )
     parser.add_argument(
         "--home",
         action="append",
@@ -1034,7 +1680,9 @@ def main(argv=None):
         choices=sorted(SCHEMAS),
         help="схема записи для --config (%(default)s)",
     )
-    parser.add_argument("--name", default=DEFAULT_NAME, help="имя сервера в конфиге (%(default)s)")
+    parser.add_argument(
+        "--name", default=DEFAULT_NAME, help="имя сервера в конфиге (%(default)s)"
+    )
     parser.add_argument("--launcher", default=None, help="путь к mcp_launcher.sh")
     parser.add_argument(
         "--allow-write",
@@ -1042,18 +1690,65 @@ def main(argv=None):
         help="вписать в запись агента явный LQRAG_ALLOW_WRITE=1 (write-инструменты и так "
         "включены у моста по умолчанию; флаг оставляет след в конфиге)",
     )
-    parser.add_argument("--remove", action="store_true", help="снять регистрацию")
-    parser.add_argument("--dry-run", action="store_true", help="показать результат, не записывая")
+    parser.add_argument(
+        "--agent",
+        type=agent_name,
+        default=None,
+        metavar="NAME",
+        help="только с --config: имя агента для ярлыка LQRAG_AGENT и его токена "
+        "(штатные цели подписываются своим именем сами)",
+    )
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
+        "--remove", action="store_true", help="снять регистрацию; токены не трогает"
+    )
+    modes.add_argument(
+        "--rotate",
+        action="store_true",
+        help="перевыпустить токены агентов, у которых найден конфиг: один новый токен "
+        "на агента во всех домах",
+    )
+    modes.add_argument(
+        "--revoke",
+        type=agent_name,
+        default=None,
+        metavar="AGENT",
+        help="отозвать текущий токен агента: удалить его хэш из auth.json и файл "
+        "токена во всех домах и выйти. Регистрация остаётся, и следующая регистрация "
+        "выдаст агенту новый токен. Чтобы закрыть агенту доступ, снимите регистрацию "
+        "(--remove) и отзовите токен; пока агент установлен, автоматическая регистрация "
+        "пакета (вход в сессию, правка конфига агента) вернёт запись и токен",
+    )
+    modes.add_argument(
+        "--forget",
+        action="store_true",
+        help="удалить токены, auth.json и служебные файлы регистратора во всех домах "
+        "и выйти (этим пользуется uninstall.sh)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="показать результат, не записывая"
+    )
     if argv is None:
         argv = sys.argv[1:]
     args = parser.parse_args(argv)
+    if args.agent and not args.config:
+        parser.error("--agent работает только вместе с --config")
+    if args.config and not args.agent and not (args.remove or args.doctor or args.list):
+        # Запись без ярлыка LQRAG_AGENT мосту бесполезна: токена нет — 401 всегда.
+        parser.error("--config требует --agent NAME (кроме --remove)")
 
     if args.list:
         for home in discover_homes(args.homes):
             for key, target in sorted(TARGETS.items()):
-                print("%-9s %-22s %s" % (key, target["title"], resolve_path(target["path"], home)))
+                print(
+                    "%-9s %-22s %s"
+                    % (key, target["title"], resolve_path(target["path"], home))
+                )
         for key, target in sorted(CLEANUP_TARGETS.items()):
-            print("%-9s %-22s %s  (только очистка)" % (key, target["title"], resolve_path(target["path"])))
+            print(
+                "%-9s %-22s %s  (только очистка)"
+                % (key, target["title"], resolve_path(target["path"]))
+            )
         return 0
 
     launcher = os.path.abspath(os.path.expanduser(args.launcher or default_launcher()))
@@ -1068,6 +1763,18 @@ def main(argv=None):
         print(refusal, file=sys.stderr)
         return 2
 
+    if args.revoke:
+        # Отдельный ручной режим: конфиги агентов не трогает, сбой — код 1
+        # и без --strict.
+        failed = revoke_agent(
+            discover_homes(args.homes), args.revoke, dry_run=args.dry_run
+        )
+        return 1 if failed else 0
+
+    if args.forget:
+        failed = forget_tokens(discover_homes(args.homes), dry_run=args.dry_run)
+        return 1 if failed else 0
+
     for note in check_launcher_origin(launcher):
         print("%s" % note, file=sys.stderr)
 
@@ -1081,6 +1788,9 @@ def main(argv=None):
     agent_statuses = []
     cleanup_statuses = []
     homes = None
+    # Агенты с найденным конфигом: только им положены токены, иначе отозванный
+    # агент без регистрации получал бы новый токен при каждом входе.
+    found_agents = []
 
     if args.config:
         # Явно указанный файл. Реестр в этом случае не трогаем вообще: вызывающий
@@ -1094,13 +1804,25 @@ def main(argv=None):
             "path": args.config,
             "schema": args.schema,
         }
-        agent_statuses.append(process_target("--config", ad_hoc, launcher, args, cleanup_only=False))
+        status = process_target(
+            "--config", ad_hoc, launcher, args, cleanup_only=False, agent=args.agent
+        )
+        agent_statuses.append(status)
+        if args.agent and status in AGENT_FOUND:
+            found_agents.append(args.agent)
+        token_homes = discover_homes(args.homes)
     else:
         selected = args.targets
         if selected:
-            unknown = [name for name in selected if name not in TARGETS and name not in CLEANUP_TARGETS]
+            unknown = [
+                name
+                for name in selected
+                if name not in TARGETS and name not in CLEANUP_TARGETS
+            ]
             if unknown:
-                raise SystemExit("неизвестные цели: %s (см. --list)" % ", ".join(unknown))
+                raise SystemExit(
+                    "неизвестные цели: %s (см. --list)" % ", ".join(unknown)
+                )
 
         homes = discover_homes(args.homes)
         if not homes:
@@ -1122,16 +1844,35 @@ def main(argv=None):
                 if real in seen:
                     continue
                 seen.add(real)
-                agent_statuses.append(
-                    process_target(key, target, launcher, args, cleanup_only=False, home=home)
+                status = process_target(
+                    key,
+                    target,
+                    launcher,
+                    args,
+                    cleanup_only=False,
+                    home=home,
+                    agent=key,
                 )
+                agent_statuses.append(status)
+                if status in AGENT_FOUND and key not in found_agents:
+                    found_agents.append(key)
 
         for key, target in sorted(CLEANUP_TARGETS.items()):
             if selected and key not in selected:
                 continue
             cleanup_statuses.append(
-                process_target(key, target, launcher, args, cleanup_only=not args.remove)
+                process_target(
+                    key, target, launcher, args, cleanup_only=not args.remove
+                )
             )
+        token_homes = homes
+
+    if register_tokens(token_homes, found_agents, args):
+        agent_statuses.append(FAILED)
+
+    if args.rotate and FAILED in agent_statuses:
+        # Ручной режим, как --revoke: несработавший перевыпуск — код 1 и без --strict.
+        return 1
 
     # Просим перезапуск, только если конфиг агента действительно переписан.
     if not args.remove and WRITTEN in agent_statuses:

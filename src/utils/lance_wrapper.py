@@ -3,6 +3,7 @@ import concurrent
 import concurrent.futures
 import math
 import threading
+import time
 from datetime import timedelta
 from functools import cached_property
 from typing import Any, NamedTuple
@@ -31,6 +32,17 @@ MIN_ROWS_FOR_VECTOR_INDEX = 256
 # двусторонний — после массового удаления партиции набиты мёртвыми PQ-кодами.
 VECTOR_INDEX_REBUILD_FACTOR = 4
 
+# FTS строится без табличных локов (AB-BA, см. _build_fts), и его CreateIndex
+# может проиграть параллельному CreateIndex на той же таблице: Lance отвечает
+# «Retryable commit conflict… Please retry». Пауза между попытками растёт
+# вдвое, но не выше потолка: create_table ждёт сборку под _create_lock.
+FTS_CONFLICT_TRIES = 4
+FTS_CONFLICT_BACKOFF_S = 0.25
+FTS_CONFLICT_MAX_BACKOFF_S = 1.0
+
+# Фраза из ошибки Lance о проигранном коммите (см. _is_commit_conflict).
+_COMMIT_CONFLICT_MARKER = "Retryable commit conflict"
+
 lg = get_logger(__name__)
 
 # Сколько держать прежние версии таблицы после компакции. Не ноль: поиск,
@@ -56,6 +68,15 @@ def new_lance_session() -> ld.Session:
 def sql_quote(value: str) -> str:
     """Экранировать одинарные кавычки в значении для фильтра LanceDB."""
     return value.replace("'", "''")
+
+
+def _is_commit_conflict(exc: RuntimeError) -> bool:
+    """Коммит проиграл параллельной транзакции, и Lance просит повторить.
+
+    Узнаём по тексту: lancedb отдаёт конфликт обычным RuntimeError, без
+    своего типа и кода. Формулировку сверяет тест на настоящей LanceDB.
+    """
+    return _COMMIT_CONFLICT_MARKER in str(exc)
 
 
 def pq_num_sub_vectors(embed_dim: int, target_sub_dim: int = PQ_TARGET_SUB_DIM) -> int:
@@ -235,11 +256,40 @@ class LanceWrapper:
         create_table под _create_lock, а self.table берёт _table_lock и сама
         зовёт create_table. Встречный порядок захвата двух локов даёт
         AB-BA-дедлок с optimize_indices и create_vector_index.
+
+        Коммит, проигранный параллельному CreateIndex, повторяется. При
+        replace=False индекс, построенный соседом, считается готовым: повтор
+        Lance отклонил бы с «индекс уже существует».
         """
         lg.info("create fts index on %s: %s", self.table_name, self.fts.model_dump())
-        self.lancedb.open_table(self.table_name).create_index(
-            "text", config=FTS(**self.fts.model_dump()), replace=replace
-        )
+        delay = FTS_CONFLICT_BACKOFF_S
+        for attempt in range(1, FTS_CONFLICT_TRIES + 1):
+            try:
+                self.lancedb.open_table(self.table_name).create_index(
+                    "text", config=FTS(**self.fts.model_dump()), replace=replace
+                )
+                return
+            except RuntimeError as exc:
+                if not _is_commit_conflict(exc):
+                    raise
+                if not replace and self.fts_created:
+                    lg.info(
+                        "FTS-индекс на %s уже построил параллельный CreateIndex",
+                        self.table_name,
+                    )
+                    return
+                if attempt == FTS_CONFLICT_TRIES:
+                    raise
+            lg.info(
+                "FTS-индекс на %s: параллельный CreateIndex закоммитился первым, "
+                "повтор %d из %d через %.2f с",
+                self.table_name,
+                attempt + 1,
+                FTS_CONFLICT_TRIES,
+                delay,
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, FTS_CONFLICT_MAX_BACKOFF_S)
 
     def create_fts(self, force: bool = False):
         if self.fts_created and not force:

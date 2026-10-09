@@ -55,11 +55,43 @@ else:
     LSM_PATH = str(_root / "lsm.ldb")
 
 
+# Носители токенов агентов в lsm_root: хэши читает демон (src/server/auth.py),
+# сами токены — мосты; пишет их scripts/register_mcp.py.
+AUTH_FILE_NAME = "auth.json"
+TOKENS_DIR_NAME = "tokens"
+# Хэши отозванных токенов (scripts/register_mcp.py): без них регистрация
+# вернула бы отозванный токен из копии в другом доме.
+WITHDRAWN_FILE_NAME = "withdrawn_tokens"
+# Это не индекс, а доступ мостов к API: снеси их RESET=1 — и всё 401 до
+# следующей регистрации агентов.
+_KEPT_ON_RESET = frozenset({AUTH_FILE_NAME, TOKENS_DIR_NAME, WITHDRAWN_FILE_NAME})
+
+
 def _is_home_or_ancestor(path: Path) -> bool:
     """Путь — домашний каталог или его предок: такое не удаляем и не закрываем."""
     home = Path(os.path.expanduser("~")).resolve()
     path = path.expanduser().resolve()
     return path == home or path in home.parents
+
+
+def _may_remove(target: Path) -> bool:
+    if _is_home_or_ancestor(target):
+        lg.warning("RESET=1: %s — домашний каталог или его предок, не удаляю", target)
+        return False
+    return True
+
+
+def _clear_keeping_auth(root: Path) -> None:
+    """Удалить содержимое root, кроме носителей токенов агентов."""
+    if not root.is_dir():
+        return
+    for entry in root.iterdir():
+        if entry.name in _KEPT_ON_RESET:
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
 
 
 def reset_storage(cfg: "Config") -> None:
@@ -69,17 +101,21 @@ def reset_storage(cfg: "Config") -> None:
     должен ничего удалять. user_conf.yml удаляется файлом, как в
     POST /api/v1/reset: data_directory задаётся снаружи и может быть общим.
     """
-    roots = [Path(cfg.lsm_root).expanduser(), Path(cfg.ld_db_path).expanduser()]
-    lg.info("RESET=1: удаляю %s и %s", ", ".join(map(str, roots)), cfg.user_conf_path)
-    for target in roots:
-        if _is_home_or_ancestor(target):
-            lg.warning(
-                "RESET=1: %s — домашний каталог или его предок, не удаляю", target
-            )
-            continue
-        shutil.rmtree(target, ignore_errors=True)
+    lsm_root = Path(cfg.lsm_root).expanduser()
+    lance = Path(cfg.ld_db_path).expanduser()
+    lg.info(
+        "RESET=1: удаляю %s (кроме %s), %s и %s",
+        lsm_root,
+        ", ".join(sorted(_KEPT_ON_RESET)),
+        lance,
+        cfg.user_conf_path,
+    )
+    if _may_remove(lsm_root):
+        _clear_keeping_auth(lsm_root)
+    if _may_remove(lance):
+        shutil.rmtree(lance, ignore_errors=True)
     cfg.user_conf_path.unlink(missing_ok=True)
-    os.makedirs(roots[0], mode=0o700, exist_ok=True)
+    os.makedirs(lsm_root, mode=0o700, exist_ok=True)
 
 
 def reset_storage_if_requested(cfg: "Config") -> None:

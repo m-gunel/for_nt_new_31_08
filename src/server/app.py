@@ -6,12 +6,13 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from time import monotonic
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.openapi.docs import (
     get_swagger_ui_html,
     get_swagger_ui_oauth2_redirect_html,
 )
 from fastapi.responses import RedirectResponse
+from fastapi.security import HTTPBearer
 from fastapi.staticfiles import StaticFiles
 
 from src.indexer import serve_indexer
@@ -26,6 +27,7 @@ from src.utils.systemd_notify import (
 )
 from src.version import __version__
 
+from .auth import TokenFirstMiddleware, log_auth_state, verify_token
 from .loopback_guard import LoopbackOnlyMiddleware
 from .router import router
 
@@ -48,12 +50,19 @@ def _static_dir() -> Path | None:
     else:
         base = Path(__file__).resolve().parents[2]
     candidate = base / "src" / "server" / "static"
-    if (candidate / "swagger-ui-bundle.js").is_file() and (candidate / "swagger-ui.css").is_file():
+    if (candidate / "swagger-ui-bundle.js").is_file() and (
+        candidate / "swagger-ui.css"
+    ).is_file():
         return candidate
     return None
 
 
 STATIC_DIR = _static_dir()
+
+_SWAGGER_BEARER = HTTPBearer(
+    auto_error=False,
+    description="Токен агента из ~/.files-search/tokens/<агент>.token",
+)
 
 
 @asynccontextmanager
@@ -69,6 +78,8 @@ async def app_life(app: FastAPI):
             "cdn.jsdelivr.net и в сети без интернета откроется пустой. "
             "Как положить файлы — см. src/server/static/README.md"
         )
+    # Без auth.json API закрыт всем: причина 401 должна быть в логе со старта.
+    log_auth_state(cfg.lsm_root)
     # Прогрев обоих каналов инференса, чтобы первый запрос не ждал создания
     # infer request. Первое обращение к cfg.ov_model компилирует модель — это
     # почти всё время старта; без строк на INFO 40–45 с выглядят как зависание.
@@ -114,7 +125,12 @@ app = FastAPI(
         "в поставке `RAG_PORT=0`, и порт выбирает ядро. Фактический порт "
         "опубликован в `~/.files-search/port`.\n\n"
         "Запросы, у которых `Host` или `Origin` не loopback, отклоняются "
-        "(400/403): защита от DNS rebinding и запросов со сторонних сайтов."
+        "(400/403): защита от DNS rebinding и запросов со сторонних сайтов.\n\n"
+        "Все ручки `/api/v1`, кроме `/health`, требуют заголовок "
+        "`Authorization: Bearer <токен агента>` (в Swagger — кнопка Authorize). "
+        "Токен выдаёт `scripts/register_mcp.py` в "
+        "`~/.files-search/tokens/<агент>.token`; без `~/.files-search/auth.json` "
+        "доступ закрыт всем (401)."
     ),
     # Без локальной статики — штатный /docs через CDN.
     docs_url=None if STATIC_DIR is not None else "/docs",
@@ -125,11 +141,25 @@ app = FastAPI(
     lifespan=app_life,
 )
 
+API_PREFIX = "/api/v1"
+
+# Внутри LoopbackOnlyMiddleware: на чужой Host/Origin — 400/403, а не 401.
+app.add_middleware(
+    TokenFirstMiddleware,
+    paths=frozenset(API_PREFIX + route.path for route in router.routes),
+)
 # Снаружи всего приложения, включая /docs и статику: чужой Host/Origin не
 # доходит ни до одной ручки.
 app.add_middleware(LoopbackOnlyMiddleware)
 
-app.include_router(router, prefix="/api/v1")
+# Токен — на весь роутер: новая ручка не останется открытой по забывчивости.
+# /health открыта (OPEN_PATHS в auth.py). HTTPBearer ничего не проверяет — он
+# даёт Swagger кнопку Authorize.
+app.include_router(
+    router,
+    prefix=API_PREFIX,
+    dependencies=[Depends(_SWAGGER_BEARER), Depends(verify_token)],
+)
 
 if STATIC_DIR is not None:
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

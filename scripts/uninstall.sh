@@ -41,6 +41,7 @@ echo "  $STATE   (индексы, состояние LSM, очереди, port, 
 echo "  $USER_CONF        (пользовательский конфиг: список папок)"
 echo "  временные выдачи ${TMPDIR:-/tmp}/rag_file_*"
 echo "  запись localrag из конфига MCP-агента"
+echo "  токены агентов во всех домах пользователя (на SberOS их два)"
 echo
 
 if [ "$ASSUME_YES" -ne 1 ]; then
@@ -143,6 +144,11 @@ elif [ -n "${MCP_CONFIG:-}" ]; then
 else
     python3 "$register" --remove \
         || echo "  не удалось — уберите запись localrag вручную" >&2
+fi
+# Регистратор раскладывает токены в каждый дом, а ниже удаляется один $STATE.
+if [ -n "$register" ] && command -v python3 >/dev/null 2>&1; then
+    python3 "$register" --forget \
+        || echo "  токены удалены не во всех домах — см. ошибки выше" >&2
 fi
 
 echo

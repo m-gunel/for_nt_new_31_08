@@ -1,13 +1,12 @@
 """Отказ запросам, у которых Host или Origin — не loopback.
 
-У API нет аутентификации, и чужой код извне АРМ достаёт его через браузер
-пользователя: страница стороннего сайта шлёт POST без тела (CSRF: /reset,
-/deactivate), а через DNS rebinding ещё и читает ответы /search и /read_file.
-Host и Origin браузер выставляет сам, страница их не подделает. Мост на urllib
-и curl Origin не шлют и проходят по loopback-Host.
+Первый рубеж против браузера пользователя: страница стороннего сайта шлёт POST
+без тела (CSRF: /reset, /deactivate), а через DNS rebinding ещё и читает
+ответы /search и /read_file. Host и Origin браузер выставляет сам, страница их
+не подделает. Мост на urllib и curl Origin не шлют и проходят по loopback-Host.
 
-Процесс другой учётки на том же АРМ проверку проходит: от него защищает только
-аутентификация, а она меняет контракт API для моста и внешних клиентов.
+Отказ 400/403 приходит раньше проверки токена. Процесс другой учётки на том же
+АРМ эту проверку проходит — его отсекает токен агента (src/server/auth.py).
 """
 
 import ipaddress
@@ -19,7 +18,8 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 # Имена через запятую, которые принимаются в Host и Origin сверх loopback:
-# для демона, явно открытого в сеть (RAG_HOST=0.0.0.0), и тестового клиента.
+# для демона, явно открытого в сеть (RAG_HOST и LQRAG_EXPOSE=1), и тестового
+# клиента.
 ALLOWED_HOSTS_ENV = "RAG_ALLOWED_HOSTS"
 
 _HOST_DETAIL = (

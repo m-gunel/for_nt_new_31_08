@@ -8,8 +8,9 @@ LQRAG_URL не задан явно.
 PID. Пакетный демон останавливает systemd (юнит, prerm), индексацию на сессию —
 POST /api/v1/deactivate. PID читают uninstall.sh (останавливает по нему демон
 без systemd, БТ §7, не угадывая процесс по имени), мост (отличает
-прогревающийся демон от мёртвого) и scripts/sberos_check.py (находит процесс
-и домашний каталог демона).
+прогревающийся демон от мёртвого и токен агента отдаёт только живому процессу
+своей учётки) и scripts/sberos_check.py (находит процесс и домашний каталог
+демона).
 
 Оба файла создаются с правами 0600 и снимаются при штатной остановке.
 Устаревший файл после падения демона не опаснее отсутствующего: клиент получит
@@ -74,7 +75,15 @@ def publish_port(root: str | os.PathLike[str], port: int) -> Path | None:
 
 
 def publish_pid(root: str | os.PathLike[str], pid: int | None = None) -> Path | None:
-    return _publish(pid_file_path(root), os.getpid() if pid is None else pid, "pid")
+    path = _publish(pid_file_path(root), os.getpid() if pid is None else pid, "pid")
+    if path is None:
+        # Без pid мост не признаёт демон своим и не предъявляет ему токен
+        # агента: агент получит 401, и перерегистрация не поможет.
+        lg.error(
+            "мост не отправит демону токен агента: pid не опубликован. Поиск "
+            "агенту недоступен до перезапуска службы"
+        )
+    return path
 
 
 def remove_published(*paths: Path | None) -> None:

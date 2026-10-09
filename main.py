@@ -16,6 +16,7 @@ from pathlib import Path
 
 import uvicorn
 
+from src.bind_host import resolve_bind_host
 from src.malloc_tuning import apply_arena_limit, memory_state
 
 # До импорта нативных расширений: при SIGABRT/SIGSEGV в LSM, Lance или OpenVINO
@@ -154,9 +155,16 @@ def _log_startup_context() -> None:
 _log_startup_context()
 
 if __name__ == "__main__":
-    # Внешний интерфейс — только явным RAG_HOST: у API нет аутентификации.
-    # Пустое значение — тоже умолчание, а не «все интерфейсы».
-    host = os.environ.get("RAG_HOST") or "127.0.0.1"
+    # Loopback по умолчанию; внешний интерфейс — только RAG_HOST вместе с
+    # LQRAG_EXPOSE=1 (src/bind_host.py).
+    host, exposed = resolve_bind_host(os.environ)
+    if exposed:
+        lg.warning(
+            "слушаю ВНЕШНИЙ интерфейс %s: API доступен по сети. Клиентам нужны "
+            "имя хоста в RAG_ALLOWED_HOSTS и токен агента, а по HTTP он идёт "
+            "открытым текстом",
+            host,
+        )
     # Сокет биндим сами: при RAG_PORT=0 (БТ §4.2) порт выбирает ядро, и номер
     # нужно опубликовать для MCP-моста до старта uvicorn.
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

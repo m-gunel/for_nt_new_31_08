@@ -21,6 +21,9 @@ Type=oneshot
 # inactive (dead) со status=0/SUCCESS после прогона — норма.
 ExecStart=/usr/bin/python3 /usr/lib/lib-local-rag/mcp/register_mcp.py --all \
     --launcher /usr/lib/lib-local-rag/mcp/mcp_launcher.sh
+# Демон ждёт этот юнит (After=): зависшая регистрация (flock, сетевой дом)
+# не должна держать его старт бесконечно.
+TimeoutStartSec=120
 # Фоновая работа — не конкурировать с пользователем за CPU и диск.
 Nice=10
 IOSchedulingClass=idle

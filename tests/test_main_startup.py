@@ -1,4 +1,4 @@
-"""main.py: адрес по умолчанию и каталог файлового лога.
+"""main.py: адрес по умолчанию, отказ открыть сеть и каталог файлового лога.
 
 main.py при импорте поднимает конфиг и логирование, а в __main__ биндит сокет
 и запускает uvicorn, поэтому выполняется в подпроцессе: uvicorn.Server подменён
@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from src.bind_host import REFUSAL_EXIT_CODE
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -33,12 +35,18 @@ runpy.run_path(sys.argv[1], run_name="__main__")
 """
 
 
-def _run_main(tmp_path: Path, log_file: Path, **extra_env: str) -> str:
-    """Выполнить main.py как __main__ и вернуть адрес, на котором он слушал бы."""
+def _spawn_main(
+    tmp_path: Path, log_file: Path, **extra_env: str
+) -> subprocess.CompletedProcess[str]:
+    """Выполнить main.py как __main__ с заглушкой uvicorn.Server."""
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
-    # RAG_* из окружения разработчика (RAG_HOST, RAG_LSM_ROOT…) исказили бы проверку.
-    env = {k: v for k, v in os.environ.items() if not k.startswith("RAG_")}
+    # RAG_* и LQRAG_EXPOSE из окружения разработчика исказили бы проверку.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("RAG_") and k != "LQRAG_EXPOSE"
+    }
     env.update(
         PYTHONPATH=str(ROOT),
         CONFIG_PATH=str(ROOT / "cfg" / "dev.yml"),
@@ -50,7 +58,7 @@ def _run_main(tmp_path: Path, log_file: Path, **extra_env: str) -> str:
         PYTHONDONTWRITEBYTECODE="1",
     )
     env.update(extra_env)
-    done = subprocess.run(
+    return subprocess.run(
         [sys.executable, "-c", _BOOT, str(ROOT / "main.py")],
         cwd=tmp_path,
         env=env,
@@ -58,6 +66,11 @@ def _run_main(tmp_path: Path, log_file: Path, **extra_env: str) -> str:
         text=True,
         timeout=120,
     )
+
+
+def _run_main(tmp_path: Path, log_file: Path, **extra_env: str) -> str:
+    """Выполнить main.py как __main__ и вернуть адрес, на котором он слушал бы."""
+    done = _spawn_main(tmp_path, log_file, **extra_env)
     assert done.returncode == 0, done.stderr[-3000:]
     bound = [line for line in done.stdout.splitlines() if line.startswith("BOUND=")]
     assert bound, done.stdout + done.stderr[-3000:]
@@ -96,3 +109,12 @@ def test_empty_host_is_loopback_and_new_log_dir_private(tmp_path):
     assert host == "127.0.0.1", "пустой RAG_HOST открыл API сети"
     assert stat.S_IMODE(log_file.parent.stat().st_mode) == 0o700
     assert log_file.is_file()
+
+
+def test_external_host_without_expose_refuses_to_start(tmp_path: Path) -> None:
+    """RAG_HOST=0.0.0.0 без LQRAG_EXPOSE=1: сокет не биндится, причина в stderr."""
+    done = _spawn_main(tmp_path, tmp_path / "rag.log", RAG_HOST="0.0.0.0")
+
+    assert done.returncode == REFUSAL_EXIT_CODE, done.stderr[-3000:]
+    assert "LQRAG_EXPOSE" in done.stderr
+    assert "BOUND=" not in done.stdout

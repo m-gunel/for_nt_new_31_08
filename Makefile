@@ -112,7 +112,8 @@ export_zip:
 	openssl enc -aes-256-ctr -pbkdf2 -in repo.zip -out repo.zip.enc
 	rm repo.zip
 
-# Токен — BuildKit-секретом из окружения: в выводе make, слоях и истории образа его нет.
+# Токен в выводе make не печатается. Dockerfile из CI берёт его из pip.conf и своей
+# строки uv.toml, а BuildKit-секрет получит только RUN --mount=type=secret.
 docker_build: export OSC_TOKEN := $(OSC_TOKEN)
 docker_build:
 # До docker build: docker cp в существующий каталог даст dist/dist и нерабочий
@@ -126,7 +127,8 @@ docker_build:
 # дефис — его отсутствие не ошибка.
 	-docker rm -f tc
 	docker create --name tc rag-sberos:v1 /bin/sh
-	docker cp tc:/app/dist ./dist && docker rm tc
+# Итоговый stage собирает пакет в /build: dist там, в /app — только local-rag.deb.
+	docker cp tc:/build/dist ./dist && docker rm tc
 # Мост не входит в PyInstaller-бандл — докладываем его на хосте поверх dist.
 	$(MAKE) dist_mcp dist_extras
 

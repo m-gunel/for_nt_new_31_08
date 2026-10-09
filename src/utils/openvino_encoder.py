@@ -5,6 +5,7 @@ import gc
 import hashlib
 import os
 import threading
+import time
 from functools import cached_property, partial
 from pathlib import Path
 from typing import Literal
@@ -45,6 +46,10 @@ MODEL_IR = "openvino/openvino_model_qint8_quantized.xml"
 TOKENIZER_IR = "openvino_tokenizer.xml"
 # Длина отпечатка: 64 бита хватает, чтобы различать версии модели.
 _FINGERPRINT_CHARS = 16
+
+# Батч из batch_size фрагментов считается за доли секунды даже на слабом АРМ:
+# вызов дольше — зависание, а не медленная машина (сторож systemd, src/server/app.py).
+INFER_STALL_LIMIT_S = 300.0
 
 
 def model_fingerprint(model_path: str | os.PathLike) -> str:
@@ -136,6 +141,10 @@ class _InferChannel:
         self._model_inf: ov.InferRequest | None = None
         self._lock = threading.Lock()
         self._counter = 0
+        # Начало идущего вызова (monotonic) — для сторожа; None — канал свободен.
+        # Без лока: сторож читает его из event loop, а лок канала держит сам
+        # (возможно, зависший) инференс; чтение float под GIL атомарно.
+        self._busy_since: float | None = None
         # nice потока канала index понижен, но в нём только ожидание, копия
         # результата и gc: инференс считают общие для обоих каналов потоки
         # плагина OpenVINO с обычным приоритетом. Нагрузку индексации на CPU
@@ -173,22 +182,35 @@ class _InferChannel:
     def infer(self, texts: list[str]) -> np.ndarray:
         """Синхронный инференс. Выполняется в собственном потоке канала."""
         with self._lock:
-            self._maybe_reset_memory()
+            # После захвата лока: ожидание в очереди за другим батчем — не зависание.
+            self._busy_since = time.monotonic()
+            try:
+                return self._infer_locked(texts)
+            finally:
+                self._busy_since = None
 
-            tok_inf = self.tok_inf
-            tok_inf.start_async(inputs=texts)
-            tok_inf.wait()
-            toks = {
-                x.any_name: v.data
-                for x, v in zip(self.tokenizer.outputs, tok_inf.output_tensors)
-            }
+    def _infer_locked(self, texts: list[str]) -> np.ndarray:
+        self._maybe_reset_memory()
 
-            model_inf = self.model_inf
-            model_inf.start_async(inputs=toks)
-            model_inf.wait()
-            # Копия обязательна: .data — view на буфер infer-request'а, который
-            # перепишет следующий батч.
-            return np.array(model_inf.output_tensors[0].data, copy=True)
+        tok_inf = self.tok_inf
+        tok_inf.start_async(inputs=texts)
+        tok_inf.wait()
+        toks = {
+            x.any_name: v.data
+            for x, v in zip(self.tokenizer.outputs, tok_inf.output_tensors)
+        }
+
+        model_inf = self.model_inf
+        model_inf.start_async(inputs=toks)
+        model_inf.wait()
+        # Копия обязательна: .data — view на буфер infer-request'а, который
+        # перепишет следующий батч.
+        return np.array(model_inf.output_tensors[0].data, copy=True)
+
+    def busy_seconds(self, now: float) -> float:
+        """Сколько идёт текущий вызов; 0 — канал свободен."""
+        since = self._busy_since
+        return 0.0 if since is None else now - since
 
     def shutdown(self):
         self.executor.shutdown(wait=False)
@@ -286,6 +308,23 @@ class OpenVINOEmbedder:
         embeddings = self.cls_pooling(res)
         embeddings: np.ndarray = self.l2_normalize(embeddings)
         return embeddings
+
+    def oldest_infer_age(self) -> float:
+        """Сколько идёт самый долгий из текущих вызовов; 0 — все каналы свободны."""
+        now = time.monotonic()
+        return max(channel.busy_seconds(now) for channel in self._channels.values())
+
+    def inference_alive(self) -> bool:
+        """Ни один вызов не висит дольше INFER_STALL_LIMIT_S (для сторожа systemd)."""
+        age = self.oldest_infer_age()
+        if age < INFER_STALL_LIMIT_S:
+            return True
+        lg.error(
+            "инференс висит %.0f c — сторож systemd не продлевается, "
+            "демон будет перезапущен",
+            age,
+        )
+        return False
 
     def shutdown(self):
         for channel in self._channels.values():

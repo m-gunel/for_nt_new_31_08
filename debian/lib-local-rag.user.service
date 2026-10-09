@@ -6,14 +6,19 @@ Documentation=file:/usr/lib/lib-local-rag/mcp/README.md
 # Юниты включены глобально — для каждого systemd --user, в том числе greeter-а
 # и root. Без условия root проиндексировал бы весь /home в /root/.files-search.
 ConditionUser=!@system
-# Предел запусков: при устойчивом сбое старта каждый круг — прогрев OpenVINO
-# 40-45 c на всех ядрах, а умолчание менеджера (5 за 10 c) при RestartSec=5
-# недостижимо, и юнит крутился бы вечно, не переходя в failed.
-StartLimitIntervalSec=600
+# Предел запусков: при устойчивом сбое каждый круг — прогрев OpenVINO 40-45 c
+# на всех ядрах, а умолчание менеджера (5 за 10 c) при RestartSec=5 недостижимо,
+# и юнит крутился бы вечно, не переходя в failed. Окно вмещает и 5 кругов
+# сторожа при устойчивом зависании: прогрев + 300 c зависшего инференса
+# (INFER_STALL_LIMIT_S) + WatchdogSec + TimeoutStopSec (ожидание после SIGABRT)
+# + RestartSec ≈ 545 c на круг.
+StartLimitIntervalSec=3600
 StartLimitBurst=5
 
 [Service]
-Type=exec
+# notify: служба active только после READY=1, а демон шлёт его по окончании
+# прогрева модели (src/server/app.py) — без READY=1 старт упадёт по таймауту.
+Type=notify
 Environment=CONFIG_PATH=/etc/lib-local-rag/distro.yml
 # Явно, хотя это и умолчание демона: авторизации у API нет, и только адрес
 # не даёт сети добраться до поиска по личным файлам.
@@ -32,10 +37,13 @@ StandardError=journal
 SyslogIdentifier=lib-local-rag
 Restart=on-failure
 RestartSec=5
-# Предел только на запуск процесса (например, /opt на зависшем носителе): при
-# Type=exec служба active сразу после exec, прогрев OpenVINO (40-45 c) идёт
-# уже после и этим таймаутом не ограничен.
+# Ограничивает старт до READY=1, то есть и прогрев OpenVINO (40-45 c, на
+# медленной машине до полутора минут).
 TimeoutStartSec=180
+# Сторож: демон продлевает его из event loop (WATCHDOG=1 каждые 60 c), пока
+# инференс не висит дольше INFER_STALL_LIMIT_S. Пинга нет — systemd шлёт
+# SIGABRT (faulthandler пишет в журнал стеки всех потоков) и перезапускает.
+WatchdogSec=120
 # uvicorn завершается за 5 c по SIGTERM, затем демон снимает port/pid — с запасом.
 TimeoutStopSec=30
 # Nice= и IOSchedulingClass= не ставить: systemd применяет их до exec, а nice на

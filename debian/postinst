@@ -181,9 +181,10 @@ start_for_user() {
         echo "  Диагностика: python3 $REGISTER --doctor" >&2
     done
 
-    # Поднялся ли демон: restart --no-block только ставит задание в очередь,
-    # Type=exec становится active сразу после exec — ждём до 10 c. Ошибка exec
-    # видна как failed или auto-restart.
+    # Поднялся ли демон: restart --no-block только ставит задание в очередь —
+    # ждём до 10 c. Type=notify до READY=1 (прогрев модели) в activating/start:
+    # ждём дальше, чтобы ошибка exec или падение в первые секунды успели стать
+    # failed или auto-restart, а по истечении считаем это нормой.
     act=""
     sub=""
     if [ "$daemon_loaded" = yes ]; then
@@ -208,7 +209,7 @@ start_for_user() {
         daemon="юнит демона не загружен (LoadState=$daemon_loaded), демон НЕ запущен"
     else
         case "$act/$sub" in
-            active/*|reloading/*)
+            active/*|reloading/*|activating/start)
                 daemon="демон запущен, индексация стартует после прогрева (~45 c)" ;;
             failed/*|*/auto-restart)
                 daemon="демон НЕ запустился (ActiveState=$act, SubState=$sub)"

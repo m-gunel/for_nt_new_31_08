@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from src.utils.openvino_encoder import INFER_STALL_LIMIT_S
+
 ROOT = Path(__file__).resolve().parents[1]
 
 # Прогрев модели до падения на старте: 40-45 c, на медленной машине до полутора
@@ -132,3 +134,37 @@ def test_daemon_unit_restart_loop_reaches_start_limit():
     # Запуски с прогревом должны превысить burst внутри окна, иначе юнит не
     # уйдёт в failed никогда (умолчание 5 за 10 c при RestartSec=5 недостижимо).
     assert burst * (WARMUP_S + restart_sec) < interval
+
+
+@pytest.mark.skipif(
+    not (ROOT / "debian").is_dir(),
+    reason="debian/ в контекст docker-сборки не копируется",
+)
+def test_daemon_unit_waits_for_ready_and_has_watchdog():
+    service = _unit_sections(ROOT / "debian" / "lib-local-rag.user.service")["Service"]
+
+    assert service["Type"] == "notify"
+    assert int(service["WatchdogSec"]) > 0
+    assert int(service["TimeoutStartSec"]) > WARMUP_S, "до READY=1 идёт прогрев"
+
+
+@pytest.mark.skipif(
+    not (ROOT / "debian").is_dir(),
+    reason="debian/ в контекст docker-сборки не копируется",
+)
+def test_watchdog_restart_loop_reaches_start_limit():
+    """При устойчивом зависании юнит должен уйти в failed, а не крутиться вечно."""
+    unit = _unit_sections(ROOT / "debian" / "lib-local-rag.user.service")
+    service = unit["Service"]
+    # TimeoutStopSec — сколько systemd ждёт процесс после SIGABRT сторожа.
+    cycle = (
+        WARMUP_S
+        + INFER_STALL_LIMIT_S
+        + int(service["WatchdogSec"])
+        + int(service["TimeoutStopSec"])
+        + int(service["RestartSec"])
+    )
+
+    assert int(unit["Unit"]["StartLimitBurst"]) * cycle < int(
+        unit["Unit"]["StartLimitIntervalSec"]
+    )

@@ -202,7 +202,16 @@ systemctl --user status lib-local-rag.service
 ```
 
 Ожидание: `Loaded: loaded (/usr/lib/systemd/user/lib-local-rag.service; enabled; ...)`
-и `Active: active (running)`.
+и `Active: active (running)`. Первые 40-45 секунд после старта — `activating (start)`:
+это прогрев модели, служба становится `active`, когда демон сообщает systemd о
+готовности (`Type=notify`).
+
+Сторож systemd (`WatchdogSec=120`): демон раз в минуту подтверждает, что жив.
+Если зависнет event loop или вызов модели висит дольше 5 минут, подтверждений
+не будет, и systemd перезапустит службу. В журнале перед перезапуском —
+`инференс висит … — сторож systemd не продлевается` или `Watchdog timeout`, а
+следом стеки всех потоков процесса. Зависание внутри LanceDB при живом event
+loop и в потоках разбора файлов сторож не ловит.
 
 ### Логи
 
@@ -500,7 +509,7 @@ systemd поднять `lib-local-rag.service` (не чаще раза в 3 ми
 - «Индексатор LocalRAG не поднимается (…)» — соединение отвергается подряд
   дольше 3 минут; в скобках `ActiveState`, `SubState`, `NRestarts` из
   `systemctl --user show lib-local-rag.service`. Дальше — журнал службы:
-  `journalctl --user -u lib-local-rag.service`. Больше 5 запусков за 10 минут
+  `journalctl --user -u lib-local-rag.service`. Больше 5 запусков за час
   systemd не даёт: служба остаётся в `failed` (`start-limit-hit`). После
   устранения причины: `systemctl --user reset-failed lib-local-rag.service`,
   затем `systemctl --user start lib-local-rag.service`;

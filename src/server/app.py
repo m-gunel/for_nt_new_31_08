@@ -1,7 +1,8 @@
+import asyncio
 import sys
-from asyncio import get_running_loop
+from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from time import monotonic
 
@@ -15,6 +16,14 @@ from fastapi.staticfiles import StaticFiles
 
 from src.indexer import serve_indexer
 from src.utils import get_config, get_logger
+from src.utils.openvino_encoder import OpenVINOEmbedder
+from src.utils.systemd_notify import (
+    READY,
+    STOPPING,
+    keep_alive,
+    notify,
+    watchdog_period,
+)
 from src.version import __version__
 
 from .loopback_guard import LoopbackOnlyMiddleware
@@ -50,7 +59,7 @@ STATIC_DIR = _static_dir()
 @asynccontextmanager
 async def app_life(app: FastAPI):
     cfg = get_config()
-    get_running_loop().set_default_executor(
+    asyncio.get_running_loop().set_default_executor(
         ThreadPoolExecutor(max_workers=cfg.asyncio_num_workers)
     )
     if STATIC_DIR is None:
@@ -68,8 +77,30 @@ async def app_life(app: FastAPI):
     await cfg.ov_model.async_encode(["test"], role="search")
     await cfg.ov_model.async_encode(["test"], role="index")
     lg.info("прогрев завершён за %.1f c", monotonic() - started)
-    async with serve_indexer():
+    # После прогрева, а не перед yield: миграции индекса идут в потоках и loop
+    # не держат, а TimeoutStartSec юнита ограничивает только прогрев.
+    notify(READY)
+    try:
+        async with _watchdog(cfg.ov_model), serve_indexer():
+            yield
+    finally:
+        notify(STOPPING)
+
+
+@asynccontextmanager
+async def _watchdog(model: OpenVINOEmbedder) -> AsyncIterator[None]:
+    """Пинг сторожа systemd (WatchdogSec юнита), пока инференс не завис."""
+    period = watchdog_period()
+    if period is None:
         yield
+        return
+    task = asyncio.create_task(keep_alive(period, model.inference_alive))
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 app = FastAPI(

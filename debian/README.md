@@ -94,7 +94,7 @@ docker cp rag-deb:/app/local-rag.deb ./lib-local-rag_1.0.11_amd64.deb
 docker rm rag-deb
 ```
 
-- На Mac с Apple Silicon (arm64) добавьте к `docker build` флаг
+- На машине с процессором arm64 добавьте к `docker build` флаг
   `--platform linux/amd64`. Пакет объявлен как `Architecture: amd64`, и в
   arm64-образе `dpkg-buildpackage` его не соберёт, а PyInstaller собрал бы
   бинарь не той архитектуры.

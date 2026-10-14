@@ -19,12 +19,32 @@ _MODEL_EXCLUDE = {
 }
 
 
+# Части файла весов (models/reranker/openvino_model.bin.part-NN): в репозитории файл
+# разбит из-за лимита GitHub в 100 МБ, в пакет идёт склеенный — OpenVINO читает его
+# с диска без лишней копии в памяти (src/utils/openvino_reranker.py).
+_PART_MARK = ".part-"
+_JOINED_DIR = Path("build") / "joined"
+
+
 def _model_datas(root="models"):
     """Пары (файл, каталог назначения) для всего каталога модели, кроме мусора."""
     out = []
+    parts: dict[Path, list[Path]] = {}
     for path in sorted(Path(root).rglob("*")):
-        if path.is_file() and path.name not in _MODEL_EXCLUDE:
+        if not path.is_file() or path.name in _MODEL_EXCLUDE:
+            continue
+        whole, mark, _ = path.name.partition(_PART_MARK)
+        if mark:
+            parts.setdefault(path.parent / whole, []).append(path)
+        else:
             out.append((str(path), str(path.parent)))
+    for whole, pieces in parts.items():
+        joined = _JOINED_DIR / whole
+        joined.parent.mkdir(parents=True, exist_ok=True)
+        with open(joined, "wb") as f:
+            for piece in sorted(pieces):
+                f.write(piece.read_bytes())
+        out.append((str(joined), str(whole.parent)))
     return out
 
 

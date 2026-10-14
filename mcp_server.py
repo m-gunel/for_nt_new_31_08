@@ -26,7 +26,7 @@
                        Токен уходит лишь нашему демону: по порт-файлу с живым
                        pid этой учётки или на loopback-адрес LQRAG_URL, а на
                        Linux — если порт слушает процесс этой учётки
-  LQRAG_TIMEOUT      — таймаут HTTP, сек (по умолчанию 30)
+  LQRAG_TIMEOUT      — таймаут HTTP, сек (по умолчанию 60: поиск с реранкером — секунды)
   LQRAG_AUTOSTART    — 0 запрещает мосту поднимать lib-local-rag.service, когда
                        демон недоступен (по умолчанию поднимает, не чаще раза
                        в 3 минуты)
@@ -64,7 +64,9 @@ PORT_FILE_RELATIVE = os.path.join(".files-search", "port")
 # pid демона рядом с порт-файлом (src/port_file.py), см. _pid_alive.
 PID_FILE_NAME = "pid"
 FALLBACK_URL = "http://127.0.0.1:8000"
-LQRAG_TIMEOUT = float(os.environ.get("LQRAG_TIMEOUT", "30"))
+# 60, а не 30: поиск с реранкером bge на CPU — ~12 с на тестовой машине, на слабом АРМ под
+# нагрузкой индексации заметно дольше.
+LQRAG_TIMEOUT = float(os.environ.get("LQRAG_TIMEOUT", "60"))
 
 # Токен агента (VAS-6850): в конфиге агента только несекретный ярлык
 # LQRAG_AGENT, секрет — в tokens/<агент>.token рядом с порт-файлом. Явный

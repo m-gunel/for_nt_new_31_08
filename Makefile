@@ -1,4 +1,4 @@
-.PHONY: build deb dist_mcp dist_extras docker_build openvino spec tests
+.PHONY: build deb dist_mcp dist_extras docker_build openvino spec tests reranker-model
 # Дефис: в чистом клоне .secret нет, а без него make не выполнит ни одной цели.
 -include .secret
 # Без общего export: OSC_TOKEN и прочее из .secret в окружение рецептов не уходят.
@@ -106,6 +106,16 @@ openvino:
 	uv sync --native-tls --group torch
 	uv run utils/convert_openvino.py --model "$(MODEL_SRC)" --calib "$(CALIB)"
 	uv run utils/convert_openvino_tokenizer.py --model "$(MODEL_SRC)"
+
+# Реранкер (models/reranker, лежит в репозитории): пересобрать — скачать с Hugging Face,
+# сконвертировать в OpenVINO (INT8 весов), сверить с исходной моделью и разрезать веса на
+# части < 100 МБ (utils/reranker_model.py). Пакеты конвертации — на один запуск (uv run
+# --with), uv.lock не меняется. Другая модель или режим: RERANKER_ARGS="--model mminilm".
+SYS_CA = /etc/ssl/certs/ca-certificates.crt
+RERANKER_WITH = --group torch --with nncf --with huggingface-hub --with "transformers>=5.5"
+reranker-model:
+	$(if $(wildcard $(SYS_CA)),SSL_CERT_FILE=$(SYS_CA) REQUESTS_CA_BUNDLE=$(SYS_CA)) \
+	uv run --frozen $(RERANKER_WITH) python utils/reranker_model.py $(RERANKER_ARGS)
 
 export_zip:
 	git archive --format=zip --output repo.zip HEAD

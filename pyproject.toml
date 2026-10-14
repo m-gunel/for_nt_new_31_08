@@ -3,7 +3,7 @@ name = "files-search-back"
 # Повторяет src/version.py и верхнюю запись debian/changelog: расхождение ловит
 # гейт в цели `deb` Makefile. Та же версия — у files-search-back в uv.lock
 # (сверяет tests/test_version_sync.py).
-version = "1.0.11"
+version = "1.0.12"
 description = "Add your description here"
 readme = "README.md"
 # Код использует синтаксис дженериков PEP 695 (class LSMTable[T]) — это 3.12+.

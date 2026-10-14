@@ -36,3 +36,6 @@ debian/files
 debian/*.substvars
 debian/.debhelper/
 debian/lib-local-rag/
+# Веса реранкера целиком (make reranker-model без разбиения): в репозитории — части
+# openvino_model.bin.part-NN, каждая меньше 100 МБ (лимит GitHub).
+models/reranker/openvino_model.bin

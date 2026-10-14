@@ -19,6 +19,7 @@ from src.server.model import (
     UserConfig,
     UserConfigUpdate,
 )
+from src.server.rerank import rerank_response
 from src.utils import AppConfig, get_logger
 
 lg = get_logger(__name__)
@@ -81,18 +82,36 @@ async def search(
     # По limit индексатор берёт глубокий пул чанков, а SearchResponse собирает
     # из него не больше limit документов. pinned заполняет индексатор: это
     # документы, найденные по коду из имени файла, в выдаче они первые.
+    #
+    # Переранжирование (reranker_model_cfg.enabled) — только для гибрида: режимы
+    # vector и text остаются диагностикой отдельных каналов. Индексатор отдаёт
+    # reranker_k документов, кросс-энкодер их переставляет, выдача обрезается до
+    # limit (src/server/rerank.py).
     if "files" not in request.sources:
         # Устаревший источник "email": писем в индексе нет.
         return SearchResponse(results=[], total=0)
+    cfg = getattr(index, "cfg", None)
+    reranker = (
+        getattr(cfg, "reranker", None) if request.query_type == "hybrid" else None
+    )
+    depth = (
+        max(request.limit, cfg.reranker_k) if reranker is not None else request.limit
+    )
     pinned: list[str] = []
     frame = await index.search(
         request.query,
-        top_k=request.limit,
+        top_k=depth,
         query_type=request.query_type,
         pinned=pinned,
         where=request.filters.where() if request.filters else None,
     )
-    return SearchResponse.from_dataframe(frame, limit=request.limit, pinned=pinned)
+    response = SearchResponse.from_dataframe(frame, limit=depth, pinned=pinned)
+    if reranker is None:
+        return response
+    rcfg = cfg.reranker_model_cfg
+    return await rerank_response(
+        response, request.query, reranker, rcfg.alpha, request.limit, rcfg.keep_top
+    )
 
 
 @router.get("/config")

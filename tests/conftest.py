@@ -26,6 +26,10 @@ TEST_AGENT = "test-agent"
 @fixture(scope="session", autouse=True)
 def config():
     cfg = Config()
+    # Реранкер (bge, ~0,55 ГБ) прогревался бы в каждом TestClient(app) с lifespan.
+    # Переранжирование проверяют tests/test_reranker.py: на подставной модели и на
+    # настоящей из models/reranker.
+    cfg.reranker_model_cfg.enabled = False
     set_config(cfg)
     return cfg
 

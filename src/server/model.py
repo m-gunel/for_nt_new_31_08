@@ -225,6 +225,14 @@ class BaseSearchResponseItem(BaseModel):
             "из имени"
         )
     )
+    rerank_score: float | None = Field(
+        None,
+        description=(
+            "Оценка кросс-энкодера (логит пары «запрос — лучший фрагмент»), если "
+            "включено переранжирование: тогда порядок после name_code задаёт "
+            "слияние рангов гибрида и реранкера, а не score. null — выключено"
+        ),
+    )
     document: DocumentInfo | None = None
     duplicates: list[str] = Field(
         default_factory=list,

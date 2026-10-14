@@ -87,6 +87,10 @@ async def app_life(app: FastAPI):
     lg.info("прогрев модели OpenVINO: компиляция и два канала инференса")
     await cfg.ov_model.async_encode(["test"], role="search")
     await cfg.ov_model.async_encode(["test"], role="index")
+    if cfg.reranker is not None:
+        # Реранкер (bge, ~0,55 ГБ INT8) компилируется тоже здесь, внутри
+        # TimeoutStartSec, а не на первом поиске пользователя.
+        await cfg.reranker.async_score("test", ["test"])
     lg.info("прогрев завершён за %.1f c", monotonic() - started)
     # После прогрева, а не перед yield: миграции индекса идут в потоках и loop
     # не держат, а TimeoutStartSec юнита ограничивает только прогрев.

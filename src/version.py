@@ -5,4 +5,4 @@
 `make deb`, pyproject.toml и uv.lock — tests/test_version_sync.py.
 """
 
-__version__ = "1.0.11"
+__version__ = "1.0.12"

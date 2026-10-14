@@ -3,7 +3,7 @@
 Модели (лицензии разрешают коммерческое использование):
   bge     — BAAI/bge-reranker-v2-m3 (Apache-2.0): XLM-R large, 568 млн; модель продукта —
             лежит в models/reranker (INT8 весов, ~0,55 ГБ). На наборе hr точнее остальных:
-            Hit@1 0,652 против 0,525 у mminilm, но ~12 с на поиск против 1,3 с;
+            Hit@1 0,788 против 0,682 у mminilm, но ~12 с на поиск против 1,3 с;
   mminilm — cross-encoder/mmarco-mMiniLMv2-L12-H384-v1 (Apache-2.0): 118 млн параметров,
             из них 96 млн — словарь XLM-R; считает как модель на 21 млн;
   dity    — DiTy/cross-encoder-russian-msmarco (MIT): RuBERT-base, 178 млн; на hr — как

@@ -90,7 +90,7 @@ sh scripts/check_deb.sh ../lib-local-rag_1.0.7_amd64.deb   # последняя 
 ```bash
 docker build -t rag-sberos .
 docker create --name rag-deb rag-sberos /bin/sh
-docker cp rag-deb:/app/local-rag.deb ./lib-local-rag_1.0.11_amd64.deb
+docker cp rag-deb:/app/local-rag.deb ./lib-local-rag_1.0.12_amd64.deb
 docker rm rag-deb
 ```
 

@@ -33,7 +33,6 @@
   LQRAG_SYSTEMCTL    — какой systemctl звать для автозапуска (по умолчанию из PATH)
   LQRAG_ALLOW_WRITE  — 0 прячет от агента инструменты управления индексацией;
                        по умолчанию они включены (агент — единственный пульт)
-  LQRAG_MAX_OUTPUT   — бюджет символов на ответ поиска (по умолчанию 12000)
 """
 
 import datetime
@@ -163,7 +162,6 @@ ALLOW_WRITE = os.environ.get("LQRAG_ALLOW_WRITE", "1").strip().lower() in (
     "yes",
     "on",
 )
-MAX_OUTPUT_CHARS = int(os.environ.get("LQRAG_MAX_OUTPUT", "12000"))
 
 SERVER_NAME = "localrag-mcp"
 SERVER_VERSION = "0.4.0"
@@ -173,15 +171,16 @@ SERVER_VERSION = "0.4.0"
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 LATEST_PROTOCOL_VERSION = "2025-06-18"
 
-# Сколько текста отдаём на документ. Без этих границ limit=50 × чанки × 600
-# символов уходит в контекст модели целиком.
+# Сколько текста отдаём на документ: до MAX_CHUNKS_PER_DOC найденных фрагментов
+# (их отбирает демон). У первых FULL_DOCS документов фрагменты целиком — с
+# реранкером ответ почти всегда в них; у остальных — начало фрагмента
+# (HEAD_CHUNK_CHARS символов): по нему модель решает, читать ли документ
+# через local_read_file. Общего бюджета на ответ нет.
 MAX_CHUNKS_PER_DOC = 3
-MAX_CHUNK_CHARS = 600
-# Короче фрагмент уже не несёт смысла: при нехватке места фрагменты получают
-# верхние документы, остальные остаются с заголовком и путём.
-MIN_CHUNK_CHARS = 120
+FULL_DOCS = 5
+HEAD_CHUNK_CHARS = 400
 # Строка о документе и список копий — служебные: длинное название из свойств
-# файла или десяток копий не должны съедать место других документов.
+# файла или десяток копий не должны раздувать ответ.
 MAX_ABOUT_CHARS = 300
 MAX_COPIES_SHOWN = 5
 # Верхняя граница чтения файла: больше в контекст всё равно не влезет.
@@ -1259,34 +1258,6 @@ def _clip(text, size):
     return text[: max(size - 1, 0)].rstrip() + "…"
 
 
-def _share(wants, budget):
-    """Поделить budget поровну с переливом: кому нужно меньше доли — берёт своё,
-    остаток делят остальные."""
-    sizes = [0] * len(wants)
-    left = budget
-    order = sorted(range(len(wants)), key=wants.__getitem__)
-    for pos, i in enumerate(order):
-        sizes[i] = min(wants[i], left // (len(order) - pos))
-        left -= sizes[i]
-    return sizes
-
-
-def _first_fragment_sizes(wants, overheads, budget):
-    """Сколько символов текста дать первому фрагменту каждого документа.
-
-    wants — длина полного фрагмента, overheads — строка вокруг него (отступ,
-    место в документе, перевод строки). Сначала пробуем дать фрагмент всем,
-    укорачивая поровну. Если на каждого выходит меньше MIN_CHUNK_CHARS,
-    фрагменты получают только верхние документы — сколько влезет без
-    обрывков в пару слов; заголовок с путём остаётся у всех.
-    """
-    for count in range(len(wants), 0, -1):
-        sizes = _share(wants[:count], budget - sum(overheads[:count]))
-        if all(size >= min(want, MIN_CHUNK_CHARS) for size, want in zip(sizes, wants)):
-            return sizes + [0] * (len(wants) - count)
-    return [0] * len(wants)
-
-
 def _search_entry(item, number):
     """Документ выдачи до раскладки: обязательные строки, фрагменты, structured."""
     path = item.get("absolute_path") or item.get("id") or "?"
@@ -1316,11 +1287,13 @@ def _search_entry(item, number):
         content = (chunk.get("content") or "").strip()
         if not content:
             continue
+        if number > FULL_DOCS:
+            content = _clip(content, HEAD_CHUNK_CHARS)
         place = _chunk_place(chunk, ext)
         fragments.append(
             {
                 "prefix": "   · " + ("[%s] " % place if place else ""),
-                "content": _clip(content, MAX_CHUNK_CHARS),
+                "content": content,
                 "chunk": chunk,
             }
         )
@@ -1342,55 +1315,25 @@ def _search_entry(item, number):
     return {"lines": lines, "fragments": fragments, "result": result}
 
 
-def _add_fragment(entry, fragment, size):
-    """Дописать фрагмент документа, укоротив текст до size; вернуть длину строки."""
-    text = _clip(fragment["content"], size)
-    line = fragment["prefix"] + text
-    entry["lines"].append(line)
+def _add_fragment(entry, fragment):
+    """Дописать фрагмент документа в текст и в structured."""
+    text = fragment["content"]
+    entry["lines"].append(fragment["prefix"] + text)
     chunk = fragment["chunk"]
     record = {"text": text, "score": chunk.get("score")}
     record.update((k, chunk[k]) for k in _CHUNK_PLACE if chunk.get(k) is not None)
     entry["result"]["chunks"].append(record)
-    return len(line) + 1
 
 
 def _layout_search(results):
-    """Разложить выдачу в бюджет MAX_OUTPUT_CHARS.
-
-    Порядок важнее полноты фрагментов: сначала каждому документу —
-    заголовок с путём, отметки и строка о документе, затем по первому
-    фрагменту (при нехватке места — укороченному), и только потом добавочные
-    фрагменты верхним документам — иначе длинные фрагменты первых документов
-    вытесняют из ответа остальные найденные файлы. Документ отбрасывается,
-    только если не влезает даже его заголовок.
-    """
+    """Все документы выдачи по порядку: заголовок с путём, отметки, строка о
+    документе, затем фрагменты (целиком у первых FULL_DOCS, начало — у остальных)."""
     entries = []
-    used = 0
-    for item in results:
-        entry = _search_entry(item, len(entries) + 1)
-        cost = sum(len(line) + 1 for line in entry["lines"])
-        if used + cost > MAX_OUTPUT_CHARS and entries:
-            break
+    for number, item in enumerate(results, 1):
+        entry = _search_entry(item, number)
+        for fragment in entry["fragments"]:
+            _add_fragment(entry, fragment)
         entries.append(entry)
-        used += cost
-
-    firsts = [entry for entry in entries if entry["fragments"]]
-    wants = [len(entry["fragments"][0]["content"]) for entry in firsts]
-    overheads = [len(entry["fragments"][0]["prefix"]) + 1 for entry in firsts]
-    sizes = _first_fragment_sizes(wants, overheads, MAX_OUTPUT_CHARS - used)
-    for entry, size in zip(firsts, sizes):
-        if size > 0:
-            used += _add_fragment(entry, entry["fragments"][0], size)
-
-    for entry in entries:
-        if len(entry["result"]["chunks"]) != 1:
-            continue  # первый фрагмент не влез — добавочным тем более не место
-        for fragment in entry["fragments"][1:]:
-            want = len(fragment["content"])
-            room = MAX_OUTPUT_CHARS - used - len(fragment["prefix"]) - 1
-            if room < min(want, MIN_CHUNK_CHARS):
-                break
-            used += _add_fragment(entry, fragment, min(want, room))
     return entries
 
 
@@ -1454,8 +1397,6 @@ def _tool_search(args):
 
     shown = len(structured)
     head = "Найдено документов: %s" % total
-    if shown < total:
-        head += " (показано %s — остальное не поместилось в ответ)" % shown
     # Статус и при непустой выдаче: во время индексации агент иначе счёл бы
     # список полным. Это один GET по localhost, счётчики демон берёт из памяти.
     status = _safe_status()
@@ -2037,7 +1978,10 @@ _SEARCH_OUTPUT_SCHEMA = {
             "type": "integer",
             "description": "Сколько документов вернул поиск (не больше limit на источник)",
         },
-        "shown": {"type": "integer", "description": "Сколько вошло в ответ"},
+        "shown": {
+            "type": "integer",
+            "description": "Сколько документов в ответе (все найденные)",
+        },
         "indexing": {
             "type": "boolean",
             "description": "Идёт ли индексация — при true пустая выдача не окончательна",
@@ -2127,7 +2071,11 @@ READ_TOOLS = [
                     "minimum": 1,
                     "maximum": 50,
                     "default": 10,
-                    "description": "Сколько документов вернуть",
+                    "description": (
+                        "Сколько документов вернуть. У первых 5 найденные фрагменты "
+                        "целиком, у остальных — по 400 символов: больше limit — "
+                        "больше текста в ответе"
+                    ),
                 },
                 "query_type": {
                     "type": "string",

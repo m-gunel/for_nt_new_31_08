@@ -92,7 +92,7 @@ def test_tool_schemas_are_well_formed(bridge_factory):  # noqa: F811
 def test_search_contract_speaks_of_documents(bridge):
     """limit, total и match считаются в документах, как у демона."""
     (search,) = [tool for tool in bridge.tools() if tool["name"] == "local_search"]
-    assert search["inputSchema"]["properties"]["limit"]["description"] == (
+    assert search["inputSchema"]["properties"]["limit"]["description"].startswith(
         "Сколько документов вернуть"
     )
     output = search["outputSchema"]["properties"]
@@ -101,25 +101,6 @@ def test_search_contract_speaks_of_documents(bridge):
     assert match["type"] == "array" and match["items"] == {"type": "string"}
     assert "name_code" in match["description"] and "card" in match["description"]
     assert "код из имени" in search["description"]
-
-
-def test_fragment_shares_are_fair_and_never_crumbs():
-    """Раскладка первых фрагментов: поровну с переливом, без обрывков."""
-    from mcp_server import MIN_CHUNK_CHARS, _first_fragment_sizes, _share
-
-    # Короткий берёт своё, остаток делят остальные.
-    assert _share([50, 600, 600], 650) == [50, 300, 300]
-    assert _share([600, 600], 5000) == [600, 600]
-    # Хватает на всех — все получают, урезанные поровну.
-    assert _first_fragment_sizes([600] * 4, [6] * 4, 1224) == [300] * 4
-    # Не хватает — фрагменты у верхних, не меньше порога; у остальных нет.
-    sizes = _first_fragment_sizes([600] * 10, [6] * 10, 1000)
-    assert sum(sizes) == 1000 - 7 * 6 and sizes[7:] == [0] * 3
-    assert all(136 <= size <= 137 for size in sizes[:7])
-    assert min(s for s in sizes if s) >= MIN_CHUNK_CHARS
-    # Фрагмент короче порога порогом не отсекается.
-    assert _first_fragment_sizes([40, 40], [6, 6], 92) == [40, 40]
-    assert _first_fragment_sizes([600], [6], 50) == [0]
 
 
 def test_descriptions_carry_no_personal_data(bridge_factory):  # noqa: F811
